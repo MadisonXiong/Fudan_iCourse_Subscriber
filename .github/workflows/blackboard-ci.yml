@@ -25,33 +25,63 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Compile Python sources
-        run: python -m compileall -q main.py src scripts
+      - name: Compile and import Python sources
+        run: |
+          python -m compileall -q main.py src scripts
+          python -c "import main"
 
-      - name: Smoke-test schema and course whitelist
+      - name: Smoke-test blackboard parser, schema, and DB merge
         run: |
           python - <<'PY'
           import os
-          import sqlite3
           import tempfile
 
-          from src.ai.blackboard_vision import course_requires_blackboard
+          from src.ai.blackboard_vision import (
+              BlackboardVision,
+              VisionFrame,
+              course_requires_blackboard,
+          )
+          from src.data.blackboard_store import save_blackboard
           from src.data.database import Database
+          from scripts.merge_db import merge
 
           assert course_requires_blackboard("泛函分析")
           assert course_requires_blackboard("泛函分析（荣誉）")
           assert not course_requires_blackboard("高等数理统计")
 
-          fd, path = tempfile.mkstemp(suffix=".db")
-          os.close(fd)
-          try:
-              db = Database(path)
-              cols = {
-                  row[1]
-                  for row in db.conn.execute("PRAGMA table_info(lectures)").fetchall()
-              }
-              assert {"blackboard_latex", "blackboard_model", "blackboard_at"} <= cols
-              db.conn.close()
-          finally:
-              os.remove(path)
+          frames = [VisionFrame(frame_id=1, timestamp_sec=30, path="unused.jpg")]
+          parsed = BlackboardVision._parse_response(
+              "<<<FRAME id=1 ts=30 status=board>>>\n"
+              "$$x_n \\rightharpoonup x$$\n"
+              "<<<END_FRAME>>>",
+              frames,
+              "test-model",
+          )
+          assert parsed[0].is_blackboard
+          assert "\\rightharpoonup" in parsed[0].markdown
+
+          with tempfile.TemporaryDirectory() as td:
+              local_path = os.path.join(td, "local.db")
+              remote_path = os.path.join(td, "remote.db")
+
+              local = Database(local_path)
+              local.upsert_course("1", "泛函分析", "Teacher")
+              local.insert_lecture("10", "1", "lecture", "2026-09-09")
+              save_blackboard(
+                  local,
+                  "10",
+                  "### 黑板板书 LaTeX 转写\n\n$$x_n \\rightharpoonup x$$",
+                  "test-model",
+              )
+              local.conn.close()
+
+              remote = Database(remote_path)
+              remote.conn.close()
+              merge(local_path, remote_path)
+
+              check = Database(remote_path)
+              row = check.get_lecture("10")
+              assert row["blackboard_latex"]
+              assert row["blackboard_model"] == "test-model"
+              check.conn.close()
           PY
