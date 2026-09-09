@@ -22,7 +22,7 @@ from src.runtime import config
 from src.data.database import Database
 from src.api.emailer import Emailer
 from src.api.icourse import ICourseClient
-from src.pipeline.lecture_runner import LectureRunner
+from src.pipeline.blackboard_lecture_runner import BlackboardLectureRunner as LectureRunner
 from src.runtime.reporter import Reporter
 from src.runtime.scheduler import Scheduler
 from src.ai.summarizer import Summarizer
@@ -260,6 +260,7 @@ def _crawl_semester_catalog(client: ICourseClient, db: Database,
             )
         except Exception as e:
             reporter.crawl_courses_failed(name, e)
+            continue
         reporter.info(f"  ({code}) → {expected} API courses, "
                       f"{len(rows)} fetched")
 
