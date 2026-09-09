@@ -22,6 +22,7 @@ from src.runtime import config
 from src.data.database import Database
 from src.api.emailer import Emailer
 from src.api.icourse import ICourseClient
+from src.ai.blackboard_vision import course_requires_blackboard
 from src.pipeline.blackboard_lecture_runner import BlackboardLectureRunner as LectureRunner
 from src.runtime.reporter import Reporter
 from src.runtime.scheduler import Scheduler
@@ -104,6 +105,16 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
             lectures = deduped
 
             known_processed = db.get_processed_sub_ids(course_id)
+            if course_requires_blackboard(course_title):
+                # A functional-analysis lecture processed by an older version
+                # is NOT complete for this fork until its raw board LaTeX has
+                # been generated.  Remove those rows from the skip set so the
+                # new BlackboardLectureRunner can retrofit them once.
+                known_processed = {
+                    sid for sid in known_processed
+                    if bool((db.get_lecture(sid) or {}).get("blackboard_latex"))
+                }
+
             new_lectures = [
                 lec for lec in lectures
                 if lec.get("has_playback")
