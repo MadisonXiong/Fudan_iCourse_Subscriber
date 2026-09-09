@@ -1,11 +1,11 @@
 """Vision transcription for handwritten blackboard content.
 
-This module is intentionally separate from RapidOCR.  PPT OCR is optimized
+This module is intentionally separate from RapidOCR. PPT OCR is optimized
 for printed slide text; handwritten mathematics needs a multimodal model that
 can reason about two-dimensional notation and emit LaTeX directly.
 
 Only courses matched by ``course_requires_blackboard`` should invoke this
-module.  The default whitelist contains only ``泛函分析`` and can be overridden
+module. The default whitelist contains only ``泛函分析`` and can be overridden
 with the comma-separated ``BLACKBOARD_COURSES`` environment variable.
 """
 
@@ -85,7 +85,14 @@ The course may be functional analysis, but that context is only for recognizing 
 
 
 class BlackboardVision:
-    """ModelScope OpenAI-compatible vision client with model fallback."""
+    """ModelScope OpenAI-compatible vision client.
+
+    ModelScope's serverless catalogue changes independently of model pages.
+    The first real lecture run confirmed Qwen3-VL-8B-Instruct is callable on
+    the configured endpoint, while Qwen3-VL-32B-Instruct currently is not.
+    Defaults therefore use the verified 8B endpoint; users can override the
+    comma-separated model list with BLACKBOARD_VISION_MODELS.
+    """
 
     def __init__(self):
         token = os.environ.get("DASHSCOPE_API_KEY", "").strip()
@@ -100,11 +107,12 @@ class BlackboardVision:
         ).strip()
         self.models = _csv_env(
             "BLACKBOARD_VISION_MODELS",
-            "Qwen/Qwen3-VL-32B-Instruct,Qwen/Qwen3-VL-8B-Instruct",
+            "Qwen/Qwen3-VL-8B-Instruct",
         )
         if not self.models:
             raise ValueError("BLACKBOARD_VISION_MODELS is empty")
         self.max_edge = int(os.environ.get("BLACKBOARD_VISION_MAX_EDGE", "1600"))
+        self.max_tokens = int(os.environ.get("BLACKBOARD_VISION_MAX_TOKENS", "4096"))
         self.timeout = int(os.environ.get("BLACKBOARD_VISION_TIMEOUT", "180"))
         self.client = OpenAI(api_key=token, base_url=self.base_url)
 
@@ -119,21 +127,35 @@ class BlackboardVision:
         return f"data:image/jpeg;base64,{encoded}"
 
     @staticmethod
-    def _parse_response(text: str, frames: list[VisionFrame], model: str) -> list[VisionResult]:
+    def _parse_response_partial(text: str, frames: list[VisionFrame], model: str) -> dict[int, VisionResult]:
+        """Parse every valid frame block present in a model response.
+
+        Multimodal endpoints sometimes truncate or omit one item in a batch.
+        Keeping the valid blocks lets the caller retry only missing frames
+        instead of discarding the whole batch.
+        """
+        expected = {f.frame_id: f for f in frames}
         parsed: dict[int, VisionResult] = {}
         for match in _FRAME_RE.finditer(text or ""):
             frame_id = int(match.group(1))
-            timestamp = int(match.group(2))
+            if frame_id not in expected:
+                continue
+            frame = expected[frame_id]
             status = match.group(3).lower()
             body = (match.group(4) or "").strip()
             parsed[frame_id] = VisionResult(
                 frame_id=frame_id,
-                timestamp_sec=timestamp,
+                timestamp_sec=frame.timestamp_sec,
                 is_blackboard=(status == "board"),
                 markdown=body,
                 model=model,
             )
+        return parsed
 
+    @staticmethod
+    def _parse_response(text: str, frames: list[VisionFrame], model: str) -> list[VisionResult]:
+        """Strict parser retained for tests and one-frame recovery calls."""
+        parsed = BlackboardVision._parse_response_partial(text, frames, model)
         expected = {f.frame_id for f in frames}
         if set(parsed) != expected:
             missing = sorted(expected - set(parsed))
@@ -141,38 +163,16 @@ class BlackboardVision:
             raise ValueError(
                 f"vision response frame mismatch: missing={missing}, extra={extra}"
             )
+        return [parsed[f.frame_id] for f in frames]
 
-        # Trust our own timestamps rather than a model-copied value.
-        by_id = {f.frame_id: f for f in frames}
-        out = []
-        for frame in frames:
-            r = parsed[frame.frame_id]
-            out.append(
-                VisionResult(
-                    frame_id=r.frame_id,
-                    timestamp_sec=by_id[r.frame_id].timestamp_sec,
-                    is_blackboard=r.is_blackboard,
-                    markdown=r.markdown,
-                    model=r.model,
-                )
-            )
-        return out
-
-    def transcribe_batch(self, frames: list[VisionFrame], course_title: str) -> list[VisionResult]:
-        """Classify and transcribe a chronological batch of frames.
-
-        Every configured model is tried in order.  A response is accepted only
-        when it contains exactly one parseable wrapper block for every frame.
-        """
-        if not frames:
-            return []
-
+    def _content(self, frames: list[VisionFrame], course_title: str) -> list[dict]:
         content: list[dict] = [
             {
                 "type": "text",
                 "text": (
                     f"Course: {course_title}. The frames below are chronological. "
-                    "Transcribe strictly according to the system rules."
+                    "Return one wrapper block for EVERY frame. Transcribe strictly "
+                    "according to the system rules."
                 ),
             }
         ]
@@ -192,20 +192,51 @@ class BlackboardVision:
                     "image_url": {"url": self._image_data_url(frame.path)},
                 }
             )
+        return content
+
+    def _request(self, model: str, frames: list[VisionFrame], course_title: str) -> str:
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": self._content(frames, course_title)},
+            ],
+            max_tokens=self.max_tokens,
+            timeout=self.timeout,
+        )
+        return response.choices[0].message.content or ""
+
+    def transcribe_batch(self, frames: list[VisionFrame], course_title: str) -> list[VisionResult]:
+        """Classify/transcribe a batch, recovering omitted frames individually.
+
+        For each configured model, first make one efficient batch request. If
+        the model returns only a subset of wrapper blocks, preserve those valid
+        results and retry only the missing frames one-by-one. This addresses
+        the partial-output behavior observed in the first real 泛函分析 run.
+        """
+        if not frames:
+            return []
 
         errors: list[str] = []
         for model in self.models:
             try:
-                response = self.client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": content},
-                    ],
-                    timeout=self.timeout,
-                )
-                text = response.choices[0].message.content or ""
-                return self._parse_response(text, frames, model)
+                text = self._request(model, frames, course_title)
+                parsed = self._parse_response_partial(text, frames, model)
+                missing = [f for f in frames if f.frame_id not in parsed]
+
+                if missing:
+                    print(
+                        f"[BlackboardVision] {model} returned {len(parsed)}/"
+                        f"{len(frames)} frames; retrying {len(missing)} missing "
+                        "frame(s) individually",
+                        flush=True,
+                    )
+                    for frame in missing:
+                        one_text = self._request(model, [frame], course_title)
+                        one = self._parse_response(one_text, [frame], model)
+                        parsed[frame.frame_id] = one[0]
+
+                return [parsed[f.frame_id] for f in frames]
             except Exception as exc:
                 errors.append(f"{model}: {type(exc).__name__}: {exc}")
                 print(
