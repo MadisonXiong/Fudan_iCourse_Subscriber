@@ -100,7 +100,7 @@ class BlackboardVision:
         ).strip()
         self.models = _csv_env(
             "BLACKBOARD_VISION_MODELS",
-            "Qwen/Qwen3-VL-8B-Instruct,Qwen/Qwen3.5-35B-A3B",
+            "Qwen/Qwen3-VL-32B-Instruct,Qwen/Qwen3-VL-8B-Instruct",
         )
         if not self.models:
             raise ValueError("BLACKBOARD_VISION_MODELS is empty")
