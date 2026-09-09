@@ -285,10 +285,6 @@ class BlackboardVision:
                 else:
                     parsed[frame.frame_id] = result
 
-            # If this model produced at least one valid result, keep it and
-            # degrade only the unrecoverable frames instead of discarding the
-            # entire batch. This is the common case for intermittent wrapper
-            # omissions from multimodal endpoints.
             if parsed:
                 for frame in unresolved:
                     parsed[frame.frame_id] = self._unresolved_result(
@@ -313,8 +309,6 @@ class BlackboardVision:
                 flush=True,
             )
 
-        # Every configured model failed for every frame. Preserve the lecture
-        # pipeline by returning unresolved markers rather than raising.
         reason = "; ".join(aggregate_errors[-3:]) or "all vision models failed"
         print(
             "[BlackboardVision] all models failed for this batch; preserving "
