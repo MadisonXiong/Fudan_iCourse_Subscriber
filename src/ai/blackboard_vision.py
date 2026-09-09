@@ -15,6 +15,7 @@ import base64
 import io
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,11 +88,10 @@ The course may be functional analysis, but that context is only for recognizing 
 class BlackboardVision:
     """ModelScope OpenAI-compatible vision client.
 
-    ModelScope's serverless catalogue changes independently of model pages.
-    The first real lecture run confirmed Qwen3-VL-8B-Instruct is callable on
-    the configured endpoint, while Qwen3-VL-32B-Instruct currently is not.
-    Defaults therefore use the verified 8B endpoint; users can override the
-    comma-separated model list with BLACKBOARD_VISION_MODELS.
+    Blackboard extraction is best-effort by design. A malformed response for
+    one frame must not abort an otherwise usable lecture. Batch results are
+    preserved, missing frames are retried individually, and unrecoverable
+    frames are represented explicitly as unresolved markers.
     """
 
     def __init__(self):
@@ -114,6 +114,8 @@ class BlackboardVision:
         self.max_edge = int(os.environ.get("BLACKBOARD_VISION_MAX_EDGE", "1600"))
         self.max_tokens = int(os.environ.get("BLACKBOARD_VISION_MAX_TOKENS", "4096"))
         self.timeout = int(os.environ.get("BLACKBOARD_VISION_TIMEOUT", "180"))
+        self.single_retries = max(1, int(os.environ.get("BLACKBOARD_VISION_SINGLE_RETRIES", "3")))
+        self.retry_sleep = max(0.0, float(os.environ.get("BLACKBOARD_VISION_RETRY_SLEEP", "1.5")))
         self.client = OpenAI(api_key=token, base_url=self.base_url)
 
     def _image_data_url(self, path: str) -> str:
@@ -128,12 +130,7 @@ class BlackboardVision:
 
     @staticmethod
     def _parse_response_partial(text: str, frames: list[VisionFrame], model: str) -> dict[int, VisionResult]:
-        """Parse every valid frame block present in a model response.
-
-        Multimodal endpoints sometimes truncate or omit one item in a batch.
-        Keeping the valid blocks lets the caller retry only missing frames
-        instead of discarding the whole batch.
-        """
+        """Parse every valid frame block present in a model response."""
         expected = {f.frame_id: f for f in frames}
         parsed: dict[int, VisionResult] = {}
         for match in _FRAME_RE.finditer(text or ""):
@@ -154,7 +151,6 @@ class BlackboardVision:
 
     @staticmethod
     def _parse_response(text: str, frames: list[VisionFrame], model: str) -> list[VisionResult]:
-        """Strict parser retained for tests and one-frame recovery calls."""
         parsed = BlackboardVision._parse_response_partial(text, frames, model)
         expected = {f.frame_id for f in frames}
         if set(parsed) != expected:
@@ -164,6 +160,17 @@ class BlackboardVision:
                 f"vision response frame mismatch: missing={missing}, extra={extra}"
             )
         return [parsed[f.frame_id] for f in frames]
+
+    @staticmethod
+    def _unresolved_result(frame: VisionFrame, model: str, reason: str) -> VisionResult:
+        safe_reason = (reason or "unknown error").replace("\n", " ").strip()
+        return VisionResult(
+            frame_id=frame.frame_id,
+            timestamp_sec=frame.timestamp_sec,
+            is_blackboard=True,
+            markdown=f"[blackboard frame unresolved: {safe_reason}]",
+            model=model,
+        )
 
     def _content(self, frames: list[VisionFrame], course_title: str) -> list[dict]:
         content: list[dict] = [
@@ -206,43 +213,113 @@ class BlackboardVision:
         )
         return response.choices[0].message.content or ""
 
-    def transcribe_batch(self, frames: list[VisionFrame], course_title: str) -> list[VisionResult]:
-        """Classify/transcribe a batch, recovering omitted frames individually.
+    def _recover_one(self, model: str, frame: VisionFrame, course_title: str) -> VisionResult | None:
+        """Retry one missing frame without allowing it to abort the lecture."""
+        last_error = "empty or malformed response"
+        for attempt in range(1, self.single_retries + 1):
+            try:
+                text = self._request(model, [frame], course_title)
+                parsed = self._parse_response_partial(text, [frame], model)
+                result = parsed.get(frame.frame_id)
+                if result is not None:
+                    if attempt > 1:
+                        print(
+                            f"[BlackboardVision] recovered frame {frame.frame_id} "
+                            f"on retry {attempt}/{self.single_retries}",
+                            flush=True,
+                        )
+                    return result
+                last_error = "model response omitted required frame wrapper"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
 
-        For each configured model, first make one efficient batch request. If
-        the model returns only a subset of wrapper blocks, preserve those valid
-        results and retry only the missing frames one-by-one. This addresses
-        the partial-output behavior observed in the first real 泛函分析 run.
+            if attempt < self.single_retries and self.retry_sleep:
+                time.sleep(self.retry_sleep)
+
+        print(
+            f"[BlackboardVision] frame {frame.frame_id} unresolved after "
+            f"{self.single_retries} retries: {last_error}",
+            flush=True,
+        )
+        return None
+
+    def transcribe_batch(self, frames: list[VisionFrame], course_title: str) -> list[VisionResult]:
+        """Classify/transcribe a batch with graceful per-frame degradation.
+
+        For each configured model, first make one efficient batch request. Any
+        valid blocks are kept. Missing frames are retried individually. If a
+        frame still cannot be recovered, an explicit unresolved marker is
+        returned for that frame so downstream summarization can continue.
         """
         if not frames:
             return []
 
-        errors: list[str] = []
+        aggregate_errors: list[str] = []
         for model in self.models:
             try:
                 text = self._request(model, frames, course_title)
                 parsed = self._parse_response_partial(text, frames, model)
-                missing = [f for f in frames if f.frame_id not in parsed]
-
-                if missing:
-                    print(
-                        f"[BlackboardVision] {model} returned {len(parsed)}/"
-                        f"{len(frames)} frames; retrying {len(missing)} missing "
-                        "frame(s) individually",
-                        flush=True,
-                    )
-                    for frame in missing:
-                        one_text = self._request(model, [frame], course_title)
-                        one = self._parse_response(one_text, [frame], model)
-                        parsed[frame.frame_id] = one[0]
-
-                return [parsed[f.frame_id] for f in frames]
             except Exception as exc:
-                errors.append(f"{model}: {type(exc).__name__}: {exc}")
+                aggregate_errors.append(f"{model}: batch {type(exc).__name__}: {exc}")
                 print(
-                    f"[BlackboardVision] {model} failed: "
-                    f"{type(exc).__name__}: {exc}",
+                    f"[BlackboardVision] {model} batch request failed: "
+                    f"{type(exc).__name__}: {exc}; trying per-frame recovery",
+                    flush=True,
+                )
+                parsed = {}
+
+            missing = [f for f in frames if f.frame_id not in parsed]
+            if missing:
+                print(
+                    f"[BlackboardVision] {model} returned {len(parsed)}/"
+                    f"{len(frames)} frames; retrying {len(missing)} missing "
+                    "frame(s) individually",
                     flush=True,
                 )
 
-        raise RuntimeError("All blackboard vision models failed:\n" + "\n".join(errors))
+            unresolved: list[VisionFrame] = []
+            for frame in missing:
+                result = self._recover_one(model, frame, course_title)
+                if result is None:
+                    unresolved.append(frame)
+                else:
+                    parsed[frame.frame_id] = result
+
+            # If this model produced at least one valid result, keep it and
+            # degrade only the unrecoverable frames instead of discarding the
+            # entire batch. This is the common case for intermittent wrapper
+            # omissions from multimodal endpoints.
+            if parsed:
+                for frame in unresolved:
+                    parsed[frame.frame_id] = self._unresolved_result(
+                        frame,
+                        model,
+                        "model response missing after retries",
+                    )
+                if unresolved:
+                    print(
+                        f"[BlackboardVision] continuing with {len(unresolved)} "
+                        f"unresolved/{len(frames)} frame(s) in this batch",
+                        flush=True,
+                    )
+                return [parsed[f.frame_id] for f in frames]
+
+            aggregate_errors.append(
+                f"{model}: no usable frame results after per-frame recovery"
+            )
+            print(
+                f"[BlackboardVision] {model} produced no usable frame results; "
+                "trying next configured model",
+                flush=True,
+            )
+
+        # Every configured model failed for every frame. Preserve the lecture
+        # pipeline by returning unresolved markers rather than raising.
+        reason = "; ".join(aggregate_errors[-3:]) or "all vision models failed"
+        print(
+            "[BlackboardVision] all models failed for this batch; preserving "
+            "lecture with unresolved markers",
+            flush=True,
+        )
+        fallback_model = self.models[-1] if self.models else "unknown"
+        return [self._unresolved_result(frame, fallback_model, reason) for frame in frames]
