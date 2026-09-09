@@ -164,6 +164,17 @@ VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
 )
 
+# Blackboard / handwritten-math extraction.  This feature is invoked only
+# for course titles matched by BLACKBOARD_COURSES (default: 泛函分析).
+# A 15-second cadence favors completeness over API economy; consecutive
+# near-identical frames are removed locally before vision inference.
+BLACKBOARD_SAMPLE_SEC = int(os.environ.get("BLACKBOARD_SAMPLE_SEC", "15"))
+BLACKBOARD_HASH_DISTANCE = int(os.environ.get("BLACKBOARD_HASH_DISTANCE", "2"))
+BLACKBOARD_VISION_BATCH_SIZE = int(os.environ.get("BLACKBOARD_VISION_BATCH_SIZE", "6"))
+# 0 means unlimited.  If set, the pipeline retains evenly spaced coverage.
+BLACKBOARD_MAX_FRAMES = int(os.environ.get("BLACKBOARD_MAX_FRAMES", "0"))
+BLACKBOARD_FFMPEG_TIMEOUT = int(os.environ.get("BLACKBOARD_FFMPEG_TIMEOUT", "1800"))
+
 # 监控的课程 ID 列表
 COURSE_IDS = [
     c.strip()
