@@ -51,10 +51,10 @@ def merge(local_path: str, remote_path: str):
                 INSERT OR IGNORE INTO main.lectures
                     (sub_id, course_id, sub_title, date, transcript, summary,
                      processed_at, emailed_at, error_msg, error_count, error_stage,
-                     summary_model)
+                     summary_model, blackboard_latex, blackboard_model, blackboard_at)
                 SELECT sub_id, course_id, sub_title, date, transcript, summary,
                        processed_at, emailed_at, error_msg, error_count, error_stage,
-                       summary_model
+                       summary_model, blackboard_latex, blackboard_model, blackboard_at
                 FROM local.lectures
             """)
 
@@ -63,11 +63,14 @@ def merge(local_path: str, remote_path: str):
             #    - Error fields: clear if processed, otherwise keep the most info
             conn.execute("""
                 UPDATE main.lectures SET
-                    transcript    = COALESCE(l.transcript,    main.lectures.transcript),
-                    summary       = COALESCE(l.summary,       main.lectures.summary),
-                    summary_model = COALESCE(l.summary_model, main.lectures.summary_model),
-                    processed_at  = COALESCE(l.processed_at,  main.lectures.processed_at),
-                    emailed_at    = COALESCE(l.emailed_at,    main.lectures.emailed_at),
+                    transcript       = COALESCE(l.transcript,       main.lectures.transcript),
+                    summary          = COALESCE(l.summary,          main.lectures.summary),
+                    summary_model    = COALESCE(l.summary_model,    main.lectures.summary_model),
+                    blackboard_latex = COALESCE(l.blackboard_latex, main.lectures.blackboard_latex),
+                    blackboard_model = COALESCE(l.blackboard_model, main.lectures.blackboard_model),
+                    blackboard_at    = COALESCE(l.blackboard_at,    main.lectures.blackboard_at),
+                    processed_at     = COALESCE(l.processed_at,     main.lectures.processed_at),
+                    emailed_at       = COALESCE(l.emailed_at,       main.lectures.emailed_at),
                     error_msg = CASE
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
