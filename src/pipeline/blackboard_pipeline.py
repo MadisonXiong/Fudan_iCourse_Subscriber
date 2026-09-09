@@ -1,10 +1,20 @@
 """Blackboard video-frame extraction and LaTeX transcription pipeline.
 
-This pipeline is deliberately opt-in.  ``LectureRunner`` invokes it only for
+This pipeline is deliberately opt-in. ``LectureRunner`` invokes it only for
 courses whitelisted by ``course_requires_blackboard`` (default: 泛函分析).
-It samples the real lecture video, drops near-identical consecutive frames,
-uses a multimodal model to classify/transcribe the survivors, and returns a
-chronological Markdown document whose mathematics is LaTeX.
+
+The expensive vision model does *not* receive every sampled frame. We sample
+the whole lecture densely, then run a local temporal selector designed for a
+fixed classroom camera:
+
+* periodic coverage anchors guarantee the entire lecture remains represented;
+* persistent-change detection keeps board states that changed and then stayed
+  stable, which is much less sensitive to a lecturer walking across the view;
+* a soft frame cap preserves all coverage anchors first and then the strongest
+  extra change events.
+
+Only the selected frames are sent to the multimodal model for Markdown+LaTeX
+transcription.
 """
 
 from __future__ import annotations
@@ -15,7 +25,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import imagehash
+import numpy as np
 from PIL import Image
 
 from src.ai.blackboard_vision import (
@@ -28,61 +38,84 @@ from src.runtime import config
 
 
 class BlackboardPipeline:
-    """Extract, deduplicate, classify and transcribe blackboard frames."""
+    """Extract, locally select, classify and transcribe blackboard frames."""
 
     def __init__(self, client, reporter=None):
         self._client = client
         self._reporter = reporter
         self._vision = BlackboardVision()
         self.sample_sec = max(5, int(config.BLACKBOARD_SAMPLE_SEC))
-        self.hash_distance = max(0, int(config.BLACKBOARD_HASH_DISTANCE))
         self.batch_size = max(1, int(config.BLACKBOARD_VISION_BATCH_SIZE))
         self.max_frames = max(0, int(config.BLACKBOARD_MAX_FRAMES))
+        self.coverage_sec = max(self.sample_sec, int(config.BLACKBOARD_COVERAGE_SEC))
+        self.analysis_width = max(96, int(config.BLACKBOARD_ANALYSIS_WIDTH))
+        self.change_threshold = max(1, int(config.BLACKBOARD_CHANGE_THRESHOLD))
+        self.stable_threshold = max(0, int(config.BLACKBOARD_STABLE_THRESHOLD))
+        self.change_ratio = max(0.0, float(config.BLACKBOARD_CHANGE_RATIO))
+        self.event_gap_sec = max(self.sample_sec, int(config.BLACKBOARD_EVENT_GAP_SEC))
 
     def run(self, course_id: str, course_title: str, sub_id: str) -> tuple[str, str]:
         """Return ``(markdown, model_description)`` for one lecture.
 
         Raises when the video cannot be sampled, all vision models fail, or no
-        blackboard frame is found.  For a required course that failure is
-        intentional: the lecture must remain retryable rather than being
-        silently marked processed without its board notes.
+        blackboard frame is found. For a required course that failure is
+        intentional: the lecture remains retryable rather than being silently
+        marked processed without board notes.
         """
         self._info(
-            f"    [Blackboard] required for {course_title}; "
-            f"sampling every {self.sample_sec}s"
+            f"    [Blackboard] required for {course_title}; dense sampling "
+            f"every {self.sample_sec}s, coverage anchor every {self.coverage_sec}s"
         )
         temp_dir = tempfile.mkdtemp(prefix=f"icourse-board-{sub_id}-")
         try:
             frames = self._extract_frames(course_id, sub_id, temp_dir)
             if not frames:
                 raise RuntimeError("ffmpeg produced no video frames")
-            frames = self._dedup_frames(frames)
-            if self.max_frames and len(frames) > self.max_frames:
-                # Evenly retain coverage across the whole lecture rather than
-                # truncating the end.  Default is unlimited (0).
-                step = (len(frames) - 1) / max(1, self.max_frames - 1)
-                indices = sorted({round(i * step) for i in range(self.max_frames)})
-                frames = [frames[i] for i in indices]
-            self._info(
-                f"    [Blackboard] {len(frames)} candidate frame(s) after "
-                "near-duplicate filtering"
-            )
+            raw_count = len(frames)
+
+            try:
+                frames, selector_stats = self._select_keyframes(frames)
+                self._info(
+                    "    [Blackboard] local selector: "
+                    f"{raw_count} sampled -> {len(frames)} vision frame(s) "
+                    f"(anchors={selector_stats['anchors']}, "
+                    f"change-events={selector_stats['events']}, "
+                    f"cap={self.max_frames or 'none'})"
+                )
+            except Exception as exc:
+                # Selection is an optimization, never a reason to lose the
+                # required transcript. Fall back to evenly spaced coverage.
+                self._info(
+                    f"    [Blackboard] selector warning: {type(exc).__name__}: "
+                    f"{exc}; falling back to even coverage"
+                )
+                frames = self._fallback_even_coverage(frames)
+                self._info(
+                    f"    [Blackboard] fallback selected {len(frames)}/"
+                    f"{raw_count} frame(s)"
+                )
+
+            if not frames:
+                raise RuntimeError("local blackboard selector produced no frames")
 
             results: list[VisionResult] = []
             for start in range(0, len(frames), self.batch_size):
                 batch = frames[start:start + self.batch_size]
                 batch_results = self._vision.transcribe_batch(batch, course_title)
                 results.extend(batch_results)
-                board_so_far = sum(1 for r in results if r.is_blackboard and r.markdown.strip())
+                board_so_far = sum(
+                    1 for r in results if r.is_blackboard and r.markdown.strip()
+                )
                 self._info(
-                    f"    [Blackboard] vision {min(start + len(batch), len(frames))}/"
-                    f"{len(frames)}; board frames={board_so_far}"
+                    f"    [Blackboard] vision "
+                    f"{min(start + len(batch), len(frames))}/{len(frames)}; "
+                    f"board frames={board_so_far}"
                 )
 
             board = [r for r in results if r.is_blackboard and r.markdown.strip()]
             if not board:
                 raise RuntimeError(
-                    "No handwritten blackboard content was detected in sampled video frames"
+                    "No handwritten blackboard content was detected in selected video frames"
                 )
 
             markdown = self._assemble(board)
@@ -143,31 +176,134 @@ class BlackboardPipeline:
             for i, path in enumerate(paths, start=1)
         ]
 
-    def _dedup_frames(self, frames: list[VisionFrame]) -> list[VisionFrame]:
-        """Drop only near-identical *consecutive* frames.
+    def _analysis_gray(self, frame: VisionFrame) -> np.ndarray:
+        """Load one low-resolution grayscale image for temporal comparison."""
+        with Image.open(frame.path) as image:
+            image = image.convert("L")
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                raise ValueError(f"invalid frame size for {frame.path}")
+            new_h = max(54, round(height * self.analysis_width / width))
+            image = image.resize(
+                (self.analysis_width, new_h),
+                Image.Resampling.BILINEAR,
+            )
+            return np.asarray(image, dtype=np.uint8)
 
-        We intentionally avoid global image dedup: a lecturer may erase the
-        board and later return to a visually similar layout containing
-        different mathematics.  Consecutive pHash filtering removes static
-        camera shots while retaining changes in handwriting.
+    @staticmethod
+    def _robust_abs_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Absolute frame difference after compensating global brightness.
+
+        Classroom cameras often auto-adjust exposure as a lecturer moves. A
+        global luminance shift should not look like a board rewrite, so we
+        subtract a robust median shift estimated on a sparse pixel grid.
         """
-        kept: list[VisionFrame] = []
-        previous_hash = None
-        for frame in frames:
-            try:
-                with Image.open(frame.path) as image:
-                    current_hash = imagehash.phash(image.convert("RGB"))
-            except Exception:
-                # Keep undecodable-to-hash frames; the vision layer will make
-                # the final classification and can still report a useful error.
-                kept.append(frame)
-                previous_hash = None
+        delta = b.astype(np.int16) - a.astype(np.int16)
+        sparse = delta[::4, ::4]
+        shift = float(np.median(sparse)) if sparse.size else 0.0
+        return np.abs(delta.astype(np.float32) - shift)
+
+    def _select_keyframes(self, frames: list[VisionFrame]) -> tuple[list[VisionFrame], dict[str, int]]:
+        """Choose full-lecture coverage plus persistent board-change events.
+
+        A genuine newly written/erased board region differs from the previous
+        sample but is usually still present in the next sample. A moving
+        lecturer tends to differ in both directions. We therefore score the
+        mask ``changed_from_previous AND stable_to_next``. Periodic anchors are
+        selected separately, so the transcript does not rely on this heuristic
+        to cover the lecture timeline.
+        """
+        n = len(frames)
+        if n <= 2:
+            return list(frames), {"anchors": n, "events": 0}
+
+        gray = [self._analysis_gray(frame) for frame in frames]
+        if len({arr.shape for arr in gray}) != 1:
+            raise ValueError("sampled frames have inconsistent dimensions")
+
+        # Motion-after score is also used to choose a relatively stable anchor
+        # inside each coverage window. Ties prefer the latest frame, which
+        # tends to contain the most accumulated writing in that window.
+        motion_after = [1.0] * n
+        for i in range(n - 1):
+            diff = self._robust_abs_diff(gray[i], gray[i + 1])
+            motion_after[i] = float(np.mean(diff >= self.change_threshold))
+        motion_after[-1] = motion_after[-2]
+
+        anchors: set[int] = {0, n - 1}
+        windows: dict[int, list[int]] = {}
+        for i, frame in enumerate(frames):
+            key = frame.timestamp_sec // self.coverage_sec
+            windows.setdefault(key, []).append(i)
+        for indices in windows.values():
+            best = min(indices, key=lambda i: (motion_after[i], -frames[i].timestamp_sec))
+            anchors.add(best)
+
+        event_scores: dict[int, float] = {}
+        for i in range(1, n - 1):
+            changed = self._robust_abs_diff(gray[i - 1], gray[i])
+            stable_next = self._robust_abs_diff(gray[i], gray[i + 1])
+            persistent = (
+                (changed >= self.change_threshold)
+                & (stable_next <= self.stable_threshold)
+            )
+            score = float(np.mean(persistent))
+            if score >= self.change_ratio:
+                # Use the following frame: the new state has survived one more
+                # sample and is more likely to be readable after the lecturer
+                # has moved away from freshly written text.
+                target = min(i + 1, n - 1)
+                event_scores[target] = max(score, event_scores.get(target, 0.0))
+
+        # Collapse dense event clusters. Process strongest changes first so a
+        # board erase/rewrite wins over tiny transient changes nearby.
+        event_indices: list[int] = []
+        for idx, _score in sorted(event_scores.items(), key=lambda item: item[1], reverse=True):
+            ts = frames[idx].timestamp_sec
+            if any(abs(ts - frames[j].timestamp_sec) < self.event_gap_sec for j in event_indices):
                 continue
-            if previous_hash is not None and (current_hash - previous_hash) <= self.hash_distance:
-                continue
-            kept.append(frame)
-            previous_hash = current_hash
-        return kept
+            event_indices.append(idx)
+
+        selected = set(anchors)
+        # If a cap is active, coverage anchors have priority. Extra event slots
+        # are filled by change strength. For unusually long lectures where the
+        # anchors alone exceed the cap, downsample anchors evenly rather than
+        # truncating the end of the lecture.
+        if self.max_frames and len(selected) > self.max_frames:
+            ordered = sorted(selected)
+            step = (len(ordered) - 1) / max(1, self.max_frames - 1)
+            selected = {ordered[round(i * step)] for i in range(self.max_frames)}
+            event_indices = []
+        else:
+            ranked_events = sorted(
+                event_indices,
+                key=lambda idx: event_scores.get(idx, 0.0),
+                reverse=True,
+            )
+            for idx in ranked_events:
+                if idx in selected:
+                    continue
+                if self.max_frames and len(selected) >= self.max_frames:
+                    break
+                selected.add(idx)
+
+        ordered_selected = [frames[i] for i in sorted(selected)]
+        event_kept = sum(1 for i in selected if i in event_scores and i not in anchors)
+        return ordered_selected, {"anchors": len(anchors), "events": event_kept}
+
+    def _fallback_even_coverage(self, frames: list[VisionFrame]) -> list[VisionFrame]:
+        """Safe fallback when local image analysis unexpectedly fails."""
+        if not frames:
+            return []
+        target = self.max_frames if self.max_frames else max(
+            2,
+            int(frames[-1].timestamp_sec / self.coverage_sec) + 2,
+        )
+        if len(frames) <= target:
+            return list(frames)
+        step = (len(frames) - 1) / max(1, target - 1)
+        indices = sorted({round(i * step) for i in range(target)})
+        return [frames[i] for i in indices]
 
     @staticmethod
     def _timestamp(seconds: int) -> str:
