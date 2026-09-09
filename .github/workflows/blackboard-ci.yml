@@ -1,0 +1,57 @@
+name: Blackboard Feature CI
+
+on:
+  push:
+    branches: [feature/blackboard-latex]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q main.py src scripts
+
+      - name: Smoke-test schema and course whitelist
+        run: |
+          python - <<'PY'
+          import os
+          import sqlite3
+          import tempfile
+
+          from src.ai.blackboard_vision import course_requires_blackboard
+          from src.data.database import Database
+
+          assert course_requires_blackboard("泛函分析")
+          assert course_requires_blackboard("泛函分析（荣誉）")
+          assert not course_requires_blackboard("高等数理统计")
+
+          fd, path = tempfile.mkstemp(suffix=".db")
+          os.close(fd)
+          try:
+              db = Database(path)
+              cols = {
+                  row[1]
+                  for row in db.conn.execute("PRAGMA table_info(lectures)").fetchall()
+              }
+              assert {"blackboard_latex", "blackboard_model", "blackboard_at"} <= cols
+              db.conn.close()
+          finally:
+              os.remove(path)
+          PY
