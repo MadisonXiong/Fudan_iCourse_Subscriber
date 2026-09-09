@@ -44,18 +44,6 @@ MODEL_PROVIDERS: list[dict] = [
             "deepseek-v4-flash"
         ],
     },
-    # {
-    #     "name": "modelscope",
-    #     "api_key_env": "DASHSCOPE_API_KEY",
-    #     "base_url_env": "DASHSCOPE_BASE_URL",
-    #     "default_base_url": "https://api-inference.modelscope.cn/v1/",
-    #     "models": [
-    #         "deepseek-ai/DeepSeek-V3.2",
-    #         "ZhipuAI/GLM-5",
-    #         "MiniMax/MiniMax-M2.5",
-    #         "Qwen/Qwen3.5-397B-A17B",
-    #     ],
-    # },
     {
         "name": "gemini",
         "api_key_env": "GEMINI_API_KEY",
@@ -122,12 +110,10 @@ SMTP_PORT = 465
 # Database & Storage
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 VIDEO_DIR = os.path.join(DATA_DIR, "videos")
-AUDIO_DIR = os.path.join(DATA_DIR, "audio")  # ffmpeg-decoded f32le scratch buffers
+AUDIO_DIR = os.path.join(DATA_DIR, "audio")
 DB_PATH = os.environ.get("DB_PATH", os.path.join(DATA_DIR, "icourse.db"))
 
-# Sherpa-onnx ASR model directory.  Default: SenseVoice (zh+en+ja+ko+yue, int8).
-# ASR_MODEL_DIR is the new name; SENSEVOICE_MODEL_DIR is the legacy env var
-# kept as a fallback so existing CI cache keys keep working.
+# ASR
 ASR_MODEL_DIR = os.environ.get(
     "ASR_MODEL_DIR",
     os.environ.get(
@@ -135,54 +121,44 @@ ASR_MODEL_DIR = os.environ.get(
         "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
     ),
 )
-SENSEVOICE_MODEL_DIR = ASR_MODEL_DIR  # alias for any straggler imports
+SENSEVOICE_MODEL_DIR = ASR_MODEL_DIR
 SILERO_VAD_PATH = os.environ.get("SILERO_VAD_PATH", "silero_vad.onnx")
-
-# ASR backend selector — Transcriber dispatches on this.  When changing,
-# ASR_MODEL_DIR must point at a matching sherpa-onnx model bundle:
-#   sensevoice — sherpa-onnx-sense-voice-* (multi-lang CTC, single model)
-#   firered    — sherpa-onnx-fire-red-asr2-ctc-* (CTC, single model.onnx)
-#   zipformer  — sherpa-onnx-zipformer-* (transducer, encoder/decoder/joiner)
 ASR_BACKEND = os.environ.get("ASR_BACKEND", "sensevoice").strip().lower()
-# Inference thread count.  4 fully saturates a 4-vCPU GitHub runner.
 ASR_NUM_THREADS = int(os.environ.get("ASR_NUM_THREADS", "4"))
 
-# ── Scheduler concurrency knobs.  All overridable via env. ────────────────
-# image_pool: image downloads are tiny and IO-bound, 20 saturates bandwidth
-# without hammering the iCourse server.
+# Scheduler concurrency
 IMAGE_WORKERS = int(os.environ.get("IMAGE_WORKERS", "20"))
-# OCR pool: pool size is the hard ceiling; a fixed BoundedSemaphore(OCR_MAX_TARGET)
-# gates live concurrency since RapidOCR is single-threaded CPU-bound.
 OCR_MAX_WORKERS = int(os.environ.get("OCR_MAX_WORKERS", "8"))
-# Fixed cap — no dynamic CPU-based adjustment.  RapidOCR is single-threaded;
-# more than 2 concurrent workers don't increase throughput on 4-core runners.
 OCR_MAX_TARGET = int(os.environ.get("OCR_MAX_TARGET", "2"))
-# Two concurrent ffmpeg audio extractions: the current lecture being
-# transcribed + one pre-decoded for the next lecture.  Bandwidth-fair sharing
-# at 20 MB/s split = ~10 MB/s each.
 VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
 )
 
-# Blackboard / handwritten-math extraction.  This feature is invoked only
-# for course titles matched by BLACKBOARD_COURSES (default: 泛函分析).
-# A 15-second cadence favors completeness over API economy; consecutive
-# near-identical frames are removed locally before vision inference.
+# Blackboard / handwritten-math extraction. Invoked only for whitelisted
+# course titles (default: 泛函分析).
+#
+# Dense extraction remains every 15s so short-lived board states are not lost.
+# A local temporal selector then reduces expensive multimodal requests:
+# - one stable full-coverage anchor about every 60s;
+# - extra persistent board-change events;
+# - a soft default cap of 240 selected frames for very long lectures.
 BLACKBOARD_SAMPLE_SEC = int(os.environ.get("BLACKBOARD_SAMPLE_SEC", "15"))
-BLACKBOARD_HASH_DISTANCE = int(os.environ.get("BLACKBOARD_HASH_DISTANCE", "2"))
-BLACKBOARD_VISION_BATCH_SIZE = int(os.environ.get("BLACKBOARD_VISION_BATCH_SIZE", "6"))
-# 0 means unlimited.  If set, the pipeline retains evenly spaced coverage.
-BLACKBOARD_MAX_FRAMES = int(os.environ.get("BLACKBOARD_MAX_FRAMES", "0"))
+BLACKBOARD_COVERAGE_SEC = int(os.environ.get("BLACKBOARD_COVERAGE_SEC", "60"))
+BLACKBOARD_ANALYSIS_WIDTH = int(os.environ.get("BLACKBOARD_ANALYSIS_WIDTH", "192"))
+BLACKBOARD_CHANGE_THRESHOLD = int(os.environ.get("BLACKBOARD_CHANGE_THRESHOLD", "24"))
+BLACKBOARD_STABLE_THRESHOLD = int(os.environ.get("BLACKBOARD_STABLE_THRESHOLD", "14"))
+BLACKBOARD_CHANGE_RATIO = float(os.environ.get("BLACKBOARD_CHANGE_RATIO", "0.008"))
+BLACKBOARD_EVENT_GAP_SEC = int(os.environ.get("BLACKBOARD_EVENT_GAP_SEC", "30"))
+BLACKBOARD_VISION_BATCH_SIZE = int(os.environ.get("BLACKBOARD_VISION_BATCH_SIZE", "4"))
+BLACKBOARD_MAX_FRAMES = int(os.environ.get("BLACKBOARD_MAX_FRAMES", "240"))
 BLACKBOARD_FFMPEG_TIMEOUT = int(os.environ.get("BLACKBOARD_FFMPEG_TIMEOUT", "1800"))
 
-# 监控的课程 ID 列表
+# Monitored courses
 COURSE_IDS = [
     c.strip()
     for c in os.environ.get("COURSE_IDS", "").split(",")
     if c.strip()
 ]
 
-# 学期级课程目录爬取（已弃用 — main.py 现在自动发现所有学期）。
-# 保留此变量仅用于兼容老部署环境，新部署无需设置。
-# 例：CRAWL_TERM=25
+# Deprecated legacy semester-crawl setting.
 CRAWL_TERM = os.environ.get("CRAWL_TERM", "").strip()
