@@ -17,7 +17,7 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v2/"
+_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v3/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -42,8 +42,6 @@ class BlackboardLectureRunner(BaseLectureRunner):
         if not sub_id or get_blackboard(self._db, sub_id) is None:
             return False
 
-        # Old AI-generated summaries and older compiler outputs are not valid
-        # for the current reconstruction algorithm.
         return str(existing.get("summary_model") or "").startswith(_NOTES_MODEL_PREFIX)
 
     def _ensure_blackboard(self, sub_id: str, course_title: str) -> tuple[str, str]:
@@ -68,13 +66,6 @@ class BlackboardLectureRunner(BaseLectureRunner):
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
-        """Create final output.
-
-        For blackboard courses this method intentionally does not call the
-        general-purpose summarizer. It reconstructs cached frame transcriptions
-        directly into chronological LaTeX notes. Other courses retain the
-        repository's original summary behavior.
-        """
         if not course_requires_blackboard(course_title):
             return super()._summarize(
                 sub_id, course_title, transcript, transcript_segments
@@ -110,7 +101,7 @@ class BlackboardLectureRunner(BaseLectureRunner):
             model_used = f"{_NOTES_MODEL_PREFIX}{blackboard_model or 'vision'}"
             self._reporter.info(
                 f"    [OK] Blackboard LaTeX notes: {len(blackboard_latex)} raw chars "
-                f"-> {len(notes)} note chars; deterministic board-state reconstruction; "
+                f"-> {len(notes)} note chars; vertical-movement content stitching; "
                 "no LLM summarization"
             )
             self._db.update_summary(sub_id, notes, model_used)
