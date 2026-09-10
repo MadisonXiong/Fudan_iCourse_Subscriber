@@ -1,26 +1,34 @@
-"""Reconstruct chronological blackboard transcriptions into LaTeX notes.
+"""Stitch chronological blackboard snapshots into non-repetitive LaTeX notes.
 
-This module performs deterministic board-state reconstruction.  It does not
-summarize, paraphrase, infer mathematics, or call another LLM.  Each vision
-frame is already an evidence transcription; here we infer only temporal state:
-what stayed on the same board, what was newly added, and when the board was
-cleared/replaced.
+The vision model transcribes each selected frame accurately, but a physical
+blackboard can move up and down.  The same written material therefore appears
+at different vertical positions in many consecutive frames.  This module
+stitches those snapshots by CONTENT rather than by line position.
 
-The output is therefore suitable as a text substitute for replaying a proof-
-heavy lecture: repeated full-board snapshots disappear, while new proof lines,
-formula changes, corrections, and unreadable markers remain.
+No LLM is called here.  We do not summarize or infer mathematics.  We only:
+1. split large ``aligned`` snapshots into logical rows;
+2. recognize the same row even when it moved vertically or formatting changed;
+3. replace a visibly partial row with its later, longer completion;
+4. preserve genuinely new proof steps in first-appearance order; and
+5. start a new board segment only after a persistent content discontinuity.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from src.ai.blackboard_vision import BLACKBOARD_SUMMARY_MARKER
 
 
 BLACKBOARD_NOTES_MARKER = "### 黑板板书 LaTeX 笔记"
 _FRAME_HEADING_RE = re.compile(r"^####\s+([^\n]+)\s*$", re.MULTILINE)
+_ALIGNED_RE = re.compile(
+    r"(?:\$\$|\\\[)?\s*\\begin\{aligned\}(.*?)\\end\{aligned\}\s*(?:\$\$|\\\])?",
+    re.DOTALL,
+)
+_TEXT_RE = re.compile(r"\\text\{([^{}]*)\}")
 
 
 @dataclass(frozen=True)
@@ -29,24 +37,62 @@ class _Frame:
     units: tuple[str, ...]
 
 
-def _normalize(unit: str) -> str:
-    """Whitespace-only canonicalization used for identity tests.
+def _split_aligned(unit: str) -> list[str]:
+    """Split one aligned environment into row-sized display-math units.
 
-    Mathematical punctuation and symbols are deliberately untouched: changing
-    ``<`` to ``<=`` or a subscript is mathematically meaningful and must not be
-    hidden by fuzzy normalization.
+    Vision sometimes emits an entire board as a single aligned environment.
+    Treating that as one unit defeats de-duplication and creates enormous
+    rendering URLs.  Splitting on LaTeX row separators preserves the written
+    content while allowing rows to match the same rows in later frames.
     """
-    return re.sub(r"\s+", "", unit).strip()
+    match = _ALIGNED_RE.fullmatch(unit.strip())
+    if not match:
+        return [unit.strip()]
+
+    body = match.group(1)
+    rows = re.split(r"\\\\(?:\s*\[[^\]]*\])?", body)
+    out: list[str] = []
+    for row in rows:
+        row = row.strip()
+        if not row:
+            continue
+        # '&' is alignment syntax, not mathematical content.  Once a row is
+        # taken out of aligned, leaving '&' would make standalone LaTeX invalid.
+        row = row.replace("&", "").strip()
+        if row:
+            out.append(f"$$\n{row}\n$$")
+    return out or [unit.strip()]
 
 
 def _logical_units(body: str) -> list[str]:
-    """Split a frame conservatively while keeping display-math blocks intact."""
-    units: list[str] = []
+    """Split a frame conservatively while keeping display math intact."""
+    raw_units: list[str] = []
     math_buf: list[str] = []
     in_display = False
+    aligned_buf: list[str] = []
+    in_bare_aligned = False
 
     for raw in body.splitlines():
         line = raw.rstrip()
+
+        # Bare \begin{aligned}...\end{aligned} occasionally arrives without
+        # $$ delimiters.  Buffer the whole environment before splitting rows.
+        if in_bare_aligned:
+            aligned_buf.append(line)
+            if "\\end{aligned}" in line:
+                raw_units.append("\n".join(aligned_buf).strip())
+                aligned_buf = []
+                in_bare_aligned = False
+            continue
+        if not in_display and "\\begin{aligned}" in line and "$$" not in line:
+            aligned_buf = [line]
+            if "\\end{aligned}" in line:
+                raw_units.append(line.strip())
+                aligned_buf = []
+            else:
+                in_bare_aligned = True
+            continue
+
         if not line.strip():
             if in_display:
                 math_buf.append("")
@@ -56,7 +102,7 @@ def _logical_units(body: str) -> list[str]:
         if in_display:
             math_buf.append(line)
             if dollar_count % 2 == 1:
-                units.append("\n".join(math_buf).strip())
+                raw_units.append("\n".join(math_buf).strip())
                 math_buf = []
                 in_display = False
             continue
@@ -66,12 +112,19 @@ def _logical_units(body: str) -> list[str]:
             in_display = True
             continue
 
-        units.append(line.strip())
+        raw_units.append(line.strip())
 
     if math_buf:
-        # Keep incomplete visible evidence rather than silently discarding it.
-        units.append("\n".join(math_buf).strip())
-    return [u for u in units if u.strip()]
+        raw_units.append("\n".join(math_buf).strip())
+    if aligned_buf:
+        raw_units.append("\n".join(aligned_buf).strip())
+
+    units: list[str] = []
+    for unit in raw_units:
+        if not unit.strip():
+            continue
+        units.extend(_split_aligned(unit))
+    return [unit for unit in units if unit.strip()]
 
 
 def _parse_frames(markdown: str) -> list[_Frame]:
@@ -81,9 +134,9 @@ def _parse_frames(markdown: str) -> list[_Frame]:
 
     matches = list(_FRAME_HEADING_RE.finditer(text))
     frames: list[_Frame] = []
-    for i, match in enumerate(matches):
+    for index, match in enumerate(matches):
         start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         body = text[start:end].strip()
         units = tuple(_logical_units(body))
         if units:
@@ -91,118 +144,184 @@ def _parse_frames(markdown: str) -> list[_Frame]:
     return frames
 
 
-def _norm_set(frame: _Frame | None) -> set[str]:
-    if frame is None:
-        return set()
-    return {_normalize(u) for u in frame.units if _normalize(u)}
+def _comparison_key(unit: str) -> str:
+    """Canonical form used ONLY to detect repeated visible content.
+
+    We remove presentation syntax (math delimiters, alignment markers,
+    whitespace, bullets, \text wrappers) but keep mathematical symbols,
+    numbers, subscripts, superscripts, operators, and command names.
+    """
+    text = unit.strip()
+    text = text.replace("$$", "").replace(r"\[", "").replace(r"\]", "")
+    text = text.replace(r"\(", "").replace(r"\)", "")
+    text = text.replace(r"\begin{aligned}", "").replace(r"\end{aligned}", "")
+    text = text.replace("&", "")
+    text = text.replace(r"\left", "").replace(r"\right", "")
+    text = re.sub(r"\\(?:quad|qquad|,|;|!|:)", "", text)
+
+    # Unwrap simple \text{...} so a prose line and the same prose inside an
+    # aligned environment compare as the same board content.
+    previous = None
+    while previous != text:
+        previous = text
+        text = _TEXT_RE.sub(r"\1", text)
+
+    text = re.sub(r"^[\s>*•·\-—–]+", "", text)
+    text = text.replace("，", ",").replace("。", ".").replace("：", ":")
+    text = text.replace("；", ";").replace("（", "(").replace("）", ")")
+    text = text.replace(r"\cdots", "...").replace(r"\ldots", "...")
+    text = re.sub(r"\s+", "", text)
+    # End punctuation varies harmlessly between otherwise identical frames.
+    text = re.sub(r"[.,;:]+$", "", text)
+    return text
 
 
-def _retention(old: set[str], new: set[str]) -> float:
-    """Fraction of the old visible board that remains exactly present."""
-    if not old:
-        return 1.0
-    return len(old & new) / len(old)
+def _is_math_heavy(unit: str) -> bool:
+    return any(
+        token in unit
+        for token in ("$$", "\\sum", "\\int", "\\forall", "\\infty", "=", "<", ">", "^", "_")
+    )
 
 
-def _overlap_small_side(a: set[str], b: set[str]) -> float:
+def _same_content(a: str, b: str) -> bool:
+    """Conservative content-equivalence test independent of vertical position."""
+    ka = _comparison_key(a)
+    kb = _comparison_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+
+    shorter, longer = (ka, kb) if len(ka) <= len(kb) else (kb, ka)
+    if len(shorter) >= 10 and shorter in longer:
+        # Literal containment is strong evidence of the same row while the
+        # lecturer is still completing it.  Use a stricter ratio for math.
+        ratio = len(shorter) / len(longer)
+        threshold = 0.84 if (_is_math_heavy(a) or _is_math_heavy(b)) else 0.70
+        if ratio >= threshold:
+            return True
+
+    # Fuzzy matching is allowed only for prose.  For mathematics, even a
+    # one-symbol edit may be meaningful, so exact/containment rules above are
+    # deliberately the only forms of fuzzy equivalence.
+    if _is_math_heavy(a) or _is_math_heavy(b):
+        return False
+    if min(len(ka), len(kb)) < 12:
+        return False
+    return SequenceMatcher(None, ka, kb, autojunk=False).ratio() >= 0.93
+
+
+def _prefer_newer(old: str, new: str) -> bool:
+    """Whether a later equivalent row is a visibly fuller transcription."""
+    ko = _comparison_key(old)
+    kn = _comparison_key(new)
+    if not ko or not kn or ko == kn:
+        return False
+    if ko in kn and len(kn) >= len(ko) * 1.06:
+        return True
+    if not (_is_math_heavy(old) or _is_math_heavy(new)):
+        sim = SequenceMatcher(None, ko, kn, autojunk=False).ratio()
+        return sim >= 0.93 and len(kn) >= len(ko) * 1.12
+    return False
+
+
+def _matching_count(a: tuple[str, ...], b: tuple[str, ...]) -> int:
+    """Greedy one-to-one match count between two board snapshots."""
+    used: set[int] = set()
+    count = 0
+    for unit_a in a:
+        for j, unit_b in enumerate(b):
+            if j in used:
+                continue
+            if _same_content(unit_a, unit_b):
+                used.add(j)
+                count += 1
+                break
+    return count
+
+
+def _overlap_small_side(a: tuple[str, ...], b: tuple[str, ...]) -> float:
     if not a or not b:
         return 0.0
-    return len(a & b) / min(len(a), len(b))
+    return _matching_count(a, b) / min(len(a), len(b))
+
+
+def _retention(old: tuple[str, ...], new: tuple[str, ...]) -> float:
+    if not old:
+        return 1.0
+    return _matching_count(old, new) / len(old)
 
 
 def _is_board_reset(frames: list[_Frame], index: int) -> bool:
-    """Detect a persistent erase/board switch, rejecting one-frame occlusion.
+    """Detect persistent replacement, not mere up/down board motion.
 
-    A reset is accepted only when the following frame supports the new state
-    rather than returning to the previous state.  This prevents a lecturer
-    standing in front of the board from creating a false section break.
+    Vertical motion commonly turns a full frame into an overlapping subset;
+    overlap on the SMALLER side therefore remains high and must not be treated
+    as an erase.  A reset requires both low semantic overlap and confirmation
+    from the following frame.
     """
     if index <= 0:
         return False
 
-    previous = _norm_set(frames[index - 1])
-    current = _norm_set(frames[index])
-    following = _norm_set(frames[index + 1]) if index + 1 < len(frames) else set()
+    previous = frames[index - 1].units
+    current = frames[index].units
+    following = frames[index + 1].units if index + 1 < len(frames) else tuple()
     if not previous or not current:
         return False
 
     direct_overlap = _overlap_small_side(previous, current)
     old_retained = _retention(previous, current)
 
-    # Last frame cannot be validated by look-ahead; only accept a very strong
-    # discontinuity there.
     if not following:
-        return direct_overlap < 0.06 and old_retained < 0.12
+        return direct_overlap < 0.05 and old_retained < 0.10
 
     new_persists = _retention(current, following)
     old_returns = _retention(previous, following)
 
-    # Near-total replacement: almost none of the old text remains, and the new
-    # state persists into the next sampled frame.
-    if direct_overlap < 0.10 and old_retained < 0.18:
-        return new_persists >= 0.35 and old_returns < 0.30
-
-    # Erasing often leaves a heading or one formula behind.  Detect a large,
-    # persistent shrink even when the surviving small set overlaps perfectly.
-    large_shrink = len(current) <= max(2, int(len(previous) * 0.55))
-    if large_shrink and old_retained < 0.45:
-        return new_persists >= 0.50 and old_returns < 0.55
-
-    return False
+    # A genuine board replacement has almost no common content and the new
+    # content remains visible in the next sample.  A shifted board usually has
+    # strong overlap on the smaller side even if many old lines leave view.
+    return (
+        direct_overlap < 0.08
+        and old_retained < 0.14
+        and new_persists >= 0.35
+        and old_returns < 0.25
+    )
 
 
-def _extension_candidate(previous_units: tuple[str, ...], current_unit: str,
-                         current_pos: int) -> str | None:
-    """Find a nearby previous line that was merely extended while writing.
+def _find_equivalent(state: list[str], unit: str) -> int | None:
+    # Search newest-first because a repeated board line is normally close in
+    # time, but position is intentionally ignored.
+    for index in range(len(state) - 1, -1, -1):
+        if _same_content(state[index], unit):
+            return index
+    return None
 
-    We only treat literal containment as an extension; no fuzzy edit-distance
-    replacement is used because a one-symbol mathematical edit can change the
-    statement.  Position is restricted to the same/adjacent line to avoid
-    merging two different proof steps that happen to share a long expression.
-    """
-    new_norm = _normalize(current_unit)
-    if len(new_norm) < 10:
-        return None
 
-    lo = max(0, current_pos - 1)
-    hi = min(len(previous_units), current_pos + 2)
-    candidates: list[str] = []
-    for old in previous_units[lo:hi]:
-        old_norm = _normalize(old)
-        if len(old_norm) < 8 or old_norm == new_norm:
+def _merge_units(state: list[str], current_units: tuple[str, ...]) -> int:
+    """Merge a snapshot into a segment; return number of genuinely new rows."""
+    added = 0
+    for unit in current_units:
+        index = _find_equivalent(state, unit)
+        if index is not None:
+            if _prefer_newer(state[index], unit):
+                state[index] = unit
             continue
-        if old_norm in new_norm and len(old_norm) / len(new_norm) >= 0.45:
-            candidates.append(old)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda u: len(_normalize(u)))
-
-
-def _merge_frame_into_episode(state: list[str], previous_units: tuple[str, ...],
-                              current_units: tuple[str, ...]) -> None:
-    """Merge one full-board snapshot into an accumulated board episode."""
-    norm_to_index = {_normalize(u): i for i, u in enumerate(state)}
-
-    for pos, unit in enumerate(current_units):
-        norm = _normalize(unit)
-        if not norm or norm in norm_to_index:
-            continue
-
-        # A teacher often writes one formula over several 15-second samples.
-        # Replace only a literal shorter prefix/subexpression from the previous
-        # snapshot with the longer visible version.  This removes partial-write
-        # duplicates without inventing or correcting any mathematics.
-        old = _extension_candidate(previous_units, unit, pos)
-        old_norm = _normalize(old) if old else ""
-        if old_norm and old_norm in norm_to_index:
-            idx = norm_to_index.pop(old_norm)
-            state[idx] = unit
-            norm_to_index[norm] = idx
-            continue
-
-        # Otherwise it is genuinely new/changed evidence. Preserve it verbatim.
-        norm_to_index[norm] = len(state)
         state.append(unit)
+        added += 1
+    return added
+
+
+def _seen_elsewhere(history: list[str], unit: str) -> bool:
+    """Suppress long rows that reappear after a physical board move/reset.
+
+    Short labels such as 'Proof' or '例' may legitimately recur, so global
+    suppression is restricted to substantive rows.
+    """
+    key = _comparison_key(unit)
+    if len(key) < 14:
+        return False
+    return _find_equivalent(history, unit) is not None
 
 
 def _render_episode(number: int, start_ts: str, end_ts: str,
@@ -214,29 +333,20 @@ def _render_episode(number: int, start_ts: str, end_ts: str,
 
 
 def compile_blackboard_notes(markdown: str) -> str:
-    """Reconstruct full-board snapshots into continuous, faithful LaTeX notes.
-
-    Semantics:
-    - exact repeated material is emitted once per physical board episode;
-    - incremental writing extends a partial line when literal containment proves
-      that it is the same line being completed;
-    - changed statements/formulas are preserved as separate evidence;
-    - persistent erase/board-switch events start a new board episode;
-    - no LLM, mathematical inference, paraphrase, correction, or summarization.
-    """
+    """Compile frame snapshots into content-stitched, non-repetitive notes."""
     frames = _parse_frames(markdown)
     if not frames:
         return (markdown or "").strip()
 
     out: list[str] = [BLACKBOARD_NOTES_MARKER, ""]
+    history: list[str] = []
     episode_no = 1
     episode_start = frames[0].timestamp
     episode_end = frames[0].timestamp
     episode_state: list[str] = []
-    previous_units: tuple[str, ...] = tuple()
 
-    for i, frame in enumerate(frames):
-        if i > 0 and _is_board_reset(frames, i):
+    for index, frame in enumerate(frames):
+        if index > 0 and _is_board_reset(frames, index):
             out.extend(
                 _render_episode(
                     episode_no,
@@ -245,13 +355,19 @@ def compile_blackboard_notes(markdown: str) -> str:
                     episode_state,
                 )
             )
+            history.extend(episode_state)
             episode_no += 1
             episode_start = frame.timestamp
             episode_state = []
-            previous_units = tuple()
 
-        _merge_frame_into_episode(episode_state, previous_units, frame.units)
-        previous_units = frame.units
+        # If a board was moved away and later moved back, long rows can cross a
+        # reset boundary.  Do not print those rows twice; only merge genuinely
+        # new content from the returning board.
+        filtered = tuple(
+            unit for unit in frame.units
+            if not _seen_elsewhere(history, unit)
+        )
+        _merge_units(episode_state, filtered)
         episode_end = frame.timestamp
 
     out.extend(
@@ -263,8 +379,6 @@ def compile_blackboard_notes(markdown: str) -> str:
         )
     )
 
-    # If every parsed frame was somehow empty after normalization, fall back to
-    # the raw evidence rather than emitting a misleading blank note.
     if len(out) <= 2:
         return (markdown or "").strip()
     return "\n".join(out).strip()
