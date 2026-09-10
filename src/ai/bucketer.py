@@ -1,22 +1,19 @@
-"""Assemble LLM input by aligning ASR segments and PPT OCR text in 10-min buckets.
+"""Assemble LLM input by aligning timed transcript segments and PPT OCR.
 
-Two flavors:
-  - assemble_bucketed(): for new lectures (segments captured during ASR, in-memory)
-  - assemble_flat():     for old lectures (only joined transcript text)
-
-Important: transcript segments are NEVER persisted. They are produced by the
-transcriber, used here at prompt-build time, and discarded. The DB stores only
-the joined transcript string. This avoids doubling text storage.
+Legacy ``assemble`` remains available.  New ``assemble_traceable`` builds
+shorter evidence windows with stable IDs (T00, T01, ...).  Summaries cite those
+IDs and the summarizer deterministically renders them as validated video ranges,
+so the model never invents timestamps.
 """
 
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 
 from src.ai.ppt_dedup import clean_ppt_text, dedup_text_subset
 
-BUCKET_SIZE_SEC = 600  # 10 minutes
+BUCKET_SIZE_SEC = 600
+TRACE_BUCKET_SIZE_SEC = 180
 
 
 def _format_timestamp(seconds: int) -> str:
@@ -99,25 +96,94 @@ def assemble_flat(transcript: str, ppt_pages: list[dict]) -> str:
     return "\n".join(parts).strip()
 
 
+def assemble_traceable(
+    transcript: str,
+    transcript_segments: list[dict] | None,
+    ppt_pages: list[dict] | None,
+    *,
+    bucket_size_sec: int = TRACE_BUCKET_SIZE_SEC,
+) -> tuple[str, str, dict[str, tuple[int, int]]]:
+    """Build a source-tagged prompt and validated time-window map.
+
+    Returns ``(prompt, mode, windows)``.  ``windows`` maps source tags such as
+    ``T03`` to integer ``(start_sec, end_sec)``.  The summarizer is instructed
+    to cite only these IDs; it later converts them into human-readable video
+    ranges after validating every tag against this mapping.
+    """
+    pages = dedup_text_subset(ppt_pages or [])
+    if not transcript_segments:
+        # This path should only occur for a legacy cached transcript before its
+        # timestamp segments have been rebuilt. Keep a safe fallback rather
+        # than fabricate time provenance.
+        return assemble_flat(transcript or "", pages), "flat", {}
+
+    asr_by_bucket: dict[int, list[str]] = defaultdict(list)
+    max_sec = 0
+    for seg in transcript_segments:
+        start_sec = int(seg.get("start_ms", 0)) // 1000
+        end_sec = int(seg.get("end_ms", seg.get("start_ms", 0))) // 1000
+        max_sec = max(max_sec, end_sec)
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        bucket = start_sec // bucket_size_sec
+        asr_by_bucket[bucket].append(text)
+
+    ppt_by_bucket: dict[int, list[dict]] = defaultdict(list)
+    for page in pages:
+        sec = int(page.get("created_sec", 0))
+        max_sec = max(max_sec, sec)
+        ppt_by_bucket[sec // bucket_size_sec].append(page)
+
+    all_buckets = sorted(set(asr_by_bucket) | set(ppt_by_bucket))
+    if not all_buckets:
+        return "", "traceable", {}
+
+    out: list[str] = [
+        "【来源标记说明】每个 Txx 都对应一个真实视频时段。总结时只能引用这里出现的 Txx，禁止自行编造时间。",
+        "",
+    ]
+    windows: dict[str, tuple[int, int]] = {}
+
+    for ordinal, bucket in enumerate(all_buckets):
+        tag = f"T{ordinal:02d}"
+        start = bucket * bucket_size_sec
+        end = min(max_sec, (bucket + 1) * bucket_size_sec)
+        if end <= start:
+            end = (bucket + 1) * bucket_size_sec
+        windows[tag] = (start, end)
+        out.append(
+            f"=== [{tag}] 视频 {_format_timestamp(start)}–{_format_timestamp(end)} ==="
+        )
+
+        audio = " ".join(asr_by_bucket.get(bucket, [])).strip()
+        if audio:
+            out.extend(["【AI 校订语音转写】", audio, ""])
+
+        bucket_pages = ppt_by_bucket.get(bucket, [])
+        if bucket_pages:
+            out.append("【PPT 文字识别】")
+            for page in bucket_pages:
+                sec = int(page.get("created_sec", 0))
+                page_num = page.get("page_num", "")
+                label = (
+                    f"[页 {page_num} @ {_format_timestamp(sec)}]"
+                    if page_num else f"[@ {_format_timestamp(sec)}]"
+                )
+                text = clean_ppt_text(page.get("text") or "").strip()
+                if text:
+                    out.append(f"{label}\n{text}")
+            out.append("")
+
+    return "\n".join(out).strip(), "traceable", windows
+
+
 def assemble(
     transcript: str,
     transcript_segments: list[dict] | None,
     ppt_pages: list[dict] | None,
 ) -> tuple[str, str]:
-    """Single entry point used by main.py.
-
-    Args:
-        transcript: joined transcript string (always available; persisted in DB).
-        transcript_segments: in-memory list of {start_ms, end_ms, text}, or None
-            for re-summarized old lectures.
-        ppt_pages: list of {created_sec, page_num, text}; usually loaded from
-            DB's ppt_ocr JSON column. Can be empty for transition cases.
-
-    Returns:
-        (assembled_text, mode) where mode is 'bucketed' or 'flat'.
-    """
     pages = dedup_text_subset(ppt_pages or [])
     if transcript_segments:
         return assemble_bucketed(transcript_segments, pages), "bucketed"
     return assemble_flat(transcript or "", pages), "flat"
-
