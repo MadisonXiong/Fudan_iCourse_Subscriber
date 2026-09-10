@@ -71,8 +71,6 @@ class BlackboardLectureRunner(BaseLectureRunner):
         match = _AI_SUMMARY_HEADING_RE.search(summary)
         if match:
             summary = summary[:match.start()].strip()
-        # Require a substantial document so an accidental marker in a short
-        # error message can never bypass vision extraction.
         return summary if len(summary) >= 5000 else ""
 
     def _has_summary(self, existing: dict | None) -> bool:
@@ -84,10 +82,6 @@ class BlackboardLectureRunner(BaseLectureRunner):
         model = str(existing.get("summary_model") or "")
         if model.startswith(_NOTES_MODEL_PREFIX):
             return True
-
-        # Old board-only summaries are intentionally reprocessed once so the
-        # new traceable AI-summary section and transcript attachment can be
-        # appended. They remain usable as board recovery material.
         return False
 
     def _ensure_raw_blackboard(self, sub_id: str, course_title: str) -> tuple[str, str]:
@@ -157,10 +151,6 @@ class BlackboardLectureRunner(BaseLectureRunner):
             )
 
         try:
-            # Prefer raw cache. If it is gone but a prior, substantial final
-            # board section exists, reuse that finished section verbatim. This
-            # avoids re-running vision solely because a historical DB migration
-            # destroyed the cache column.
             raw_cached = get_blackboard(self._db, sub_id)
             prior_board_notes = self._prior_board_notes(sub_id)
 
@@ -169,7 +159,7 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 self._reporter.info(
                     f"    [Blackboard] current cache exists ({len(blackboard_latex)} chars), reusing."
                 )
-                editor = BlackboardEditor()
+                editor = BlackboardEditor(db=self._db, sub_id=sub_id)
                 board_notes, editor_model = editor.edit(blackboard_latex)
                 if not board_notes.strip():
                     raise RuntimeError("blackboard editor produced empty output")
@@ -195,7 +185,7 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 )
                 if not blackboard_latex.strip():
                     raise RuntimeError("blackboard transcription empty")
-                editor = BlackboardEditor()
+                editor = BlackboardEditor(db=self._db, sub_id=sub_id)
                 board_notes, editor_model = editor.edit(blackboard_latex)
                 if not board_notes.strip():
                     raise RuntimeError("blackboard editor produced empty output")
