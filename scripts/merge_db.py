@@ -19,7 +19,6 @@ from src.data.schema import (
 
 
 def _ensure_schema(conn: sqlite3.Connection):
-    """Create tables and migration columns if missing in remote DB."""
     conn.executescript(SCHEMA_SQL)
     existing_lectures = {r[1] for r in conn.execute("PRAGMA table_info(lectures)")}
     for col, typedef in LECTURES_MIGRATION_COLUMNS:
@@ -33,14 +32,11 @@ def _ensure_schema(conn: sqlite3.Connection):
 
 
 def merge(local_path: str, remote_path: str):
-    """Merge local changes into remote DB. Only adds/progresses, never deletes."""
     conn = sqlite3.connect(remote_path)
     _ensure_schema(conn)
     conn.execute("ATTACH DATABASE ? AS local", (local_path,))
     _ensure_schema(conn)
 
-    # A local DB created by an older workflow may be attached without the new
-    # columns.  Bring its schema forward before referring to them below.
     local_columns = {r[1] for r in conn.execute("PRAGMA local.table_info(lectures)")}
     for col, typedef in LECTURES_MIGRATION_COLUMNS:
         if col not in local_columns:
@@ -48,13 +44,11 @@ def merge(local_path: str, remote_path: str):
 
     try:
         with conn:
-            # 1) Courses: upsert
             conn.execute("""
                 INSERT OR REPLACE INTO main.courses (course_id, title, teacher)
                 SELECT course_id, title, teacher FROM local.courses
             """)
 
-            # 2) Lectures: insert rows that only exist in local
             conn.execute("""
                 INSERT OR IGNORE INTO main.lectures
                     (sub_id, course_id, sub_title, date,
@@ -74,7 +68,6 @@ def merge(local_path: str, remote_path: str):
                 FROM local.lectures
             """)
 
-            # 3) Lectures: merge existing rows (progress forward only)
             conn.execute("""
                 UPDATE main.lectures SET
                     transcript = COALESCE(l.transcript, main.lectures.transcript),
@@ -142,7 +135,6 @@ def merge(local_path: str, remote_path: str):
                 WHERE main.lectures.sub_id = l.sub_id
             """)
 
-            # 4) PPT pages: insert local-only rows.
             conn.execute("""
                 INSERT OR IGNORE INTO main.ppt_pages
                     (sub_id, page_num, created_sec, pptimgurl, text, ocr_status, ocr_at, dhash)
@@ -150,9 +142,8 @@ def merge(local_path: str, remote_path: str):
                 FROM local.ppt_pages
             """)
 
-            # 5) Persist blackboard cache/checkpoint metadata. Blackboard cache
-            # validity is stored in meta, so dropping these keys during deploy
-            # makes a good 200k-char transcription look stale on the next run.
+            # Blackboard metadata is deliberately stored in meta because that
+            # table is copied by key, not by the physical lectures column order.
             has_local_meta = conn.execute(
                 "SELECT 1 FROM local.sqlite_master "
                 "WHERE type='table' AND name='meta'"
@@ -163,10 +154,10 @@ def merge(local_path: str, remote_path: str):
                     SELECT key, value
                     FROM local.meta
                     WHERE key LIKE 'blackboard_cache_version:%'
+                       OR key LIKE 'blackboard_cache_blob:%'
                        OR key LIKE 'blackboard_checkpoint:%'
                 """)
 
-            # 6) all_courses (catalog): upsert local rows into remote.
             has_all_courses = conn.execute(
                 "SELECT 1 FROM local.sqlite_master "
                 "WHERE type='table' AND name='all_courses'"
@@ -187,8 +178,6 @@ def merge(local_path: str, remote_path: str):
                 """)
 
     finally:
-        # Persist COURSE_IDS from the CI secret into the meta table so the
-        # frontend can read the current subscription list.
         course_ids_env = os.environ.get("COURSE_IDS", "")
         if course_ids_env:
             conn.execute(
