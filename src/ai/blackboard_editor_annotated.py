@@ -1,18 +1,17 @@
-"""Policy overlay for BlackboardEditor with visually marked AI annotations.
+"""Annotation policy and final quality gate for BlackboardEditor.
 
-The underlying editor keeps the raw-board preservation/de-duplication pipeline.
-Only the *global* editing stage is allowed to add concise explanatory material,
-and every such addition must be wrapped in a distinctive inline-styled HTML box
-so the email cannot confuse model commentary with the professor's blackboard.
-
-Raw/local transcription remains source-faithful.  This overlay intentionally
-leaves LOCAL_SYSTEM_PROMPT unchanged and patches only the global/audit/correction
-and format-repair policies before re-exporting BlackboardEditor.
+The base editor performs local de-duplication, global semantic consolidation,
+faithfulness audit and normal LaTeX repair.  This overlay allows concise
+model-authored explanations, but requires them to be visibly marked as purple
+``AI 补充`` blocks.  After the base editor finishes, a strict local finalizer
+checks the complete document for concrete renderer/transcription defects and
+repairs only the affected small chunks against the raw vision evidence.
 """
 
 from __future__ import annotations
 
 from src.ai import blackboard_editor as _base
+from src.ai.blackboard_finalizer import repair_final_anomalies
 
 
 AI_NOTE_OPEN = (
@@ -57,10 +56,11 @@ _base.GLOBAL_SYSTEM_PROMPT = rf"""
 【C. Markdown / LaTeX】
 - 所有数学内容位于 `$...$` 或 `$$...$$`；
 - 中文在数学环境外；
-- 禁止 aligned、array、cases；
+- 禁止 aligned、array、cases、gathered、split；
 - 长推导拆成若干独立 display 公式；
 - 不使用 Markdown 代码块；
-- 保留 AI 补充框的原始 HTML，不要把它转义成代码。
+- 保留 AI 补充框的原始 HTML，不要把它转义成代码；
+- 绝不能输出 `##C##`、`xxxx`、`[unclear]`、乱码占位符。若来源确实无法判清，使用 `[转写存疑]`。
 
 直接输出最终完整板书稿，不要解释你的处理过程。
 """.strip()
@@ -110,7 +110,7 @@ AI 补充必须使用且只能使用：
 AI 补充内容
 {AI_NOTE_CLOSE}
 
-普通板书正文不得使用这个紫色框。保持 Markdown/LaTeX 可渲染：数学放入 `$...$` 或 `$$...$$`，不用 aligned/array/cases。
+普通板书正文不得使用这个紫色框。保持 Markdown/LaTeX 可渲染：数学放入 `$...$` 或 `$$...$$`，不用 aligned/array/cases/gathered/split。
 只输出修正后的完整正文。
 """.strip()
 
@@ -124,7 +124,7 @@ _base.REPAIR_SYSTEM_PROMPT = r"""
 - 所有数学内容必须在 `$...$` 或 `$$...$$` 内；
 - 不得有裸露的 LaTeX 命令；
 - 中文必须在数学环境外；
-- 不使用 aligned/array/cases；
+- 不使用 aligned/array/cases/gathered/split；
 - 过长 display 公式拆成多个独立 `$$...$$`；
 - 不使用代码块；
 - 文本长度原则上应与输入接近；
@@ -134,7 +134,25 @@ _base.REPAIR_SYSTEM_PROMPT = r"""
 """.strip()
 
 
-# Re-export the existing implementation after installing the annotation policy.
-BlackboardEditor = _base.BlackboardEditor
+class BlackboardEditor(_base.BlackboardEditor):
+    """Base semantic editor plus strict local render/transcription preflight."""
+
+    def edit(self, raw_blackboard: str) -> tuple[str, str]:
+        notes, model_label = super().edit(raw_blackboard)
+        finalized = repair_final_anomalies(self, notes, raw_blackboard)
+
+        all_models = [part for part in model_label.split("+") if part]
+        all_models.extend(finalized.models)
+        combined_model_label = "+".join(dict.fromkeys(all_models)) or "unknown"
+
+        if finalized.repaired_chunks:
+            print(
+                f"[BlackboardEditor] final local preflight repaired "
+                f"{finalized.repaired_chunks} chunk(s)",
+                flush=True,
+            )
+
+        return finalized.text, combined_model_label
+
 
 __all__ = ["BlackboardEditor", "AI_NOTE_OPEN", "AI_NOTE_LABEL", "AI_NOTE_CLOSE"]
