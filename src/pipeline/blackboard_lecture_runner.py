@@ -1,11 +1,10 @@
 """LectureRunner extension for proof-preserving blackboard notes.
 
 For whitelisted mathematics courses, the expensive vision stage creates and
-caches a chronological raw board transcription. The final student-facing notes
-are produced by an LLM transcription editor that de-duplicates small raw chunks,
-then reconciles only adjacent chunk seams, removes only exact repeated
-multi-paragraph blocks, and normalizes Markdown/LaTeX without using the audio
-transcript or summarizing away proof steps.
+caches a chronological raw board transcription. The student-facing notes are
+produced by an LLM-only semantic editor: local chunk de-duplication, whole-draft
+global consolidation, faithfulness audit, and LaTeX normalization. The audio
+transcript is deliberately excluded so the raw board remains the source of truth.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v3/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v4/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -112,9 +111,9 @@ class BlackboardLectureRunner(BaseLectureRunner):
             self._reporter.info(
                 f"    [OK] Blackboard edited transcript: "
                 f"{len(blackboard_latex)} raw chars -> {len(notes)} final chars; "
-                "chunked LLM de-duplication + boundary-only seam merge + "
-                "exact repeated-block cleanup + LaTeX normalization; "
-                "audio transcript excluded; not a lecture summary"
+                "LLM local de-duplication + whole-draft semantic consolidation + "
+                "faithfulness audit + LaTeX normalization; audio transcript excluded; "
+                "not a lecture summary"
             )
             self._db.update_summary(sub_id, notes, model_used)
             return notes
