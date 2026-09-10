@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS lectures (
     sub_id TEXT PRIMARY KEY,
     course_id TEXT NOT NULL,
     sub_title TEXT, date TEXT,
-    transcript TEXT, summary TEXT,
+    transcript TEXT, transcript_segments_json TEXT,
+    proofread_transcript TEXT, proofread_segments_json TEXT,
+    proofread_model TEXT, proofread_at TEXT,
+    summary TEXT,
     processed_at TEXT, emailed_at TEXT,
     error_msg TEXT, error_count INTEGER DEFAULT 0,
     error_stage TEXT, summary_model TEXT,
@@ -81,6 +84,14 @@ LECTURES_MIGRATION_COLUMNS: list[tuple[str, str]] = [
     ("blackboard_latex", "TEXT"),
     ("blackboard_model", "TEXT"),
     ("blackboard_at", "TEXT"),
+    # Persist ASR timing so traceable summaries keep working on reruns.
+    ("transcript_segments_json", "TEXT"),
+    # AI-proofread transcript used for the email attachment and as the
+    # evidence text for timestamped summaries.
+    ("proofread_transcript", "TEXT"),
+    ("proofread_segments_json", "TEXT"),
+    ("proofread_model", "TEXT"),
+    ("proofread_at", "TEXT"),
 ]
 
 # Columns added to ``ppt_pages`` after its initial shape shipped.
