@@ -1,13 +1,9 @@
 """LectureRunner extension for proof-preserving blackboard notes.
 
-For whitelisted mathematics courses, the expensive vision stage creates and
-caches a chronological raw board transcription. The student-facing output first
-contains the proof-preserving blackboard transcription/editing pipeline, with
-model-authored explanations visibly marked as purple ``AI 补充`` blocks. A
-strict local finalizer repairs concrete rendering/transcription defects against
-the raw vision evidence. After that complete blackboard section, the repository's
-original audio+PPT AI summary is generated with the normal bucketer/Summarizer
-pipeline and appended as a clearly separated final section.
+Functional Analysis keeps its proof-preserving blackboard section.  Its appended
+normal AI summary now uses the same timestamped, AI-proofread ASR evidence and
+validated video provenance as every other course.  The proofreader additionally
+receives timestamp-aligned raw blackboard frames as terminology evidence.
 """
 
 from __future__ import annotations
@@ -23,14 +19,14 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v7/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v8/"
 
 _AI_SUMMARY_SEPARATOR = """\
 ---
 
-### AI 课程总结
+### AI 课程总结（带视频定位）
 
-> 以下部分使用原有课程总结流程，根据录音转写与 PPT OCR 生成；它与上方的老师板书转写及紫色 AI 补充相互独立。
+> 以下部分根据 AI 校订后的录音转写与 PPT OCR 生成；每个知识点的视频时段由真实 ASR 时间轴验证。它与上方老师板书转写及紫色 AI 补充相互独立。
 """.strip()
 
 
@@ -47,10 +43,10 @@ class BlackboardLectureRunner(BaseLectureRunner):
         return super().run(course_id, course_title, lecture, next_info=next_info)
 
     def _has_summary(self, existing: dict | None) -> bool:
+        if not course_requires_blackboard(self._active_course_title):
+            return super()._has_summary(existing)
         if not existing or not existing.get("summary"):
             return False
-        if not course_requires_blackboard(self._active_course_title):
-            return True
 
         sub_id = str(existing.get("sub_id") or "")
         if not sub_id or get_blackboard(self._db, sub_id) is None:
@@ -80,39 +76,41 @@ class BlackboardLectureRunner(BaseLectureRunner):
             save_blackboard(self._db, sub_id, markdown, model)
         return markdown, model
 
-    def _generate_original_ai_summary(
+    def _generate_traceable_ai_summary(
         self,
         sub_id: str,
         course_title: str,
-        transcript: str,
-        transcript_segments: list[dict] | None,
+        corrected_segments: list[dict],
+        kept_pages: list[dict],
     ) -> tuple[str, str]:
-        """Run exactly the repository's normal audio+PPT summary path.
-
-        This intentionally does *not* feed the blackboard notes into the normal
-        summarizer. The appended section therefore remains comparable with what
-        a non-blackboard course receives: ASR + PPT OCR assembled by bucketer,
-        then ``Summarizer.summarize`` with the existing system prompt.
-        """
-        kept_pages = self._db.get_done_ppt_pages(sub_id)
-        prompt_text, mode = bucketer.assemble(
-            transcript,
-            transcript_segments,
+        corrected_flat = " ".join(
+            str(seg.get("text") or "").strip()
+            for seg in corrected_segments
+            if str(seg.get("text") or "").strip()
+        )
+        prompt_text, mode, video_windows = bucketer.assemble_traceable(
+            corrected_flat,
+            corrected_segments,
             kept_pages,
         )
+        if not video_windows:
+            raise RuntimeError("Functional Analysis summary has no video windows")
+
         self._reporter.info(
-            f"    [Time] Generating appended original AI summary at "
+            f"    [Time] Generating appended traceable AI summary at "
             f"{time.strftime('%H:%M:%S')}"
-            f" — mode={mode}, prompt={len(prompt_text)} chars"
+            f" — mode={mode}, prompt={len(prompt_text)} chars, "
+            f"windows={len(video_windows)}"
         )
         summary, model_used = self._summarizer.summarize(
             course_title,
             prompt_text,
+            video_windows=video_windows,
         )
         if not summary or not summary.strip():
-            raise RuntimeError("original audio+PPT summarizer returned empty output")
+            raise RuntimeError("traceable audio+PPT summarizer returned empty output")
         self._reporter.info(
-            f"    [OK] Appended original AI summary by {model_used}: "
+            f"    [OK] Appended traceable AI summary by {model_used}: "
             f"{len(summary)} chars"
         )
         return summary.strip(), model_used
@@ -139,8 +137,6 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 )
                 return None
 
-            # The blackboard editor's evidence source remains the raw board only.
-            # Audio/PPT are used later by a completely separate summary call.
             editor = BlackboardEditor()
             board_notes, editor_model = editor.edit(blackboard_latex)
             if not board_notes.strip():
@@ -158,19 +154,27 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 f"    [OK] Blackboard edited transcript: "
                 f"{len(blackboard_latex)} raw chars -> {len(board_notes)} final chars; "
                 "LLM semantic de-duplication + global faithfulness audit + "
-                "strict local render/transcription preflight; optional model "
-                "explanations are marked as purple AI supplements"
+                "strict local render/transcription preflight"
             )
 
-            # Append the *original* normal course summary after the completed
-            # board section. Keeping the two model calls independent avoids
-            # contaminating the proof-preserving board evidence with ASR noise.
-            ai_summary, ai_summary_model = self._generate_original_ai_summary(
+            # The attachment and appended summary use the speech stream, but the
+            # transcript proofreader may consult timestamp-aligned raw board
+            # frames to correct mathematical terms. The board itself is never
+            # copied into the speech transcript unless the lecturer said it.
+            kept_pages = self._db.get_done_ppt_pages(sub_id)
+            _, corrected_segments, proofread_model = self._get_proofread_transcript(
+                sub_id,
+                transcript_segments,
+                kept_pages,
+                raw_blackboard=blackboard_latex,
+            )
+            ai_summary, ai_summary_model = self._generate_traceable_ai_summary(
                 sub_id,
                 course_title,
-                transcript,
-                transcript_segments,
+                corrected_segments,
+                kept_pages,
             )
+
             combined = (
                 board_notes.rstrip()
                 + "\n\n"
@@ -178,17 +182,17 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 + "\n\n"
                 + ai_summary
             )
-
             model_used = (
                 f"{_NOTES_MODEL_PREFIX}{editor_model}"
                 f"|vision={blackboard_model or 'vision'}"
+                f"|proofread={proofread_model}"
                 f"|summary={ai_summary_model}"
             )
             self._reporter.info(
                 f"    [OK] Combined Functional Analysis notes: "
                 f"board={len(board_notes)} chars + "
-                f"AI-summary={len(ai_summary)} chars -> "
-                f"{len(combined)} chars total; one email section"
+                f"traceable-summary={len(ai_summary)} chars -> "
+                f"{len(combined)} chars total; one email section + transcript attachment"
             )
             self._db.update_summary(sub_id, combined, model_used)
             return combined
