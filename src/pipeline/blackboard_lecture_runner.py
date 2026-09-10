@@ -1,24 +1,25 @@
 """LectureRunner extension for proof-preserving blackboard notes.
 
 For whitelisted mathematics courses, the expensive vision stage creates and
-caches a chronological raw board transcription. The student-facing notes are
-produced by an LLM-only semantic editor: local chunk de-duplication, whole-draft
-global consolidation, faithfulness audit, and LaTeX normalization. The audio
-transcript is deliberately excluded so the raw board remains the source of truth.
+caches a chronological raw board transcription. The final student-facing notes
+use LLM semantic de-duplication over that evidence. The global editor may add
+short explanatory notes, but every model-authored addition is explicitly marked
+as a purple ``AI 补充`` block so it cannot be confused with the professor's
+blackboard.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from src.ai.blackboard_editor import BlackboardEditor
+from src.ai.blackboard_editor_annotated import BlackboardEditor
 from src.ai.blackboard_vision import course_requires_blackboard
 from src.data.blackboard_store import get_blackboard, save_blackboard
 from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v4/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v5/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -89,8 +90,9 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 )
                 return None
 
-            # Deliberately exclude transcript/transcript_segments here. The
-            # editor's source of truth is the raw board timeline only.
+            # Deliberately exclude transcript/transcript_segments here. The raw
+            # board timeline remains the evidence source. Any explanatory model
+            # additions are visually marked as AI supplements by the editor.
             editor = BlackboardEditor()
             notes, editor_model = editor.edit(blackboard_latex)
             if not notes.strip():
@@ -111,9 +113,9 @@ class BlackboardLectureRunner(BaseLectureRunner):
             self._reporter.info(
                 f"    [OK] Blackboard edited transcript: "
                 f"{len(blackboard_latex)} raw chars -> {len(notes)} final chars; "
-                "LLM local de-duplication + whole-draft semantic consolidation + "
-                "faithfulness audit + LaTeX normalization; audio transcript excluded; "
-                "not a lecture summary"
+                "LLM semantic de-duplication + global faithfulness audit + "
+                "LaTeX normalization; optional model explanations are marked "
+                "as purple AI supplements; audio transcript excluded"
             )
             self._db.update_summary(sub_id, notes, model_used)
             return notes
