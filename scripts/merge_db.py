@@ -156,6 +156,7 @@ def merge(local_path: str, remote_path: str):
                     WHERE key LIKE 'blackboard_cache_version:%'
                        OR key LIKE 'blackboard_cache_blob:%'
                        OR key LIKE 'blackboard_checkpoint:%'
+                       OR key LIKE 'blackboard_editor_checkpoint:%'
                 """)
 
             has_all_courses = conn.execute(
