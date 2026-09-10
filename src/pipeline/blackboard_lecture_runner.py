@@ -1,17 +1,21 @@
 """LectureRunner extension for proof-preserving blackboard notes.
 
 For whitelisted mathematics courses, the expensive vision stage creates and
-caches a chronological raw board transcription. The final student-facing notes
-use LLM semantic de-duplication over that evidence. The global editor may add
-short explanatory notes, but every model-authored addition is explicitly marked
-as a purple ``AI 补充`` block. A strict local finalizer then repairs only concrete
-rendering/transcription defects against the raw vision evidence before storage.
+caches a chronological raw board transcription. The student-facing output first
+contains the proof-preserving blackboard transcription/editing pipeline, with
+model-authored explanations visibly marked as purple ``AI 补充`` blocks. A
+strict local finalizer repairs concrete rendering/transcription defects against
+the raw vision evidence. After that complete blackboard section, the repository's
+original audio+PPT AI summary is generated with the normal bucketer/Summarizer
+pipeline and appended as a clearly separated final section.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
+from src.ai import bucketer
 from src.ai.blackboard_editor_annotated import BlackboardEditor
 from src.ai.blackboard_vision import course_requires_blackboard
 from src.data.blackboard_store import get_blackboard, save_blackboard
@@ -19,7 +23,15 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v6/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v7/"
+
+_AI_SUMMARY_SEPARATOR = """\
+---
+
+### AI 课程总结
+
+> 以下部分使用原有课程总结流程，根据录音转写与 PPT OCR 生成；它与上方的老师板书转写及紫色 AI 补充相互独立。
+""".strip()
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -68,6 +80,43 @@ class BlackboardLectureRunner(BaseLectureRunner):
             save_blackboard(self._db, sub_id, markdown, model)
         return markdown, model
 
+    def _generate_original_ai_summary(
+        self,
+        sub_id: str,
+        course_title: str,
+        transcript: str,
+        transcript_segments: list[dict] | None,
+    ) -> tuple[str, str]:
+        """Run exactly the repository's normal audio+PPT summary path.
+
+        This intentionally does *not* feed the blackboard notes into the normal
+        summarizer. The appended section therefore remains comparable with what
+        a non-blackboard course receives: ASR + PPT OCR assembled by bucketer,
+        then ``Summarizer.summarize`` with the existing system prompt.
+        """
+        kept_pages = self._db.get_done_ppt_pages(sub_id)
+        prompt_text, mode = bucketer.assemble(
+            transcript,
+            transcript_segments,
+            kept_pages,
+        )
+        self._reporter.info(
+            f"    [Time] Generating appended original AI summary at "
+            f"{time.strftime('%H:%M:%S')}"
+            f" — mode={mode}, prompt={len(prompt_text)} chars"
+        )
+        summary, model_used = self._summarizer.summarize(
+            course_title,
+            prompt_text,
+        )
+        if not summary or not summary.strip():
+            raise RuntimeError("original audio+PPT summarizer returned empty output")
+        self._reporter.info(
+            f"    [OK] Appended original AI summary by {model_used}: "
+            f"{len(summary)} chars"
+        )
+        return summary.strip(), model_used
+
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
         if not course_requires_blackboard(course_title):
@@ -90,12 +139,11 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 )
                 return None
 
-            # Deliberately exclude transcript/transcript_segments here. The raw
-            # board timeline remains the evidence source. Any explanatory model
-            # additions are visually marked as AI supplements by the editor.
+            # The blackboard editor's evidence source remains the raw board only.
+            # Audio/PPT are used later by a completely separate summary call.
             editor = BlackboardEditor()
-            notes, editor_model = editor.edit(blackboard_latex)
-            if not notes.strip():
+            board_notes, editor_model = editor.edit(blackboard_latex)
+            if not board_notes.strip():
                 self._reporter.info(
                     "    [FAIL] Blackboard editor produced empty output."
                 )
@@ -106,23 +154,47 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 )
                 return None
 
+            self._reporter.info(
+                f"    [OK] Blackboard edited transcript: "
+                f"{len(blackboard_latex)} raw chars -> {len(board_notes)} final chars; "
+                "LLM semantic de-duplication + global faithfulness audit + "
+                "strict local render/transcription preflight; optional model "
+                "explanations are marked as purple AI supplements"
+            )
+
+            # Append the *original* normal course summary after the completed
+            # board section. Keeping the two model calls independent avoids
+            # contaminating the proof-preserving board evidence with ASR noise.
+            ai_summary, ai_summary_model = self._generate_original_ai_summary(
+                sub_id,
+                course_title,
+                transcript,
+                transcript_segments,
+            )
+            combined = (
+                board_notes.rstrip()
+                + "\n\n"
+                + _AI_SUMMARY_SEPARATOR
+                + "\n\n"
+                + ai_summary
+            )
+
             model_used = (
                 f"{_NOTES_MODEL_PREFIX}{editor_model}"
                 f"|vision={blackboard_model or 'vision'}"
+                f"|summary={ai_summary_model}"
             )
             self._reporter.info(
-                f"    [OK] Blackboard edited transcript: "
-                f"{len(blackboard_latex)} raw chars -> {len(notes)} final chars; "
-                "LLM semantic de-duplication + global faithfulness audit + "
-                "strict local render/transcription preflight; optional model "
-                "explanations are marked as purple AI supplements; "
-                "audio transcript excluded"
+                f"    [OK] Combined Functional Analysis notes: "
+                f"board={len(board_notes)} chars + "
+                f"AI-summary={len(ai_summary)} chars -> "
+                f"{len(combined)} chars total; one email section"
             )
-            self._db.update_summary(sub_id, notes, model_used)
-            return notes
+            self._db.update_summary(sub_id, combined, model_used)
+            return combined
         except Exception as exc:
             self._reporter.info(
-                f"    [FAIL] Blackboard editor error: "
+                f"    [FAIL] Blackboard/AI-summary pipeline error: "
                 f"{type(exc).__name__}: {exc}"
             )
             self._db.update_error(sub_id, "blackboard-editor", str(exc))
