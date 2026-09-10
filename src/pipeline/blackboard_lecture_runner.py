@@ -3,8 +3,9 @@
 For whitelisted mathematics courses, the expensive vision stage creates and
 caches a chronological raw board transcription. The final student-facing notes
 are produced by an LLM transcription editor that de-duplicates small raw chunks,
-then reconciles only adjacent chunk seams and normalizes Markdown/LaTeX without
-using the audio transcript or summarizing away proof steps.
+then reconciles only adjacent chunk seams, removes only exact repeated
+multi-paragraph blocks, and normalizes Markdown/LaTeX without using the audio
+transcript or summarizing away proof steps.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v2/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v3/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -112,8 +113,8 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 f"    [OK] Blackboard edited transcript: "
                 f"{len(blackboard_latex)} raw chars -> {len(notes)} final chars; "
                 "chunked LLM de-duplication + boundary-only seam merge + "
-                "LaTeX normalization; audio transcript excluded; "
-                "not a lecture summary"
+                "exact repeated-block cleanup + LaTeX normalization; "
+                "audio transcript excluded; not a lecture summary"
             )
             self._db.update_summary(sub_id, notes, model_used)
             return notes
