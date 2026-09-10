@@ -1,10 +1,11 @@
 """Evidence-constrained AI proofreading for timed ASR transcripts.
 
-The goal is not to rewrite a lecture into polished prose.  It is to correct
+The goal is not to rewrite a lecture into polished prose. It is to correct
 obvious ASR mistakes while preserving what the lecturer actually said and the
-video timeline.  Each 4-minute window is proofread independently with nearby PPT
+video timeline. Each 3-minute window is proofread independently with nearby PPT
 OCR; Functional Analysis can additionally supply timestamped raw blackboard
-frames as evidence.
+frames as evidence. Every emitted attachment chunk must actually pass an AI
+proofreading call; unreviewed raw ASR is never silently labelled as proofread.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from src.data.transcript_store import (
 from src.runtime import config
 
 
-_CHUNK_SEC = int(os.environ.get("TRANSCRIPT_PROOFREAD_CHUNK_SEC", "240"))
+_CHUNK_SEC = int(os.environ.get("TRANSCRIPT_PROOFREAD_CHUNK_SEC", "180"))
 _CONTEXT_SEC = 45
 _TIMEOUT = int(os.environ.get("TRANSCRIPT_PROOFREAD_TIMEOUT", "300"))
 
@@ -33,7 +34,10 @@ _MODELSCOPE_MODELS = [
     "Qwen/Qwen3-VL-8B-Instruct",
 ]
 
-_BOARD_HEADING_RE = re.compile(r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$", re.MULTILINE)
+_BOARD_HEADING_RE = re.compile(
+    r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$",
+    re.MULTILINE,
+)
 
 
 SYSTEM_PROMPT = r"""
@@ -103,8 +107,6 @@ def _parse_board_time(match: re.Match) -> int:
     a = int(match.group(1))
     b = int(match.group(2))
     c = int(match.group(3) or 0)
-    # Raw board headings normally use mm:ss. A three-component timestamp is
-    # treated as hh:mm:ss.
     if match.group(3) is None:
         return a * 60 + b
     return a * 3600 + b * 60 + c
@@ -146,7 +148,10 @@ class TranscriptProofreader:
             self.providers.append(
                 (
                     provider["name"],
-                    OpenAI(api_key=provider["api_key"], base_url=provider["base_url"]),
+                    OpenAI(
+                        api_key=provider["api_key"],
+                        base_url=provider["base_url"],
+                    ),
                     tuple(models),
                 )
             )
@@ -185,7 +190,9 @@ class TranscriptProofreader:
                 except Exception as exc:
                     errors.append(f"{model_id}: {type(exc).__name__}: {exc}")
                     print(f"[TranscriptProofreader] {errors[-1]}", flush=True)
-        raise RuntimeError("All transcript proofreading models failed: " + " | ".join(errors))
+        raise RuntimeError(
+            "All transcript proofreading models failed: " + " | ".join(errors)
+        )
 
     def proofread(
         self,
@@ -206,10 +213,22 @@ class TranscriptProofreader:
             current = _text_in_window(segments, start, end)
             if not current:
                 continue
-            before = _text_in_window(segments, max(0, start - _CONTEXT_SEC), start - 1)
-            after = _text_in_window(segments, end + 1, end + _CONTEXT_SEC)
+            before = _text_in_window(
+                segments,
+                max(0, start - _CONTEXT_SEC),
+                start - 1,
+            )
+            after = _text_in_window(
+                segments,
+                end + 1,
+                end + _CONTEXT_SEC,
+            )
             ppt = _ppt_in_window(ppt_pages or [], start, end)
-            board = _board_in_window(raw_blackboard, start, end) if raw_blackboard else "（本课程不使用黑板视觉证据）"
+            board = (
+                _board_in_window(raw_blackboard, start, end)
+                if raw_blackboard
+                else "（本课程不使用黑板视觉证据）"
+            )
 
             prompt = (
                 f"【视频时段】{_fmt(start)}–{_fmt(end)}\n\n"
@@ -219,28 +238,15 @@ class TranscriptProofreader:
                 f"【同时段 PPT OCR 校对证据】\n{ppt}\n\n"
                 f"【同时段黑板视觉校对证据】\n{board}"
             )
-            try:
-                corrected, model = self._call(prompt)
-                ratio = len(corrected) / max(1, len(current))
-                # Proofreading should remain close to the source. If a model
-                # summarizes or balloons the transcript, keep raw ASR instead.
-                if not (0.55 <= ratio <= 1.55):
-                    print(
-                        f"[TranscriptProofreader] rejected aggressive rewrite "
-                        f"{len(current)} -> {len(corrected)} ({ratio:.1%}); keeping ASR",
-                        flush=True,
-                    )
-                    corrected = current
-                else:
-                    models.append(model)
-            except Exception as exc:
-                print(
-                    f"[TranscriptProofreader] chunk {_fmt(start)}–{_fmt(end)} failed: "
-                    f"{type(exc).__name__}: {exc}; keeping raw ASR",
-                    flush=True,
+            corrected, model = self._call(prompt)
+            ratio = len(corrected) / max(1, len(current))
+            if not (0.55 <= ratio <= 1.55):
+                raise RuntimeError(
+                    "AI proofreading changed a transcript window too aggressively: "
+                    f"{_fmt(start)}–{_fmt(end)}, "
+                    f"{len(current)} -> {len(corrected)} ({ratio:.1%})"
                 )
-                corrected = current
-
+            models.append(model)
             chunks.append(
                 {
                     "start_ms": start * 1000,
@@ -255,7 +261,7 @@ class TranscriptProofreader:
         markdown_parts = [
             "# AI 校订语音转写",
             "",
-            "> 本附件由原始 ASR 经 AI 结合同时段课件/板书证据校订。AI 只用于纠明显识别错误；无法可靠判断处标记为 `[转写存疑]`。",
+            "> 本附件由原始 ASR 经 AI 结合同时段课件/板书证据校订。AI 只用于纠正明显识别错误；无法可靠判断处标记为 `[转写存疑]`。",
             "",
         ]
         for chunk in chunks:
@@ -265,8 +271,12 @@ class TranscriptProofreader:
                 [f"### {_fmt(s)}–{_fmt(e)}", "", chunk["text"], ""]
             )
 
-        prefix = PROOFREAD_BOARD_MODEL_PREFIX if raw_blackboard else PROOFREAD_MODEL_PREFIX
-        model_label = "+".join(dict.fromkeys(models)) or "raw-asr-fallback"
+        prefix = (
+            PROOFREAD_BOARD_MODEL_PREFIX
+            if raw_blackboard
+            else PROOFREAD_MODEL_PREFIX
+        )
+        model_label = "+".join(dict.fromkeys(models))
         return ProofreadResult(
             markdown="\n".join(markdown_parts).strip(),
             segments=chunks,
