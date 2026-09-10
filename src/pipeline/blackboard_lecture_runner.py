@@ -4,8 +4,8 @@ For whitelisted mathematics courses, the expensive vision stage creates and
 caches a chronological raw board transcription. The final student-facing notes
 use LLM semantic de-duplication over that evidence. The global editor may add
 short explanatory notes, but every model-authored addition is explicitly marked
-as a purple ``AI 补充`` block so it cannot be confused with the professor's
-blackboard.
+as a purple ``AI 补充`` block. A strict local finalizer then repairs only concrete
+rendering/transcription defects against the raw vision evidence before storage.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v5/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v6/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -114,8 +114,9 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 f"    [OK] Blackboard edited transcript: "
                 f"{len(blackboard_latex)} raw chars -> {len(notes)} final chars; "
                 "LLM semantic de-duplication + global faithfulness audit + "
-                "LaTeX normalization; optional model explanations are marked "
-                "as purple AI supplements; audio transcript excluded"
+                "strict local render/transcription preflight; optional model "
+                "explanations are marked as purple AI supplements; "
+                "audio transcript excluded"
             )
             self._db.update_summary(sub_id, notes, model_used)
             return notes
