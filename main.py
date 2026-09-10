@@ -17,7 +17,7 @@ from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
 
 
-BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v3/"
+BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v4/"
 
 
 def _has_webvpn_ticket(vpn: WebVPNSession) -> bool:
