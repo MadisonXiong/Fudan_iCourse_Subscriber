@@ -59,8 +59,6 @@ def merge(local_path: str, remote_path: str):
             """)
 
             # 3) Lectures: merge existing rows (progress forward only)
-            #    - Progress fields: COALESCE(local, remote) — prefer non-null
-            #    - Error fields: clear if processed, otherwise keep the most info
             conn.execute("""
                 UPDATE main.lectures SET
                     transcript       = COALESCE(l.transcript,       main.lectures.transcript),
@@ -90,9 +88,7 @@ def merge(local_path: str, remote_path: str):
                 WHERE main.lectures.sub_id = l.sub_id
             """)
 
-            # 4) PPT pages: insert local-only rows.  Existing rows are left
-            # untouched — if it's already in the remote DB the previous run
-            # already handled it, and we have no business second-guessing.
+            # 4) PPT pages: insert local-only rows.
             conn.execute("""
                 INSERT OR IGNORE INTO main.ppt_pages
                     (sub_id, page_num, created_sec, pptimgurl, text, ocr_status, ocr_at, dhash)
@@ -100,17 +96,24 @@ def merge(local_path: str, remote_path: str):
                 FROM local.ppt_pages
             """)
 
-            # 6) all_courses (catalog): upsert local rows into remote.  We take
-            #    the side with the newer ``last_seen_at`` so a stale local crawl
-            #    can't overwrite a fresher remote one.  We deliberately don't
-            #    delete from remote — local's upsert_all_courses_for_term may
-            #    have hard-deleted dropped courses for the term it crawled, but
-            #    we can't tell here which terms were "intentionally crawled"
-            #    vs. "stale snapshot".  Frontend filters on last_seen_at for
-            #    freshness instead.
-            #
-            #    Guarded: workflows running against a pre-catalog local DB will
-            #    lack the table entirely; in that case there's nothing to merge.
+            # 5) Persist blackboard cache/checkpoint metadata.  Blackboard
+            # cache validity is stored in meta, so dropping these keys during
+            # deploy makes a perfectly good 200k-char transcription look stale
+            # on the next run and needlessly re-runs all vision calls.
+            has_local_meta = conn.execute(
+                "SELECT 1 FROM local.sqlite_master "
+                "WHERE type='table' AND name='meta'"
+            ).fetchone()
+            if has_local_meta:
+                conn.execute("""
+                    INSERT OR REPLACE INTO main.meta (key, value)
+                    SELECT key, value
+                    FROM local.meta
+                    WHERE key LIKE 'blackboard_cache_version:%'
+                       OR key LIKE 'blackboard_checkpoint:%'
+                """)
+
+            # 6) all_courses (catalog): upsert local rows into remote.
             has_all_courses = conn.execute(
                 "SELECT 1 FROM local.sqlite_master "
                 "WHERE type='table' AND name='all_courses'"
@@ -123,17 +126,16 @@ def merge(local_path: str, remote_path: str):
                     FROM local.all_courses
                     WHERE true
                     ON CONFLICT(course_id, term) DO UPDATE SET
-                        title       = excluded.title,
-                        teacher     = excluded.teacher,
-                        dept        = excluded.dept,
+                        title        = excluded.title,
+                        teacher      = excluded.teacher,
+                        dept         = excluded.dept,
                         last_seen_at = excluded.last_seen_at
                     WHERE excluded.last_seen_at > all_courses.last_seen_at
                 """)
 
     finally:
         # Persist COURSE_IDS from the CI secret into the meta table so
-        # the frontend can read the current subscription list from the
-        # metadata shard without relying on localStorage alone.
+        # the frontend can read the current subscription list.
         course_ids_env = os.environ.get("COURSE_IDS", "")
         if course_ids_env:
             conn.execute(
