@@ -17,7 +17,7 @@ from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
 
 
-BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v1/"
+BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v2/"
 
 
 def _has_webvpn_ticket(vpn: WebVPNSession) -> bool:
@@ -105,6 +105,7 @@ def login_with_retry(
 
 
 def _check_session(client: ICourseClient) -> None:
+    """Verify WebVPN session; re-login in place if expired."""
     if client.check_alive():
         return
     print("[Session] WebVPN session expired, re-logging in...")
@@ -117,6 +118,7 @@ def _enumerate_lectures(
     db: Database,
     reporter: Reporter,
 ) -> list[tuple[str, str, dict]]:
+    """List every lecture that should be processed in this run."""
     out: list[tuple[str, str, dict]] = []
 
     for course_id in config.COURSE_IDS:
@@ -213,6 +215,7 @@ def _drive_lectures(
     all_lectures: list[tuple[str, str, dict]],
     email_items: list,
 ) -> None:
+    """Run each queued lecture through LectureRunner."""
     if not all_lectures:
         return
 
@@ -273,6 +276,7 @@ def _send_email(
     reporter: Reporter,
     email_items: list,
 ) -> None:
+    """Append unsent processed lectures, then send."""
     unsent = db.get_unsent_lectures()
     if unsent:
         seen_sub_ids = {item["sub_id"] for item in email_items}
@@ -308,6 +312,7 @@ def _crawl_semester_catalog(
     db: Database,
     reporter: Reporter,
 ) -> None:
+    """Auto-discover semesters and refresh all_courses."""
     reporter.info("Discovering available semesters from API...")
 
     try:
@@ -362,6 +367,7 @@ def _crawl_semester_catalog(
 
 
 def run():
+    """Single execution of the full pipeline."""
     reporter = Reporter()
     reporter.run_header()
 
