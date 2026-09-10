@@ -1,7 +1,10 @@
 """Blackboard video-frame extraction and LaTeX transcription pipeline.
 
-The pipeline keeps full-lecture coverage while treating vision transcription
-as best-effort evidence: individual malformed frames never abort a lecture.
+For proof-heavy mathematics courses, small additions to a blackboard are
+semantically important: a new inequality, exponent, quantifier, or proof line
+must not be discarded merely because most pixels are unchanged.  The selector
+therefore combines full-lecture anchors with persistent ink-change events and
+keeps the last stable state before a board is erased/replaced.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from src.runtime import config
 
 
 class BlackboardPipeline:
-    """Extract, locally select, classify and transcribe blackboard frames."""
+    """Extract, locally select, classify and transcribe proof-preserving board frames."""
 
     def __init__(self, client, reporter=None):
         self._client = client
@@ -37,7 +40,7 @@ class BlackboardPipeline:
         self.event_gap_sec = max(self.sample_sec, int(config.BLACKBOARD_EVENT_GAP_SEC))
 
     def run(self, course_id: str, course_title: str, sub_id: str) -> tuple[str, str]:
-        self._info(f"    [Blackboard] enabled for {course_title}; dense sampling every {self.sample_sec}s, coverage anchor every {self.coverage_sec}s")
+        self._info(f"    [Blackboard] proof-preserving mode for {course_title}; sampling every {self.sample_sec}s, coverage anchor every {self.coverage_sec}s")
         temp_dir = tempfile.mkdtemp(prefix=f"icourse-board-{sub_id}-")
         try:
             frames = self._extract_frames(course_id, sub_id, temp_dir)
@@ -46,7 +49,10 @@ class BlackboardPipeline:
             raw_count = len(frames)
             try:
                 frames, stats = self._select_keyframes(frames)
-                self._info(f"    [Blackboard] local selector: {raw_count} sampled -> {len(frames)} vision frame(s) (anchors={stats['anchors']}, change-events={stats['events']}, cap={self.max_frames or 'none'})")
+                self._info(
+                    f"    [Blackboard] proof selector: {raw_count} sampled -> {len(frames)} vision frame(s) "
+                    f"(anchors={stats['anchors']}, additions={stats['events']}, pre-erase={stats['pre_erase']}, cap={self.max_frames or 'none'})"
+                )
             except Exception as exc:
                 self._info(f"    [Blackboard] selector warning: {type(exc).__name__}: {exc}; falling back to even coverage")
                 frames = self._fallback_even_coverage(frames)
@@ -108,19 +114,24 @@ class BlackboardPipeline:
             return np.asarray(image, dtype=np.uint8)
 
     @staticmethod
-    def _robust_abs_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    def _robust_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         delta = b.astype(np.int16) - a.astype(np.int16)
         sparse = delta[::4, ::4]
         shift = float(np.median(sparse)) if sparse.size else 0.0
-        return np.abs(delta.astype(np.float32) - shift)
+        return delta.astype(np.float32) - shift
+
+    def _robust_abs_diff(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return np.abs(self._robust_delta(a, b))
 
     def _select_keyframes(self, frames: list[VisionFrame]) -> tuple[list[VisionFrame], dict[str, int]]:
         n = len(frames)
         if n <= 2:
-            return list(frames), {"anchors": n, "events": 0}
+            return list(frames), {"anchors": n, "events": 0, "pre_erase": 0}
         gray = [self._analysis_gray(frame) for frame in frames]
         if len({arr.shape for arr in gray}) != 1:
             raise ValueError("sampled frames have inconsistent dimensions")
+
+        # Stable coverage anchors protect against imperfect change detection.
         motion_after = [1.0] * n
         for i in range(n - 1):
             diff = self._robust_abs_diff(gray[i], gray[i + 1])
@@ -132,36 +143,80 @@ class BlackboardPipeline:
             windows.setdefault(frame.timestamp_sec // self.coverage_sec, []).append(i)
         for indices in windows.values():
             anchors.add(min(indices, key=lambda i: (motion_after[i], -frames[i].timestamp_sec)))
+
+        # Proof-preserving events.  We intentionally use a much smaller spatial
+        # threshold than ordinary scene-change detection: a newly written proof
+        # line may occupy <1% of the image but still carry the whole argument.
         event_scores: dict[int, float] = {}
-        for i in range(1, n - 1):
-            changed = self._robust_abs_diff(gray[i - 1], gray[i])
-            stable_next = self._robust_abs_diff(gray[i], gray[i + 1])
-            persistent = (changed >= self.change_threshold) & (stable_next <= self.stable_threshold)
-            score = float(np.mean(persistent))
-            if score >= self.change_ratio:
-                target = min(i + 1, n - 1)
-                event_scores[target] = max(score, event_scores.get(target, 0.0))
-        event_indices: list[int] = []
-        for idx, _score in sorted(event_scores.items(), key=lambda item: item[1], reverse=True):
-            ts = frames[idx].timestamp_sec
-            if any(abs(ts - frames[j].timestamp_sec) < self.event_gap_sec for j in event_indices):
+        erase_scores: dict[int, float] = {}
+        min_ratio = min(self.change_ratio, 0.0025)
+        for i in range(1, n):
+            delta = self._robust_delta(gray[i - 1], gray[i])
+            changed = np.abs(delta) >= self.change_threshold
+            ratio = float(np.mean(changed))
+            if ratio < min_ratio:
                 continue
-            event_indices.append(idx)
+
+            # Require the changed state to persist into the next sample where
+            # possible; this suppresses a lecturer walking across the board.
+            if i < n - 1:
+                stable_next = self._robust_abs_diff(gray[i], gray[i + 1])
+                persistent = changed & (stable_next <= self.stable_threshold)
+                persistent_ratio = float(np.mean(persistent))
+            else:
+                persistent_ratio = ratio
+            if persistent_ratio < min_ratio:
+                continue
+
+            # Darkening is usually new ink on a light board; brightening is
+            # usually erasure. For dark boards the sign can invert, so total
+            # persistent change remains the primary trigger and sign only
+            # decides whether to preserve the pre-change state as well.
+            darkening = float(np.mean(delta <= -self.change_threshold))
+            brightening = float(np.mean(delta >= self.change_threshold))
+            event_scores[i] = max(persistent_ratio, event_scores.get(i, 0.0))
+            if brightening > darkening * 1.35 and brightening >= min_ratio:
+                erase_scores[i - 1] = max(brightening, erase_scores.get(i - 1, 0.0))
+
         selected = set(anchors)
+        candidates = sorted(
+            set(event_scores) | set(erase_scores),
+            key=lambda idx: max(event_scores.get(idx, 0.0), erase_scores.get(idx, 0.0)),
+            reverse=True,
+        )
+
+        # Unlike the old selector, do not impose a 30-second gap between proof
+        # events. Consecutive 15-second states may be successive proof lines.
+        for idx in candidates:
+            if idx in selected:
+                continue
+            if self.max_frames and len(selected) >= self.max_frames:
+                break
+            selected.add(idx)
+
+        # If the cap is tight, anchors are coverage insurance but proof events
+        # are semantically more valuable. Keep first/last plus strongest events,
+        # then fill remaining slots with evenly distributed anchors.
         if self.max_frames and len(selected) > self.max_frames:
-            ordered = sorted(selected)
-            step = (len(ordered) - 1) / max(1, self.max_frames - 1)
-            selected = {ordered[round(i * step)] for i in range(self.max_frames)}
-            event_indices = []
-        else:
-            for idx in sorted(event_indices, key=lambda x: event_scores.get(x, 0.0), reverse=True):
-                if idx in selected:
-                    continue
-                if self.max_frames and len(selected) >= self.max_frames:
+            mandatory = {0, n - 1}
+            ranked_events = [i for i in candidates if i not in mandatory]
+            chosen = set(mandatory)
+            for idx in ranked_events:
+                if len(chosen) >= self.max_frames:
                     break
-                selected.add(idx)
-        event_kept = sum(1 for i in selected if i in event_scores and i not in anchors)
-        return [frames[i] for i in sorted(selected)], {"anchors": len(anchors), "events": event_kept}
+                chosen.add(idx)
+            if len(chosen) < self.max_frames:
+                for idx in sorted(anchors):
+                    if len(chosen) >= self.max_frames:
+                        break
+                    chosen.add(idx)
+            selected = chosen
+
+        return [frames[i] for i in sorted(selected)], {
+            "anchors": sum(1 for i in selected if i in anchors),
+            "events": sum(1 for i in selected if i in event_scores and i not in anchors),
+            "pre_erase": sum(1 for i in selected if i in erase_scores),
+        }
 
     def _fallback_even_coverage(self, frames: list[VisionFrame]) -> list[VisionFrame]:
         if not frames:
