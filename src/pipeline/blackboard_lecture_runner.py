@@ -1,10 +1,10 @@
 """LectureRunner extension for proof-preserving blackboard notes.
 
 For whitelisted mathematics courses, the expensive vision stage creates and
-caches a chronological raw board transcription.  The final student-facing notes
-are then produced by a separate LLM transcription editor that removes repeated
-full-board snapshots and normalizes Markdown/LaTeX without using the audio
-transcript or summarizing away proof steps.
+caches a chronological raw board transcription. The final student-facing notes
+are produced by an LLM transcription editor that de-duplicates small raw chunks,
+then reconciles only adjacent chunk seams and normalizes Markdown/LaTeX without
+using the audio transcript or summarizing away proof steps.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v1/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v2/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -89,8 +89,8 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 )
                 return None
 
-            # Deliberately exclude transcript/transcript_segments here.  The
-            # editor's source of truth is the 229k-ish board timeline only.
+            # Deliberately exclude transcript/transcript_segments here. The
+            # editor's source of truth is the raw board timeline only.
             editor = BlackboardEditor()
             notes, editor_model = editor.edit(blackboard_latex)
             if not notes.strip():
@@ -111,8 +111,9 @@ class BlackboardLectureRunner(BaseLectureRunner):
             self._reporter.info(
                 f"    [OK] Blackboard edited transcript: "
                 f"{len(blackboard_latex)} raw chars -> {len(notes)} final chars; "
-                "two-pass chunked LLM de-duplication + LaTeX normalization; "
-                "audio transcript excluded; not a lecture summary"
+                "chunked LLM de-duplication + boundary-only seam merge + "
+                "LaTeX normalization; audio transcript excluded; "
+                "not a lecture summary"
             )
             self._db.update_summary(sub_id, notes, model_used)
             return notes
