@@ -10,6 +10,11 @@ TABLE also appends columns. Keeping fresh and migrated databases in the same
 physical column order prevents old/new shards from silently shifting values
 when a legacy tool ever relies on positional ``SELECT *`` semantics.
 
+The expensive raw blackboard transcription also has its own table.  This is
+intentional: it must survive future changes to the much more frequently-evolving
+``lectures`` row shape without depending on column position or auxiliary meta
+keys.
+
 frontend/js/schema.js is a **manual mirror** of these constants. When you
 change SCHEMA_SQL, LECTURES_MIGRATION_COLUMNS, or PPT_PAGES_MIGRATION_COLUMNS
 here, update that file too — there is no automated sync. Both run in different
@@ -40,6 +45,14 @@ CREATE TABLE IF NOT EXISTS lectures (
     proofread_transcript TEXT, proofread_segments_json TEXT,
     proofread_model TEXT, proofread_at TEXT,
     FOREIGN KEY (course_id) REFERENCES courses(course_id)
+);
+CREATE TABLE IF NOT EXISTS blackboard_cache (
+    sub_id TEXT PRIMARY KEY,
+    markdown TEXT NOT NULL,
+    model TEXT,
+    cache_version INTEGER NOT NULL,
+    updated_at TEXT,
+    FOREIGN KEY (sub_id) REFERENCES lectures(sub_id)
 );
 CREATE TABLE IF NOT EXISTS ppt_pages (
     sub_id TEXT NOT NULL,
