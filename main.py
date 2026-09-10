@@ -31,6 +31,9 @@ from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
 
 
+BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v2/"
+
+
 def login_with_retry(max_attempts: int = 5) -> WebVPNSession:
     """Login to WebVPN + iCourse CAS, retrying on transient failures.
 
@@ -61,7 +64,7 @@ def _check_session(client: ICourseClient) -> None:
     """Verify WebVPN session; re-login in place if expired.
 
     Mutates ``client`` so background workers holding the same instance
-    automatically pick up refreshed cookies.
+    automatically pick up refreshed cookies through the shared ``ICourseClient``.
     """
     if client.check_alive():
         return
@@ -106,14 +109,21 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
 
             known_processed = db.get_processed_sub_ids(course_id)
             if course_requires_blackboard(course_title):
-                # A functional-analysis lecture processed by an older version
-                # is NOT complete for this fork until its raw board LaTeX has
-                # been generated.  Remove those rows from the skip set so the
-                # new BlackboardLectureRunner can retrofit them once.
-                known_processed = {
-                    sid for sid in known_processed
-                    if bool((db.get_lecture(sid) or {}).get("blackboard_latex"))
-                }
+                # A processed blackboard lecture is complete only when it has
+                # both the current raw board cache and a final note generated
+                # by the current deterministic reconstruction compiler.  This
+                # makes compiler upgrades re-queue the lecture without forcing
+                # the expensive vision transcription to run again.
+                current_processed: set[str] = set()
+                for sid in known_processed:
+                    row = db.get_lecture(sid) or {}
+                    has_board = bool(row.get("blackboard_latex"))
+                    has_current_notes = str(
+                        row.get("summary_model") or ""
+                    ).startswith(BLACKBOARD_NOTES_MODEL_PREFIX)
+                    if has_board and has_current_notes:
+                        current_processed.add(sid)
+                known_processed = current_processed
 
             new_lectures = [
                 lec for lec in lectures
