@@ -8,6 +8,7 @@ from datetime import datetime
 
 BLACKBOARD_CACHE_VERSION = 2
 _CHECKPOINT_KEY_PREFIX = "blackboard_checkpoint:"
+_EDITOR_CHECKPOINT_KEY_PREFIX = "blackboard_editor_checkpoint:"
 _CACHE_VERSION_KEY_PREFIX = "blackboard_cache_version:"
 _CACHE_BLOB_KEY_PREFIX = "blackboard_cache_blob:"
 _BLACKBOARD_MARKER = "### 黑板板书 LaTeX 转写"
@@ -15,6 +16,10 @@ _BLACKBOARD_MARKER = "### 黑板板书 LaTeX 转写"
 
 def _checkpoint_key(sub_id: str) -> str:
     return f"{_CHECKPOINT_KEY_PREFIX}{sub_id}"
+
+
+def _editor_checkpoint_key(sub_id: str) -> str:
+    return f"{_EDITOR_CHECKPOINT_KEY_PREFIX}{sub_id}"
 
 
 def _cache_version_key(sub_id: str) -> str:
@@ -129,7 +134,7 @@ def get_blackboard(db, sub_id: str) -> tuple[str, str] | None:
 
     ``blackboard_cache_blob:<sub_id>`` is authoritative for durable reuse.
     Legacy lecture-column caches remain supported and are automatically mirrored
-    into meta on first successful read.  This protects the expensive raw vision
+    into meta on first successful read. This protects the expensive raw vision
     transcript from future ``lectures`` schema migrations and shard rebuilds.
     """
     sid = str(sub_id)
@@ -246,4 +251,50 @@ def clear_blackboard_checkpoint(db, sub_id: str) -> None:
         db.conn.execute(
             "DELETE FROM meta WHERE key = ?",
             (_checkpoint_key(str(sub_id)),),
+        )
+
+
+def load_editor_checkpoint(db, sub_id: str) -> dict | None:
+    """Load the durable text-editor checkpoint for one lecture.
+
+    The caller validates the raw-transcript fingerprint and chunking parameters;
+    this helper deliberately stays schema-agnostic so future editor stages can
+    add fields without another SQLite migration.
+    """
+    row = db.conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        (_editor_checkpoint_key(str(sub_id)),),
+    ).fetchone()
+    if not row or not row["value"]:
+        return None
+    try:
+        payload = json.loads(row["value"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def save_editor_checkpoint(db, sub_id: str, payload: dict) -> None:
+    """Atomically persist successful editor work after each completed chunk."""
+    data = dict(payload)
+    data["updated_at"] = datetime.now().isoformat()
+    encoded = json.dumps(
+        data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    with db._lock, db.conn:
+        db.conn.execute(
+            """INSERT INTO meta(key, value) VALUES(?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (_editor_checkpoint_key(str(sub_id)), encoded),
+        )
+
+
+def clear_editor_checkpoint(db, sub_id: str) -> None:
+    """Delete editor progress only after a complete final note is produced."""
+    with db._lock, db.conn:
+        db.conn.execute(
+            "DELETE FROM meta WHERE key = ?",
+            (_editor_checkpoint_key(str(sub_id)),),
         )
