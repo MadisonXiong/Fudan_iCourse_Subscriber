@@ -1,6 +1,6 @@
 """Persistence helpers for timestamped and AI-proofread lecture transcripts.
 
-The original schema stored only one flattened ASR string.  Traceable summaries
+The original schema stored only one flattened ASR string. Traceable summaries
 need the ASR time segments on later runs, and email transcript attachments need
 a durable corrected transcript that can be recovered if email sending is retried.
 
@@ -14,8 +14,10 @@ import json
 from datetime import datetime
 
 
-PROOFREAD_MODEL_PREFIX = "proofread-transcript-v1/"
-PROOFREAD_BOARD_MODEL_PREFIX = "proofread-transcript-v1-board/"
+# v2 aligns proofreading chunks to the same 3-minute windows used by summary
+# provenance. Bumping the prefix prevents reuse of any earlier 4-minute cache.
+PROOFREAD_MODEL_PREFIX = "proofread-transcript-v2/"
+PROOFREAD_BOARD_MODEL_PREFIX = "proofread-transcript-v2-board/"
 
 
 def _loads_segments(value: str | None) -> list[dict] | None:
