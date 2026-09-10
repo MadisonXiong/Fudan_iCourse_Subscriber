@@ -33,10 +33,18 @@ def _ensure_schema(conn: sqlite3.Connection):
 
 
 def merge(local_path: str, remote_path: str):
-    """Merge local changes into remote DB.  Only adds/progresses, never deletes."""
+    """Merge local changes into remote DB. Only adds/progresses, never deletes."""
     conn = sqlite3.connect(remote_path)
     _ensure_schema(conn)
     conn.execute("ATTACH DATABASE ? AS local", (local_path,))
+    _ensure_schema(conn)
+
+    # A local DB created by an older workflow may be attached without the new
+    # columns.  Bring its schema forward before referring to them below.
+    local_columns = {r[1] for r in conn.execute("PRAGMA local.table_info(lectures)")}
+    for col, typedef in LECTURES_MIGRATION_COLUMNS:
+        if col not in local_columns:
+            conn.execute(f"ALTER TABLE local.lectures ADD COLUMN {col} {typedef}")
 
     try:
         with conn:
@@ -49,11 +57,19 @@ def merge(local_path: str, remote_path: str):
             # 2) Lectures: insert rows that only exist in local
             conn.execute("""
                 INSERT OR IGNORE INTO main.lectures
-                    (sub_id, course_id, sub_title, date, transcript, summary,
-                     processed_at, emailed_at, error_msg, error_count, error_stage,
+                    (sub_id, course_id, sub_title, date,
+                     transcript, transcript_segments_json,
+                     proofread_transcript, proofread_segments_json,
+                     proofread_model, proofread_at,
+                     summary, processed_at, emailed_at,
+                     error_msg, error_count, error_stage,
                      summary_model, blackboard_latex, blackboard_model, blackboard_at)
-                SELECT sub_id, course_id, sub_title, date, transcript, summary,
-                       processed_at, emailed_at, error_msg, error_count, error_stage,
+                SELECT sub_id, course_id, sub_title, date,
+                       transcript, transcript_segments_json,
+                       proofread_transcript, proofread_segments_json,
+                       proofread_model, proofread_at,
+                       summary, processed_at, emailed_at,
+                       error_msg, error_count, error_stage,
                        summary_model, blackboard_latex, blackboard_model, blackboard_at
                 FROM local.lectures
             """)
@@ -61,14 +77,49 @@ def merge(local_path: str, remote_path: str):
             # 3) Lectures: merge existing rows (progress forward only)
             conn.execute("""
                 UPDATE main.lectures SET
-                    transcript       = COALESCE(l.transcript,       main.lectures.transcript),
-                    summary          = COALESCE(l.summary,          main.lectures.summary),
-                    summary_model    = COALESCE(l.summary_model,    main.lectures.summary_model),
-                    blackboard_latex = COALESCE(l.blackboard_latex, main.lectures.blackboard_latex),
-                    blackboard_model = COALESCE(l.blackboard_model, main.lectures.blackboard_model),
-                    blackboard_at    = COALESCE(l.blackboard_at,    main.lectures.blackboard_at),
-                    processed_at     = COALESCE(l.processed_at,     main.lectures.processed_at),
-                    emailed_at       = COALESCE(l.emailed_at,       main.lectures.emailed_at),
+                    transcript = COALESCE(l.transcript, main.lectures.transcript),
+                    transcript_segments_json = COALESCE(
+                        l.transcript_segments_json,
+                        main.lectures.transcript_segments_json
+                    ),
+                    proofread_transcript = COALESCE(
+                        l.proofread_transcript,
+                        main.lectures.proofread_transcript
+                    ),
+                    proofread_segments_json = COALESCE(
+                        l.proofread_segments_json,
+                        main.lectures.proofread_segments_json
+                    ),
+                    proofread_model = COALESCE(
+                        l.proofread_model,
+                        main.lectures.proofread_model
+                    ),
+                    proofread_at = COALESCE(
+                        l.proofread_at,
+                        main.lectures.proofread_at
+                    ),
+                    summary = COALESCE(l.summary, main.lectures.summary),
+                    summary_model = COALESCE(
+                        l.summary_model,
+                        main.lectures.summary_model
+                    ),
+                    blackboard_latex = COALESCE(
+                        l.blackboard_latex,
+                        main.lectures.blackboard_latex
+                    ),
+                    blackboard_model = COALESCE(
+                        l.blackboard_model,
+                        main.lectures.blackboard_model
+                    ),
+                    blackboard_at = COALESCE(
+                        l.blackboard_at,
+                        main.lectures.blackboard_at
+                    ),
+                    processed_at = COALESCE(
+                        l.processed_at,
+                        main.lectures.processed_at
+                    ),
+                    emailed_at = COALESCE(l.emailed_at, main.lectures.emailed_at),
                     error_msg = CASE
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
@@ -77,7 +128,10 @@ def merge(local_path: str, remote_path: str):
                     error_count = CASE
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN 0
-                        ELSE MAX(COALESCE(l.error_count, 0), COALESCE(main.lectures.error_count, 0))
+                        ELSE MAX(
+                            COALESCE(l.error_count, 0),
+                            COALESCE(main.lectures.error_count, 0)
+                        )
                     END,
                     error_stage = CASE
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
@@ -96,10 +150,9 @@ def merge(local_path: str, remote_path: str):
                 FROM local.ppt_pages
             """)
 
-            # 5) Persist blackboard cache/checkpoint metadata.  Blackboard
-            # cache validity is stored in meta, so dropping these keys during
-            # deploy makes a perfectly good 200k-char transcription look stale
-            # on the next run and needlessly re-runs all vision calls.
+            # 5) Persist blackboard cache/checkpoint metadata. Blackboard cache
+            # validity is stored in meta, so dropping these keys during deploy
+            # makes a good 200k-char transcription look stale on the next run.
             has_local_meta = conn.execute(
                 "SELECT 1 FROM local.sqlite_master "
                 "WHERE type='table' AND name='meta'"
@@ -134,8 +187,8 @@ def merge(local_path: str, remote_path: str):
                 """)
 
     finally:
-        # Persist COURSE_IDS from the CI secret into the meta table so
-        # the frontend can read the current subscription list.
+        # Persist COURSE_IDS from the CI secret into the meta table so the
+        # frontend can read the current subscription list.
         course_ids_env = os.environ.get("COURSE_IDS", "")
         if course_ids_env:
             conn.execute(
