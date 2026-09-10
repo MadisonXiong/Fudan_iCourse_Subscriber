@@ -8,8 +8,9 @@ material.
 This module is NOT a lecture summarizer. Pass 1 conservatively de-duplicates
 small chronological chunks. Afterwards, only the narrow seams between adjacent
 cleaned chunks may be shown to the model again. The already-cleaned chunk bodies
-are never rewritten by a global second pass. This sharply limits the amount of
-unique proof material that any later model call could accidentally remove.
+are never rewritten by a global second pass. Finally, a deterministic exact-
+block pass removes only repeated multi-paragraph blocks that survived chunk
+boundaries. It never performs fuzzy mathematical matching.
 """
 
 from __future__ import annotations
@@ -35,6 +36,14 @@ _DEFAULT_REPAIR_CHUNK_CHARS = 10000
 _DEFAULT_TIMEOUT = 600
 _MIN_RECURSIVE_CHUNK_CHARS = 6500
 _MAX_SPLIT_DEPTH = 2
+
+# Conservative final exact-block cleanup.  These thresholds are deliberately
+# high enough that a repeated isolated formula or short reminder is never
+# deleted merely because it appeared before.
+_EXACT_BLOCK_MIN_PARAS = 3
+_EXACT_BLOCK_MIN_CHARS = 260
+_EXACT_LONG_BLOCK_MIN_PARAS = 5
+_EXACT_LONG_BLOCK_MIN_CHARS = 450
 
 # This is the ModelScope text model confirmed working in the workflow. The VL
 # model remains a text-capable fallback on the same endpoint.
@@ -266,6 +275,7 @@ def _take_head_window(text: str, target_chars: int) -> tuple[str, str]:
 
 def _normal_for_overlap(text: str) -> str:
     text = text.lower()
+    text = text.replace(r"\leqslant", r"\leq").replace(r"\geqslant", r"\geq")
     text = re.sub(r"\$+", "", text)
     text = re.sub(r"\\(?:left|right|displaystyle|quad|qquad)", "", text)
     text = re.sub(r"\s+", "", text)
@@ -295,8 +305,110 @@ def _boundary_overlap_score(left_tail: str, right_head: str) -> float:
     return best
 
 
+def _looks_structural(paragraph: str) -> bool:
+    """Whether a paragraph is a strong lecture-structure anchor."""
+    stripped = paragraph.lstrip()
+    if stripped.startswith(("###", "####", "#####")):
+        return True
+    plain = re.sub(r"^[\s>*_`#-]+", "", stripped).lower()
+    return bool(
+        re.match(
+            r"(?:def\.?|thm\.?|theorem|lem\.?|lemma|proof|remark|claim|check|"
+            r"例\s*\d|证明|定义|定理|命题|引理|推论|回顾|§)",
+            plain,
+        )
+    )
+
+
+def _dedup_exact_repeated_blocks(text: str) -> tuple[str, int, int]:
+    """Remove only later copies of exact normalized multi-paragraph blocks.
+
+    This is intentionally stricter than fuzzy de-duplication.  It is aimed at
+    residual chunk-boundary repeats such as a whole theorem/proof being emitted
+    once at the end of one cleaned chunk and again at the start of a later one.
+    A single repeated formula or short paragraph is never removed by this pass.
+    """
+    paragraphs = [
+        p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()
+    ]
+    if len(paragraphs) < _EXACT_BLOCK_MIN_PARAS * 2:
+        return text.strip(), 0, 0
+
+    keys = [_normal_for_overlap(p) for p in paragraphs]
+    removed = [False] * len(paragraphs)
+    removed_blocks = 0
+    removed_chars = 0
+    j = 0
+
+    while j < len(paragraphs):
+        if removed[j] or len(keys[j]) < 8:
+            j += 1
+            continue
+
+        best: tuple[int, int, int] | None = None
+        for i in range(j):
+            if removed[i] or len(keys[i]) < 8:
+                continue
+
+            k = 0
+            normalized_chars = 0
+            while (
+                i + k < j
+                and j + k < len(paragraphs)
+                and not removed[i + k]
+                and not removed[j + k]
+                and keys[i + k] == keys[j + k]
+                and len(keys[j + k]) >= 8
+            ):
+                normalized_chars += len(keys[j + k])
+                k += 1
+
+            if k < _EXACT_BLOCK_MIN_PARAS:
+                continue
+
+            structural = any(
+                _looks_structural(paragraphs[j + offset])
+                or _looks_structural(paragraphs[i + offset])
+                for offset in range(min(k, 2))
+            )
+            qualifies = (
+                k >= _EXACT_LONG_BLOCK_MIN_PARAS
+                and normalized_chars >= _EXACT_LONG_BLOCK_MIN_CHARS
+            ) or (
+                structural
+                and k >= _EXACT_BLOCK_MIN_PARAS
+                and normalized_chars >= _EXACT_BLOCK_MIN_CHARS
+            )
+            if not qualifies:
+                continue
+
+            if best is None or normalized_chars > best[2]:
+                best = (i, k, normalized_chars)
+
+        if best is None:
+            j += 1
+            continue
+
+        _, block_len, _ = best
+        for index in range(j, j + block_len):
+            removed[index] = True
+            removed_chars += len(paragraphs[index])
+        removed_blocks += 1
+        j += block_len
+
+    if not removed_blocks:
+        return text.strip(), 0, 0
+
+    cleaned = "\n\n".join(
+        paragraph
+        for index, paragraph in enumerate(paragraphs)
+        if not removed[index]
+    ).strip()
+    return cleaned, removed_blocks, removed_chars
+
+
 class BlackboardEditor:
-    """First-pass chunk editor plus narrow, non-global boundary reconciliation."""
+    """First-pass chunk editor plus conservative boundary reconciliation."""
 
     def __init__(self):
         self.providers = self._build_providers()
@@ -581,7 +693,11 @@ class BlackboardEditor:
                     and 0.45 <= ratio <= 1.30
                 )
                 if safe:
-                    pieces = [piece for piece in (left_body, result.text, right_body) if piece.strip()]
+                    pieces = [
+                        piece
+                        for piece in (left_body, result.text, right_body)
+                        if piece.strip()
+                    ]
                     merged = "\n\n".join(piece.strip() for piece in pieces)
                     models.append(result.model_id)
                     print(
@@ -691,7 +807,28 @@ class BlackboardEditor:
         )
 
         merged, boundary_models = self._merge_boundaries(pass1_chunks)
-        final_text, repair_models = self._repair_if_needed(merged)
+
+        # The email from the previous version showed that a few long, exact
+        # blocks can survive when their duplicated span is wider than the seam
+        # window.  Remove only exact normalized multi-paragraph repetitions.
+        exact_cleaned, removed_blocks, removed_chars = _dedup_exact_repeated_blocks(
+            merged
+        )
+        if removed_blocks:
+            print(
+                f"[BlackboardEditor] exact-block cleanup: removed "
+                f"{removed_blocks} repeated block(s), "
+                f"{removed_chars} duplicate source chars",
+                flush=True,
+            )
+        else:
+            print(
+                "[BlackboardEditor] exact-block cleanup: no qualifying "
+                "multi-paragraph duplicates found",
+                flush=True,
+            )
+
+        final_text, repair_models = self._repair_if_needed(exact_cleaned)
         if not final_text:
             raise RuntimeError("blackboard editor produced empty final output")
         if not final_text.startswith(EDITOR_MARKER):
@@ -701,8 +838,8 @@ class BlackboardEditor:
         model_label = "+".join(dict.fromkeys(all_models)) or "unknown"
         print(
             f"[BlackboardEditor] complete: {len(raw)} raw chars -> "
-            f"{len(final_text)} edited chars; boundary-only merge; "
-            f"models={model_label}",
+            f"{len(final_text)} edited chars; boundary-only merge + "
+            f"exact-block cleanup; models={model_label}",
             flush=True,
         )
         return final_text, model_label
