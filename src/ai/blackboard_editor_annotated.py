@@ -1,17 +1,31 @@
 """Annotation policy and final quality gate for BlackboardEditor.
 
 The base editor performs local de-duplication, global semantic consolidation,
-faithfulness audit and normal LaTeX repair.  This overlay allows concise
+faithfulness audit and normal LaTeX repair. This overlay allows concise
 model-authored explanations, but requires them to be visibly marked as purple
-``AI 补充`` blocks.  After the base editor finishes, a strict local finalizer
+``AI 补充`` blocks. After the base editor finishes, a strict local finalizer
 checks the complete document for concrete renderer/transcription defects and
 repairs only the affected small chunks against the raw vision evidence.
+
+The expensive local LLM pass is resumable. Every successfully completed top-level
+raw chunk is persisted to SQLite ``meta``. If a free inference quota is exhausted
+halfway through a lecture, the next run starts at the first unfinished chunk
+instead of paying for the completed chunks again. The checkpoint is bound to a
+SHA-256 fingerprint of the exact raw vision transcription and current chunking
+parameters, so stale progress can never be applied to different source material.
 """
 
 from __future__ import annotations
 
+import hashlib
+
 from src.ai import blackboard_editor as _base
 from src.ai.blackboard_finalizer import repair_final_anomalies
+from src.data.blackboard_store import (
+    clear_editor_checkpoint,
+    load_editor_checkpoint,
+    save_editor_checkpoint,
+)
 
 
 AI_NOTE_OPEN = (
@@ -22,6 +36,7 @@ AI_NOTE_OPEN = (
 )
 AI_NOTE_LABEL = '<strong style="color:#6d28d9;">AI 补充</strong><br>'
 AI_NOTE_CLOSE = "</div>"
+_EDITOR_CHECKPOINT_VERSION = 1
 
 
 _base.GLOBAL_SYSTEM_PROMPT = rf"""
@@ -135,9 +150,141 @@ _base.REPAIR_SYSTEM_PROMPT = r"""
 
 
 class BlackboardEditor(_base.BlackboardEditor):
-    """Base semantic editor plus strict local render/transcription preflight."""
+    """Annotated editor with durable local-pass resume and final preflight."""
+
+    def __init__(self, *args, db=None, sub_id: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._checkpoint_db = db
+        self._checkpoint_sub_id = str(sub_id) if sub_id is not None else ""
+
+    @staticmethod
+    def _source_fingerprint(raw_chunks: list[str]) -> str:
+        digest = hashlib.sha256()
+        for chunk in raw_chunks:
+            digest.update(chunk.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _checkpoint_identity(self, raw_chunks: list[str]) -> dict:
+        return {
+            "version": _EDITOR_CHECKPOINT_VERSION,
+            "source_sha256": self._source_fingerprint(raw_chunks),
+            "chunk_count": len(raw_chunks),
+            "raw_chunk_chars": self.raw_chunk_chars,
+            "boundary_chars": self.local_boundary_chars,
+        }
+
+    def _load_local_progress(
+        self, raw_chunks: list[str]
+    ) -> tuple[list[str], list[str], list[float]]:
+        if self._checkpoint_db is None or not self._checkpoint_sub_id:
+            return [], [], []
+
+        payload = load_editor_checkpoint(
+            self._checkpoint_db, self._checkpoint_sub_id
+        )
+        if not payload:
+            return [], [], []
+
+        identity = self._checkpoint_identity(raw_chunks)
+        if any(payload.get(key) != value for key, value in identity.items()):
+            print(
+                "[BlackboardEditor] stored editor checkpoint does not match "
+                "the current raw source/chunking; ignoring stale progress",
+                flush=True,
+            )
+            clear_editor_checkpoint(
+                self._checkpoint_db, self._checkpoint_sub_id
+            )
+            return [], [], []
+
+        outputs = payload.get("outputs")
+        models = payload.get("models")
+        ratios = payload.get("ratios")
+        if not isinstance(outputs, list) or len(outputs) > len(raw_chunks):
+            return [], [], []
+        if not all(isinstance(item, str) and item.strip() for item in outputs):
+            return [], [], []
+        if not isinstance(models, list):
+            models = []
+        if not isinstance(ratios, list):
+            ratios = []
+        try:
+            ratios = [float(value) for value in ratios]
+        except (TypeError, ValueError):
+            ratios = []
+
+        if outputs:
+            print(
+                f"[BlackboardEditor] resumed durable local-pass checkpoint: "
+                f"{len(outputs)}/{len(raw_chunks)} top-level chunk(s) already complete; "
+                f"continuing at chunk {len(outputs) + 1}",
+                flush=True,
+            )
+        return outputs, [str(x) for x in models], ratios
+
+    def _save_local_progress(
+        self,
+        raw_chunks: list[str],
+        outputs: list[str],
+        models: list[str],
+        ratios: list[float],
+    ) -> None:
+        if self._checkpoint_db is None or not self._checkpoint_sub_id:
+            return
+        payload = self._checkpoint_identity(raw_chunks)
+        payload.update(
+            {
+                "stage": "local-pass",
+                "outputs": outputs,
+                "models": models,
+                "ratios": ratios,
+            }
+        )
+        save_editor_checkpoint(
+            self._checkpoint_db,
+            self._checkpoint_sub_id,
+            payload,
+        )
+        print(
+            f"[BlackboardEditor] checkpoint saved: "
+            f"{len(outputs)}/{len(raw_chunks)} local chunk(s)",
+            flush=True,
+        )
+
+    def _run_local_pass(self, raw_chunks: list[str]) -> tuple[str, list[str]]:
+        outputs, models, ratios = self._load_local_progress(raw_chunks)
+        previous_tail = outputs[-1] if outputs else ""
+        completed = len(outputs)
+
+        print(
+            f"[BlackboardEditor] pass 1 / LLM local de-duplication: "
+            f"{len(raw_chunks)} chunk(s), {completed} resumed",
+            flush=True,
+        )
+
+        for index in range(completed, len(raw_chunks)):
+            chunk = raw_chunks[index]
+            text, used_models, chunk_ratios = self._edit_local_resilient(
+                chunk,
+                boundary=previous_tail[-self.local_boundary_chars:],
+                previous_ratios=ratios,
+                label=f"pass 1 chunk {index + 1}/{len(raw_chunks)}",
+            )
+            outputs.append(text)
+            models.extend(used_models)
+            ratios.extend(chunk_ratios)
+            previous_tail = text
+
+            # Save only after a complete top-level chunk passes all safety gates.
+            # If a recursive .a succeeds but .b fails, the parent chunk is not
+            # checkpointed and will be retried as one logical unit next time.
+            self._save_local_progress(raw_chunks, outputs, models, ratios)
+
+        return "\n\n".join(outputs).strip(), models
 
     def edit(self, raw_blackboard: str) -> tuple[str, str]:
+        # Base ``edit`` calls our resumable _run_local_pass override.
         notes, model_label = super().edit(raw_blackboard)
         finalized = repair_final_anomalies(self, notes, raw_blackboard)
 
@@ -149,6 +296,19 @@ class BlackboardEditor(_base.BlackboardEditor):
             print(
                 f"[BlackboardEditor] final local preflight repaired "
                 f"{finalized.repaired_chunks} chunk(s)",
+                flush=True,
+            )
+
+        # Clear only after the entire annotated/finalized document succeeded.
+        # Any quota/network failure before this point leaves the local progress
+        # available for tomorrow's run.
+        if self._checkpoint_db is not None and self._checkpoint_sub_id:
+            clear_editor_checkpoint(
+                self._checkpoint_db, self._checkpoint_sub_id
+            )
+            print(
+                "[BlackboardEditor] complete document produced; "
+                "local-pass checkpoint cleared",
                 flush=True,
             )
 
