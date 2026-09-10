@@ -2,8 +2,8 @@
 
 For whitelisted mathematics courses, the final deliverable is a faithful
 transcription-derived LaTeX notebook, not an LLM summary.  The vision pipeline
-transcribes the board frame by frame; a deterministic compiler removes only
-nearby repeated lines while preserving changed/new proof steps verbatim.
+transcribes the board frame by frame; a deterministic compiler reconstructs
+continuous board states while preserving changed/new proof steps verbatim.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v1/"
+_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v2/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -42,9 +42,8 @@ class BlackboardLectureRunner(BaseLectureRunner):
         if not sub_id or get_blackboard(self._db, sub_id) is None:
             return False
 
-        # Old AI-generated summaries are not valid outputs for a blackboard
-        # course. Only a summary field explicitly produced by the deterministic
-        # LaTeX-note compiler counts as complete.
+        # Old AI-generated summaries and older compiler outputs are not valid
+        # for the current reconstruction algorithm.
         return str(existing.get("summary_model") or "").startswith(_NOTES_MODEL_PREFIX)
 
     def _ensure_blackboard(self, sub_id: str, course_title: str) -> tuple[str, str]:
@@ -72,8 +71,8 @@ class BlackboardLectureRunner(BaseLectureRunner):
         """Create final output.
 
         For blackboard courses this method intentionally does not call the
-        general-purpose summarizer.  It converts cached frame transcriptions
-        directly into chronological LaTeX notes.  Other courses retain the
+        general-purpose summarizer. It reconstructs cached frame transcriptions
+        directly into chronological LaTeX notes. Other courses retain the
         repository's original summary behavior.
         """
         if not course_requires_blackboard(course_title):
@@ -111,7 +110,8 @@ class BlackboardLectureRunner(BaseLectureRunner):
             model_used = f"{_NOTES_MODEL_PREFIX}{blackboard_model or 'vision'}"
             self._reporter.info(
                 f"    [OK] Blackboard LaTeX notes: {len(blackboard_latex)} raw chars "
-                f"-> {len(notes)} note chars; no LLM summarization"
+                f"-> {len(notes)} note chars; deterministic board-state reconstruction; "
+                "no LLM summarization"
             )
             self._db.update_summary(sub_id, notes, model_used)
             return notes
