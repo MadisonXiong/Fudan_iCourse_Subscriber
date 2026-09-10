@@ -6,10 +6,12 @@ import traceback
 
 from src.runtime import config
 from src.data.database import Database
+from src.data.transcript_store import load_proofread
 from src.api.emailer import Emailer
 from src.api.icourse import ICourseClient
 from src.ai.blackboard_vision import course_requires_blackboard
 from src.pipeline.blackboard_lecture_runner import BlackboardLectureRunner as LectureRunner
+from src.pipeline.lecture_runner import TRACEABLE_SUMMARY_PREFIX
 from src.runtime.reporter import Reporter
 from src.runtime.scheduler import Scheduler
 from src.ai.summarizer import Summarizer
@@ -17,11 +19,10 @@ from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
 
 
-BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v7/"
+BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v8/"
 
 
 def _has_webvpn_ticket(vpn: WebVPNSession) -> bool:
-    """Whether the current requests session still carries a WebVPN ticket."""
     return any(
         "wengine_vpn_ticket" in cookie.name
         for cookie in vpn.session.cookies
@@ -32,15 +33,12 @@ def login_with_retry(
     max_attempts: int = 3,
     icourse_attempts_per_session: int = 4,
 ) -> WebVPNSession:
-    """Login to WebVPN, retrying flaky iCourse CAS on the same VPN session."""
     last_error: Exception | None = None
-
     for vpn_attempt in range(max_attempts):
         vpn = WebVPNSession()
         try:
             print(
-                f"\n[Login] WebVPN "
-                f"(session {vpn_attempt + 1}/{max_attempts})..."
+                f"\n[Login] WebVPN (session {vpn_attempt + 1}/{max_attempts})..."
             )
             vpn.login()
         except Exception as exc:
@@ -58,22 +56,19 @@ def login_with_retry(
         for cas_attempt in range(icourse_attempts_per_session):
             try:
                 print(
-                    f"[Login] iCourse CAS "
-                    f"(same VPN, attempt {cas_attempt + 1}/"
+                    f"[Login] iCourse CAS (same VPN, attempt {cas_attempt + 1}/"
                     f"{icourse_attempts_per_session})..."
                 )
                 vpn.authenticate_icourse()
                 return vpn
             except Exception as exc:
                 last_error = exc
-
                 if not _has_webvpn_ticket(vpn):
                     print(
                         "  iCourse CAS failed and the WebVPN ticket cookie "
                         "is missing; rebuilding WebVPN session."
                     )
                     break
-
                 if cas_attempt < icourse_attempts_per_session - 1:
                     wait = min(3 * (2 ** cas_attempt), 18)
                     print(
@@ -86,9 +81,8 @@ def login_with_retry(
                     time.sleep(wait)
                 else:
                     print(
-                        f"  iCourse CAS failed "
-                        f"{icourse_attempts_per_session} times on the same "
-                        "WebVPN session."
+                        f"  iCourse CAS failed {icourse_attempts_per_session} "
+                        "times on the same WebVPN session."
                     )
 
         if vpn_attempt < max_attempts - 1:
@@ -105,7 +99,6 @@ def login_with_retry(
 
 
 def _check_session(client: ICourseClient) -> None:
-    """Verify WebVPN session; re-login in place if expired."""
     if client.check_alive():
         return
     print("[Session] WebVPN session expired, re-logging in...")
@@ -113,12 +106,25 @@ def _check_session(client: ICourseClient) -> None:
     client._userinfo = None
 
 
+def _summary_is_current(row: dict, course_title: str) -> bool:
+    model = str(row.get("summary_model") or "")
+    if course_requires_blackboard(course_title):
+        return bool(row.get("blackboard_latex")) and model.startswith(
+            BLACKBOARD_NOTES_MODEL_PREFIX
+        )
+    return model.startswith(TRACEABLE_SUMMARY_PREFIX)
+
+
 def _enumerate_lectures(
     client: ICourseClient,
     db: Database,
     reporter: Reporter,
 ) -> list[tuple[str, str, dict]]:
-    """List every lecture that should be processed in this run."""
+    """List lectures requiring the current traceable output format.
+
+    This intentionally re-queues previously processed lectures once when their
+    stored summary predates video provenance / proofread transcript support.
+    """
     out: list[tuple[str, str, dict]] = []
 
     for course_id in config.COURSE_IDS:
@@ -152,17 +158,12 @@ def _enumerate_lectures(
             lectures = deduped
 
             known_processed = db.get_processed_sub_ids(course_id)
-            if course_requires_blackboard(course_title):
-                current_processed: set[str] = set()
-                for sid in known_processed:
-                    row = db.get_lecture(sid) or {}
-                    has_board = bool(row.get("blackboard_latex"))
-                    has_current_notes = str(
-                        row.get("summary_model") or ""
-                    ).startswith(BLACKBOARD_NOTES_MODEL_PREFIX)
-                    if has_board and has_current_notes:
-                        current_processed.add(sid)
-                known_processed = current_processed
+            current_processed: set[str] = set()
+            for sid in known_processed:
+                row = db.get_lecture(sid) or {}
+                if _summary_is_current(row, course_title):
+                    current_processed.add(sid)
+            known_processed = current_processed
 
             new_lectures = [
                 lec
@@ -185,9 +186,6 @@ def _enumerate_lectures(
             new_lectures.extend(retry_only)
 
             reporter.course_new_count(len(new_lectures))
-            if not new_lectures:
-                continue
-
             for lecture in new_lectures:
                 sub_id = str(lecture["sub_id"])
                 db.insert_lecture(
@@ -205,6 +203,33 @@ def _enumerate_lectures(
     return out
 
 
+def _email_item_from_row_like(
+    db: Database,
+    *,
+    sub_id: str,
+    course_title: str,
+    sub_title: str,
+    date: str,
+    summary: str,
+) -> dict:
+    item = {
+        "sub_id": sub_id,
+        "course_title": course_title,
+        "sub_title": sub_title,
+        "date": date,
+        "summary": summary,
+    }
+    proofread = load_proofread(db, sub_id)
+    if proofread:
+        transcript_md, timed_chunks, _ = proofread
+        if transcript_md and timed_chunks:
+            item["transcript_attachment"] = transcript_md
+            item["transcript_filename"] = (
+                f"{course_title}-{sub_title}-AI校订语音转写.md"
+            )
+    return item
+
+
 def _drive_lectures(
     client: ICourseClient,
     db: Database,
@@ -215,52 +240,40 @@ def _drive_lectures(
     all_lectures: list[tuple[str, str, dict]],
     email_items: list,
 ) -> None:
-    """Run each queued lecture through LectureRunner."""
     if not all_lectures:
         return
 
     first_course, _, first_lec = all_lectures[0]
     scheduler.prefetch_lecture(
-        client,
-        first_course,
-        str(first_lec["sub_id"]),
+        client, first_course, str(first_lec["sub_id"])
     )
 
     runner = LectureRunner(
-        client,
-        db,
-        scheduler,
-        transcriber,
-        summarizer,
-        reporter,
+        client, db, scheduler, transcriber, summarizer, reporter,
     )
 
     for index, (course_id, course_title, lecture) in enumerate(all_lectures):
         sub_id = str(lecture["sub_id"])
         next_info: tuple[str, str] | None = None
-
         if index + 1 < len(all_lectures):
             next_course, _, next_lec = all_lectures[index + 1]
             next_info = (next_course, str(next_lec["sub_id"]))
 
         _check_session(client)
-
         try:
             summary = runner.run(
-                course_id,
-                course_title,
-                lecture,
-                next_info=next_info,
+                course_id, course_title, lecture, next_info=next_info,
             )
             if summary:
                 email_items.append(
-                    {
-                        "sub_id": sub_id,
-                        "course_title": course_title,
-                        "sub_title": lecture.get("sub_title", sub_id),
-                        "date": lecture.get("date", ""),
-                        "summary": summary,
-                    }
+                    _email_item_from_row_like(
+                        db,
+                        sub_id=sub_id,
+                        course_title=course_title,
+                        sub_title=lecture.get("sub_title", sub_id),
+                        date=lecture.get("date", ""),
+                        summary=summary,
+                    )
                 )
         except Exception:
             reporter.lecture_error(sub_id)
@@ -276,20 +289,21 @@ def _send_email(
     reporter: Reporter,
     email_items: list,
 ) -> None:
-    """Append unsent processed lectures, then send."""
+    """Append unsent processed lectures, including durable transcript attachments."""
     unsent = db.get_unsent_lectures()
     if unsent:
         seen_sub_ids = {item["sub_id"] for item in email_items}
         for row in unsent:
             if row["sub_id"] not in seen_sub_ids:
                 email_items.append(
-                    {
-                        "sub_id": row["sub_id"],
-                        "course_title": row["course_title"],
-                        "sub_title": row["sub_title"],
-                        "date": row["date"],
-                        "summary": row["summary"],
-                    }
+                    _email_item_from_row_like(
+                        db,
+                        sub_id=row["sub_id"],
+                        course_title=row["course_title"],
+                        sub_title=row["sub_title"],
+                        date=row["date"],
+                        summary=row["summary"],
+                    )
                 )
         reporter.email_recovered_unsent(len(unsent))
 
@@ -312,16 +326,13 @@ def _crawl_semester_catalog(
     db: Database,
     reporter: Reporter,
 ) -> None:
-    """Auto-discover semesters and refresh all_courses."""
     reporter.info("Discovering available semesters from API...")
-
     try:
         _check_session(client)
         terms = client.discover_terms()
     except Exception as exc:
         reporter.crawl_courses_failed("discovery", exc)
         return
-
     if not terms:
         reporter.info("No semesters found via API discovery.")
         return
@@ -330,44 +341,32 @@ def _crawl_semester_catalog(
         f"Found {len(terms)} semester(s): "
         f"{', '.join(term['name'] for term in terms)}"
     )
-
     for term_info in terms:
         code = term_info["code"]
         name = term_info["name"]
         expected = term_info["count"]
         reporter.crawl_courses_start(name)
         t0 = time.time()
-
         try:
             _check_session(client)
             rows = client.list_semester_courses(code)
             if not rows:
-                reporter.info(
-                    f"  Term {name}: API returned 0 courses, skipping."
-                )
+                reporter.info(f"  Term {name}: API returned 0 courses, skipping.")
                 continue
-
             deleted, upserted = db.upsert_all_courses_for_term(name, rows)
             reporter.crawl_courses_done(
-                name,
-                len(rows),
-                deleted,
-                upserted,
-                time.time() - t0,
+                name, len(rows), deleted, upserted, time.time() - t0,
             )
         except Exception as exc:
             reporter.crawl_courses_failed(name, exc)
             continue
-
         reporter.info(
             f"  ({code}) → {expected} API courses, {len(rows)} fetched"
         )
-
     reporter.info("Semester catalog crawl complete.")
 
 
 def run():
-    """Single execution of the full pipeline."""
     reporter = Reporter()
     reporter.run_header()
 
@@ -388,9 +387,7 @@ def run():
     transcriber = Transcriber()
     summarizer = Summarizer() if config.COURSE_IDS else None
     emailer = (
-        Emailer()
-        if config.SMTP_EMAIL and config.SMTP_PASSWORD
-        else None
+        Emailer() if config.SMTP_EMAIL and config.SMTP_PASSWORD else None
     )
 
     vpn = login_with_retry()
@@ -407,14 +404,11 @@ def run():
         )
 
     if not config.COURSE_IDS:
-        reporter.info(
-            "\n[Crawl-only mode] No COURSE_IDS — skipping lectures."
-        )
+        reporter.info("\n[Crawl-only mode] No COURSE_IDS — skipping lectures.")
         reporter.run_footer()
         return
 
     scheduler = Scheduler(reporter=reporter)
-
     try:
         all_lectures = _enumerate_lectures(client, db, reporter)
         _drive_lectures(
