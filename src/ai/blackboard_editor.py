@@ -1,14 +1,15 @@
 """LLM-assisted lossless editing of raw blackboard transcriptions.
 
-The vision stage already produces a high-quality chronological transcription of
-selected full-board frames. Because a physical blackboard moves vertically and
-is written incrementally, that raw timeline contains many overlapping snapshots
-of the same material.
+The vision stage produces a high-quality chronological transcription of selected
+full-board frames. Because a physical blackboard moves vertically and is written
+incrementally, that raw timeline contains many overlapping snapshots of the same
+material.
 
-This module is NOT a lecture summarizer. It performs conservative, chunked text
-editing: remove repeated board snapshots, keep every unique mathematical step,
-and normalize Markdown/LaTeX for email rendering. Suspiciously short model
-outputs are rejected and the offending source chunk is split and retried.
+This module is NOT a lecture summarizer. Pass 1 conservatively de-duplicates
+small chronological chunks. Afterwards, only the narrow seams between adjacent
+cleaned chunks may be shown to the model again. The already-cleaned chunk bodies
+are never rewritten by a global second pass. This sharply limits the amount of
+unique proof material that any later model call could accidentally remove.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import re
 import statistics
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from openai import OpenAI
 
@@ -26,20 +28,16 @@ from src.runtime import config
 
 EDITOR_MARKER = "### 黑板板书整理稿"
 
-# Smaller than the first implementation on purpose. The 229k-character lecture
-# will normally produce about 14-16 first-pass chunks instead of 10. This costs
-# a few more calls but materially reduces the risk that the editor mistakes a
-# large span of unique proof material for repeated frames.
 _DEFAULT_RAW_CHUNK_CHARS = 16000
-_DEFAULT_SECOND_PASS_CHARS = 20000
-_DEFAULT_BOUNDARY_CHARS = 4000
+_DEFAULT_BOUNDARY_CONTEXT_CHARS = 4000
+_DEFAULT_SEAM_WINDOW_CHARS = 3200
+_DEFAULT_REPAIR_CHUNK_CHARS = 10000
 _DEFAULT_TIMEOUT = 600
 _MIN_RECURSIVE_CHUNK_CHARS = 6500
 _MAX_SPLIT_DEPTH = 2
 
-# Qwen3-235B-A22B-Instruct-2507 was removed because ModelScope's hosted
-# inference endpoint currently returns "has no provider supported" for it.
-# Qwen3-30B-A3B-Instruct-2507 is confirmed working in this workflow.
+# This is the ModelScope text model confirmed working in the workflow. The VL
+# model remains a text-capable fallback on the same endpoint.
 _MODELSCOPE_EDITOR_MODELS = [
     "Qwen/Qwen3-30B-A3B-Instruct-2507",
     "Qwen/Qwen3-VL-8B-Instruct",
@@ -65,7 +63,7 @@ EDITOR_SYSTEM_PROMPT = r"""
 
 【必须遵守：内容】
 1. 这不是摘要。必须保留所有唯一的教学内容：定义、命题、定理、例子、证明、推导步骤、公式、条件、CHECK、Why、反例、作业或课堂提示。尤其不得为了缩短输出而省略证明步骤。
-2. 只删除“能够从上下文确认是同一块板书重复出现”的内容。若不能确认是重复，宁可保留，也不要删除。
+2. 只删除能够从上下文确认是同一块黑板重复出现的内容。若不能确认是重复，宁可保留，也不要删除。
 3. 同一句/同一公式先出现不完整版本、后出现完整版本时，只保留最完整版本。
 4. 同一内容在不同帧中只有轻微 OCR/LaTeX 差异时，根据前后多行上下文判断是否为同一板书；若确认相同，选择最完整、最一致的版本。不得把数学含义真正不同的两步强行合并。
 5. 不得利用你自己的数学知识补证明、补定义、补条件或改写成教材答案。输入没有出现的数学内容不能新增。
@@ -102,15 +100,21 @@ CHUNK_SYSTEM_PROMPT = EDITOR_SYSTEM_PROMPT + r"""
 """
 
 
-SECOND_PASS_SYSTEM_PROMPT = EDITOR_SYSTEM_PROMPT + r"""
+BOUNDARY_SYSTEM_PROMPT = r"""
+你是数学板书“分段接缝编辑器”。输入只有第一轮整理稿中相邻两段的边界：左段末尾和右段开头。
 
-当前输入已经是第一轮去重稿。第二轮只能处理分段边界残留的重复和 LaTeX 格式问题。
-因为第一轮已经去掉了大量逐帧重复，第二轮原则上应保留绝大多数文本：
-- 只删除能够明确确认的跨块重复；
-- 不再做大幅压缩；
-- 保留所有唯一的定义、例子、定理、证明和推导步骤；
-- 不得把完整转写概括成摘要。
-"""
+你的任务非常窄：只合并这两个边界之间确实重复的内容，使它们连续衔接。
+
+必须遵守：
+1. 只删除能够明确确认的跨边界重复；不是摘要。
+2. 所有只出现一次的定义、公式、证明步骤、CHECK、Why、例子、条件都必须保留。
+3. 如果右段是在补全左段最后一条未完成内容，保留补全后的完整版本。
+4. 如果不确定两行是否相同，两个都保留。
+5. 不补充输入中不存在的数学内容，不重新组织知识结构。
+6. 保持原有先后顺序。
+7. 输出只能是合并后的“边界正文”，不要输出说明、标签、代码块，也不要重复“左段/右段”字样。
+8. 保持 `$...$`、`$$...$$` Markdown/LaTeX 形式；不得引入 aligned/array/cases。
+""".strip()
 
 
 REPAIR_SYSTEM_PROMPT = r"""
@@ -123,8 +127,9 @@ REPAIR_SYSTEM_PROMPT = r"""
 - 中文必须在数学环境外；
 - 不使用 aligned/array/cases 等多行环境；
 - 过长 display 公式拆成多个独立 `$$...$$`；
-- 不使用代码块。
-直接输出修复后的全文，文本长度原则上应与输入接近。
+- 不使用代码块；
+- 文本长度原则上应与输入接近。
+直接输出修复后的全文。
 """.strip()
 
 
@@ -192,14 +197,10 @@ def _split_paragraphs(text: str, target_chars: int) -> list[str]:
     return _pack_pieces(pieces, target_chars) if pieces else ([text] if text else [])
 
 
-def _split_in_two(text: str, raw_phase: bool) -> tuple[str, str] | None:
-    """Split near the middle at a safe frame/paragraph boundary."""
-    if raw_phase:
-        starts = [match.start() for match in _FRAME_HEADING_RE.finditer(text)]
-        candidates = [pos for pos in starts if 0 < pos < len(text)]
-    else:
-        candidates = [m.start() for m in re.finditer(r"\n\s*\n", text)]
-
+def _split_in_two(text: str) -> tuple[str, str] | None:
+    """Split a raw chunk near the middle at a frame boundary."""
+    starts = [match.start() for match in _FRAME_HEADING_RE.finditer(text)]
+    candidates = [pos for pos in starts if 0 < pos < len(text)]
     if not candidates:
         return None
     midpoint = len(text) / 2
@@ -233,8 +234,69 @@ def _format_issues(text: str) -> list[str]:
     return issues
 
 
+def _take_tail_window(text: str, target_chars: int) -> tuple[str, str]:
+    """Return (unchanged_body, tail_window), preferring paragraph boundaries."""
+    text = text.strip()
+    if len(text) <= target_chars:
+        return "", text
+    target = max(0, len(text) - target_chars)
+    after = text.find("\n\n", target)
+    before = text.rfind("\n\n", 0, target)
+    candidates = [pos for pos in (after, before) if pos >= 0]
+    split_at = min(candidates, key=lambda pos: abs(pos - target)) if candidates else target
+    if split_at <= 0:
+        return "", text
+    return text[:split_at].rstrip(), text[split_at:].lstrip()
+
+
+def _take_head_window(text: str, target_chars: int) -> tuple[str, str]:
+    """Return (head_window, unchanged_body), preferring paragraph boundaries."""
+    text = text.strip()
+    if len(text) <= target_chars:
+        return text, ""
+    target = min(len(text), target_chars)
+    before = text.rfind("\n\n", 0, target)
+    after = text.find("\n\n", target)
+    candidates = [pos for pos in (before, after) if pos >= 0]
+    split_at = min(candidates, key=lambda pos: abs(pos - target)) if candidates else target
+    if split_at <= 0:
+        return text, ""
+    return text[:split_at].rstrip(), text[split_at:].lstrip()
+
+
+def _normal_for_overlap(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"\$+", "", text)
+    text = re.sub(r"\\(?:left|right|displaystyle|quad|qquad)", "", text)
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^0-9a-z\u4e00-\u9fff\\{}_^=<>+-]", "", text)
+    return text
+
+
+def _boundary_overlap_score(left_tail: str, right_head: str) -> float:
+    """Cheap gate: call the seam LLM only when boundary repetition is plausible."""
+    left_parts = [p.strip() for p in re.split(r"\n\s*\n", left_tail) if p.strip()]
+    right_parts = [p.strip() for p in re.split(r"\n\s*\n", right_head) if p.strip()]
+    left_parts = left_parts[-10:]
+    right_parts = right_parts[:10]
+    best = 0.0
+    for left in left_parts:
+        a = _normal_for_overlap(left)
+        if len(a) < 12:
+            continue
+        for right in right_parts:
+            b = _normal_for_overlap(right)
+            if len(b) < 12:
+                continue
+            shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+            if len(shorter) >= 16 and shorter in longer:
+                best = max(best, len(shorter) / len(longer))
+            best = max(best, SequenceMatcher(None, a, b, autojunk=False).ratio())
+    return best
+
+
 class BlackboardEditor:
-    """Two-pass chunked editor with anti-overcompression quality gates."""
+    """First-pass chunk editor plus narrow, non-global boundary reconciliation."""
 
     def __init__(self):
         self.providers = self._build_providers()
@@ -246,13 +308,23 @@ class BlackboardEditor:
         self.raw_chunk_chars = int(
             os.environ.get("BLACKBOARD_EDITOR_CHUNK_CHARS", _DEFAULT_RAW_CHUNK_CHARS)
         )
-        self.second_pass_chars = int(
+        self.boundary_context_chars = int(
             os.environ.get(
-                "BLACKBOARD_EDITOR_SECOND_PASS_CHARS", _DEFAULT_SECOND_PASS_CHARS
+                "BLACKBOARD_EDITOR_BOUNDARY_CHARS",
+                _DEFAULT_BOUNDARY_CONTEXT_CHARS,
             )
         )
-        self.boundary_chars = int(
-            os.environ.get("BLACKBOARD_EDITOR_BOUNDARY_CHARS", _DEFAULT_BOUNDARY_CHARS)
+        self.seam_window_chars = int(
+            os.environ.get(
+                "BLACKBOARD_EDITOR_SEAM_CHARS",
+                _DEFAULT_SEAM_WINDOW_CHARS,
+            )
+        )
+        self.repair_chunk_chars = int(
+            os.environ.get(
+                "BLACKBOARD_EDITOR_REPAIR_CHARS",
+                _DEFAULT_REPAIR_CHUNK_CHARS,
+            )
         )
         self.timeout = int(
             os.environ.get("BLACKBOARD_EDITOR_TIMEOUT", _DEFAULT_TIMEOUT)
@@ -351,37 +423,20 @@ class BlackboardEditor:
         )
 
     @staticmethod
-    def _minimum_ratio(phase: str, previous_ratios: list[float]) -> float:
-        """Return a conservative retention floor for this phase.
+    def _minimum_pass1_ratio(previous_ratios: list[float]) -> float:
+        floor = 0.08
+        if previous_ratios:
+            typical = statistics.median(previous_ratios[-5:])
+            floor = max(floor, min(0.16, typical * 0.45))
+        return floor
 
-        Pass 1 is allowed to shrink heavily because adjacent frames duplicate
-        full blackboards. Even there, sudden collapse relative to neighboring
-        chunks is suspicious. Pass 2 should only remove boundary duplicates and
-        therefore must retain most of its input.
-        """
-        if phase == "pass1":
-            floor = 0.08
-            if previous_ratios:
-                typical = statistics.median(previous_ratios[-5:])
-                floor = max(floor, min(0.16, typical * 0.45))
-            return floor
-        if phase == "pass2":
-            floor = 0.52
-            if previous_ratios:
-                typical = statistics.median(previous_ratios[-4:])
-                floor = max(floor, min(0.72, typical * 0.70))
-            return floor
-        return 0.80
-
-    def _edit_one_resilient(
+    def _edit_pass1_resilient(
         self,
         source: str,
         *,
         boundary: str,
-        system_prompt: str,
-        phase: str,
-        phase_label: str,
         previous_ratios: list[float],
+        label: str,
         depth: int = 0,
     ) -> tuple[str, list[str], list[float]]:
         prompt = (
@@ -390,9 +445,9 @@ class BlackboardEditor:
             "【当前待整理内容】\n"
             f"{source}"
         )
-        result = self._call(system_prompt, prompt)
+        result = self._call(CHUNK_SYSTEM_PROMPT, prompt)
         ratio = len(result.text) / max(1, len(source))
-        floor = self._minimum_ratio(phase, previous_ratios)
+        floor = self._minimum_pass1_ratio(previous_ratios)
         suspicious = (
             result.finish_reason.lower() == "length"
             or len(result.text) < 500
@@ -401,7 +456,7 @@ class BlackboardEditor:
 
         if not suspicious:
             print(
-                f"[BlackboardEditor] {phase_label} accepted: "
+                f"[BlackboardEditor] {label} accepted: "
                 f"{len(source)} -> {len(result.text)} chars "
                 f"(retention={ratio:.1%}, floor={floor:.1%})",
                 flush=True,
@@ -413,46 +468,37 @@ class BlackboardEditor:
             if result.finish_reason.lower() == "length"
             else f"suspicious compression {ratio:.1%} < {floor:.1%}"
         )
-        print(
-            f"[BlackboardEditor] {phase_label} rejected: {reason}",
-            flush=True,
-        )
+        print(f"[BlackboardEditor] {label} rejected: {reason}", flush=True)
 
-        raw_phase = phase == "pass1"
         can_split = (
             depth < _MAX_SPLIT_DEPTH
             and len(source) >= _MIN_RECURSIVE_CHUNK_CHARS * 2
         )
-        split = _split_in_two(source, raw_phase=raw_phase) if can_split else None
+        split = _split_in_two(source) if can_split else None
         if split is None:
             raise RuntimeError(
-                f"{phase_label} produced unsafe output and cannot be split further: "
+                f"{label} produced unsafe output and cannot be split further: "
                 f"{len(source)} -> {len(result.text)} chars ({ratio:.1%})"
             )
 
         left, right = split
         print(
-            f"[BlackboardEditor] {phase_label}: retrying as two smaller pieces "
+            f"[BlackboardEditor] {label}: retrying as two smaller pieces "
             f"({len(left)} + {len(right)} chars), depth={depth + 1}",
             flush=True,
         )
-        left_text, left_models, left_ratios = self._edit_one_resilient(
+        left_text, left_models, left_ratios = self._edit_pass1_resilient(
             left,
             boundary=boundary,
-            system_prompt=system_prompt,
-            phase=phase,
-            phase_label=phase_label + ".a",
             previous_ratios=previous_ratios,
+            label=label + ".a",
             depth=depth + 1,
         )
-        right_boundary = left_text[-self.boundary_chars:]
-        right_text, right_models, right_ratios = self._edit_one_resilient(
+        right_text, right_models, right_ratios = self._edit_pass1_resilient(
             right,
-            boundary=right_boundary,
-            system_prompt=system_prompt,
-            phase=phase,
-            phase_label=phase_label + ".b",
+            boundary=left_text[-self.boundary_context_chars:],
             previous_ratios=previous_ratios + left_ratios,
+            label=label + ".b",
             depth=depth + 1,
         )
         return (
@@ -461,35 +507,105 @@ class BlackboardEditor:
             left_ratios + right_ratios,
         )
 
-    def _run_pass(
-        self,
-        chunks: list[str],
-        *,
-        system_prompt: str,
-        phase: str,
-        label: str,
-    ) -> tuple[str, list[str]]:
+    def _run_pass1(self, chunks: list[str]) -> tuple[list[str], list[str]]:
         outputs: list[str] = []
         models: list[str] = []
         ratios: list[float] = []
         previous_tail = ""
-        print(f"[BlackboardEditor] {label}: {len(chunks)} chunk(s)", flush=True)
-
+        print(
+            f"[BlackboardEditor] pass 1 / raw snapshot de-duplication: "
+            f"{len(chunks)} chunk(s)",
+            flush=True,
+        )
         for index, chunk in enumerate(chunks, start=1):
-            text, used_models, chunk_ratios = self._edit_one_resilient(
+            text, used_models, chunk_ratios = self._edit_pass1_resilient(
                 chunk,
-                boundary=previous_tail[-self.boundary_chars:],
-                system_prompt=system_prompt,
-                phase=phase,
-                phase_label=f"{label} chunk {index}/{len(chunks)}",
+                boundary=previous_tail[-self.boundary_context_chars:],
                 previous_ratios=ratios,
+                label=f"pass 1 chunk {index}/{len(chunks)}",
             )
             outputs.append(text)
             models.extend(used_models)
             ratios.extend(chunk_ratios)
             previous_tail = text
+        return outputs, models
 
-        return "\n\n".join(outputs).strip(), models
+    def _merge_boundaries(self, chunks: list[str]) -> tuple[str, list[str]]:
+        """Reconcile only narrow adjacent seams; never rewrite full cleaned chunks."""
+        if not chunks:
+            return "", []
+        merged = chunks[0].strip()
+        models: list[str] = []
+        total = max(0, len(chunks) - 1)
+        print(
+            f"[BlackboardEditor] boundary-only merge: {total} seam(s); "
+            "no full second-pass rewrite",
+            flush=True,
+        )
+
+        for seam_index, right_chunk in enumerate(chunks[1:], start=1):
+            left_body, left_tail = _take_tail_window(
+                merged, self.seam_window_chars
+            )
+            right_head, right_body = _take_head_window(
+                right_chunk, self.seam_window_chars
+            )
+            score = _boundary_overlap_score(left_tail, right_head)
+
+            if score < 0.55:
+                print(
+                    f"[BlackboardEditor] seam {seam_index}/{total}: "
+                    f"no plausible overlap (score={score:.2f}); concatenating unchanged",
+                    flush=True,
+                )
+                merged = (merged.rstrip() + "\n\n" + right_chunk.lstrip()).strip()
+                continue
+
+            prompt = (
+                "【左段末尾】\n"
+                f"{left_tail}\n\n"
+                "【右段开头】\n"
+                f"{right_head}"
+            )
+            try:
+                result = self._call(
+                    BOUNDARY_SYSTEM_PROMPT,
+                    prompt,
+                    max_tokens=6000,
+                )
+                source_len = len(left_tail) + len(right_head)
+                ratio = len(result.text) / max(1, source_len)
+                safe = (
+                    result.finish_reason.lower() != "length"
+                    and len(result.text) >= 400
+                    and 0.45 <= ratio <= 1.30
+                )
+                if safe:
+                    pieces = [piece for piece in (left_body, result.text, right_body) if piece.strip()]
+                    merged = "\n\n".join(piece.strip() for piece in pieces)
+                    models.append(result.model_id)
+                    print(
+                        f"[BlackboardEditor] seam {seam_index}/{total} merged "
+                        f"(overlap={score:.2f}, retention={ratio:.1%})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[BlackboardEditor] seam {seam_index}/{total} merge rejected "
+                        f"(overlap={score:.2f}, retention={ratio:.1%}); "
+                        "keeping both original boundaries",
+                        flush=True,
+                    )
+                    merged = (merged.rstrip() + "\n\n" + right_chunk.lstrip()).strip()
+            except Exception as exc:
+                print(
+                    f"[BlackboardEditor] seam {seam_index}/{total} merge failed: "
+                    f"{type(exc).__name__}: {exc}; keeping original boundary",
+                    flush=True,
+                )
+                merged = (merged.rstrip() + "\n\n" + right_chunk.lstrip()).strip()
+
+        return merged.strip(), models
 
     def _repair_if_needed(self, text: str) -> tuple[str, list[str]]:
         issues = _format_issues(text)
@@ -501,22 +617,47 @@ class BlackboardEditor:
             + "; ".join(issues),
             flush=True,
         )
-        chunks = _split_paragraphs(text, self.second_pass_chars)
+        chunks = _split_paragraphs(text, self.repair_chunk_chars)
         repaired: list[str] = []
         models: list[str] = []
+
         for index, chunk in enumerate(chunks, start=1):
-            result = self._call(
-                REPAIR_SYSTEM_PROMPT,
-                "【待修复文本】\n" + chunk,
-            )
-            ratio = len(result.text) / max(1, len(chunk))
-            if result.finish_reason.lower() == "length" or ratio < 0.80:
-                raise RuntimeError(
-                    f"LaTeX repair chunk {index} changed content too aggressively: "
-                    f"{len(chunk)} -> {len(result.text)} chars ({ratio:.1%})"
+            chunk_issues = _format_issues(chunk)
+            if not chunk_issues:
+                repaired.append(chunk)
+                continue
+            try:
+                result = self._call(
+                    REPAIR_SYSTEM_PROMPT,
+                    "【待修复文本】\n" + chunk,
+                    max_tokens=10000,
                 )
-            repaired.append(result.text.strip())
-            models.append(result.model_id)
+                ratio = len(result.text) / max(1, len(chunk))
+                if (
+                    result.finish_reason.lower() != "length"
+                    and 0.78 <= ratio <= 1.30
+                ):
+                    repaired.append(result.text.strip())
+                    models.append(result.model_id)
+                    print(
+                        f"[BlackboardEditor] LaTeX repair chunk {index}/{len(chunks)} "
+                        f"accepted (retention={ratio:.1%})",
+                        flush=True,
+                    )
+                else:
+                    repaired.append(chunk)
+                    print(
+                        f"[BlackboardEditor] LaTeX repair chunk {index}/{len(chunks)} "
+                        f"rejected (retention={ratio:.1%}); keeping original content",
+                        flush=True,
+                    )
+            except Exception as exc:
+                repaired.append(chunk)
+                print(
+                    f"[BlackboardEditor] LaTeX repair chunk {index}/{len(chunks)} "
+                    f"failed: {type(exc).__name__}: {exc}; keeping original content",
+                    flush=True,
+                )
 
         repaired_text = "\n\n".join(repaired).strip()
         remaining = _format_issues(repaired_text)
@@ -529,7 +670,7 @@ class BlackboardEditor:
         return repaired_text, models
 
     def edit(self, raw_blackboard: str) -> tuple[str, str]:
-        """Return ``(edited_markdown, model_label)`` without one-shot 220k calls."""
+        """Return ``(edited_markdown, model_label)`` without a global rewrite."""
         raw = (raw_blackboard or "").strip()
         if not raw:
             return "", ""
@@ -540,32 +681,28 @@ class BlackboardEditor:
             f"{len(raw_chunks)} first-pass chunk(s); no audio transcript added",
             flush=True,
         )
-        pass1, models1 = self._run_pass(
-            raw_chunks,
-            system_prompt=CHUNK_SYSTEM_PROMPT,
-            phase="pass1",
-            label="pass 1 / raw snapshot de-duplication",
+
+        pass1_chunks, models1 = self._run_pass1(raw_chunks)
+        pass1_total = sum(len(chunk) for chunk in pass1_chunks)
+        print(
+            f"[BlackboardEditor] pass 1 complete: {len(raw)} -> "
+            f"{pass1_total} chars across {len(pass1_chunks)} cleaned chunk(s)",
+            flush=True,
         )
 
-        second_chunks = _split_paragraphs(pass1, self.second_pass_chars)
-        pass2, models2 = self._run_pass(
-            second_chunks,
-            system_prompt=SECOND_PASS_SYSTEM_PROMPT,
-            phase="pass2",
-            label="pass 2 / boundary merge + LaTeX normalization",
-        )
-
-        final_text, repair_models = self._repair_if_needed(pass2)
+        merged, boundary_models = self._merge_boundaries(pass1_chunks)
+        final_text, repair_models = self._repair_if_needed(merged)
         if not final_text:
             raise RuntimeError("blackboard editor produced empty final output")
         if not final_text.startswith(EDITOR_MARKER):
             final_text = f"{EDITOR_MARKER}\n\n{final_text}"
 
-        all_models = models1 + models2 + repair_models
+        all_models = models1 + boundary_models + repair_models
         model_label = "+".join(dict.fromkeys(all_models)) or "unknown"
         print(
             f"[BlackboardEditor] complete: {len(raw)} raw chars -> "
-            f"{len(final_text)} edited chars; models={model_label}",
+            f"{len(final_text)} edited chars; boundary-only merge; "
+            f"models={model_label}",
             flush=True,
         )
         return final_text, model_label
