@@ -1,13 +1,20 @@
 """LectureRunner extension for proof-preserving blackboard notes.
 
-Functional Analysis keeps its proof-preserving blackboard section.  Its appended
-normal AI summary now uses the same timestamped, AI-proofread ASR evidence and
-validated video provenance as every other course.  The proofreader additionally
-receives timestamp-aligned raw blackboard frames as terminology evidence.
+Functional Analysis keeps its proof-preserving blackboard section. Its appended
+normal AI summary uses the same timestamped, AI-proofread ASR evidence and
+validated video provenance as every other course.
+
+The raw 200k+ vision transcription is the preferred evidence source and is now
+mirrored into durable meta storage. For the one lecture whose raw cache was
+already damaged by an earlier schema-order migration, the previous high-quality
+final board notes are also a valid recovery source: they were produced from that
+raw cache before it was lost. In that narrow case we reuse the existing board
+section verbatim instead of needlessly re-running 240 vision frames.
 """
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Optional
 
@@ -19,7 +26,12 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v8/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v9/"
+_BOARD_NOTES_MARKER = "### 黑板板书整理稿"
+_AI_SUMMARY_HEADING_RE = re.compile(
+    r"\n\s*---\s*\n\s*###\s+AI\s*课程总结(?:（带视频定位）)?\s*\n",
+    re.IGNORECASE,
+)
 
 _AI_SUMMARY_SEPARATOR = """\
 ---
@@ -42,21 +54,43 @@ class BlackboardLectureRunner(BaseLectureRunner):
         self._active_course_title = course_title or ""
         return super().run(course_id, course_title, lecture, next_info=next_info)
 
+    def _prior_board_notes(self, sub_id: str) -> str:
+        """Recover a previously-produced final board section, if present.
+
+        This is deliberately not treated as raw vision evidence. It is only used
+        as the already-finished student-facing board section when the raw cache
+        is unavailable. If a newer combined summary already contains the normal
+        AI-summary suffix, only the board part before that separator is reused.
+        """
+        existing = self._db.get_lecture(sub_id)
+        if not existing:
+            return ""
+        summary = str(existing.get("summary") or "").strip()
+        if not summary.startswith(_BOARD_NOTES_MARKER):
+            return ""
+        match = _AI_SUMMARY_HEADING_RE.search(summary)
+        if match:
+            summary = summary[:match.start()].strip()
+        # Require a substantial document so an accidental marker in a short
+        # error message can never bypass vision extraction.
+        return summary if len(summary) >= 5000 else ""
+
     def _has_summary(self, existing: dict | None) -> bool:
         if not course_requires_blackboard(self._active_course_title):
             return super()._has_summary(existing)
         if not existing or not existing.get("summary"):
             return False
 
-        sub_id = str(existing.get("sub_id") or "")
-        if not sub_id or get_blackboard(self._db, sub_id) is None:
-            return False
+        model = str(existing.get("summary_model") or "")
+        if model.startswith(_NOTES_MODEL_PREFIX):
+            return True
 
-        return str(existing.get("summary_model") or "").startswith(
-            _NOTES_MODEL_PREFIX
-        )
+        # Old board-only summaries are intentionally reprocessed once so the
+        # new traceable AI-summary section and transcript attachment can be
+        # appended. They remain usable as board recovery material.
+        return False
 
-    def _ensure_blackboard(self, sub_id: str, course_title: str) -> tuple[str, str]:
+    def _ensure_raw_blackboard(self, sub_id: str, course_title: str) -> tuple[str, str]:
         cached = get_blackboard(self._db, sub_id)
         if cached:
             markdown, model = cached
@@ -66,7 +100,7 @@ class BlackboardLectureRunner(BaseLectureRunner):
             return markdown, model
 
         self._reporter.info(
-            "    [Blackboard] cache missing/stale; regenerating proof-preserving board timeline."
+            "    [Blackboard] raw cache absent; no reusable raw board transcription found."
         )
         pipeline = BlackboardPipeline(self._client, self._reporter)
         markdown, model = pipeline.run(
@@ -123,50 +157,56 @@ class BlackboardLectureRunner(BaseLectureRunner):
             )
 
         try:
-            blackboard_latex, blackboard_model = self._ensure_blackboard(
-                sub_id, course_title
-            )
-            if not blackboard_latex.strip():
+            # Prefer raw cache. If it is gone but a prior, substantial final
+            # board section exists, reuse that finished section verbatim. This
+            # avoids re-running vision solely because a historical DB migration
+            # destroyed the cache column.
+            raw_cached = get_blackboard(self._db, sub_id)
+            prior_board_notes = self._prior_board_notes(sub_id)
+
+            if raw_cached:
+                blackboard_latex, blackboard_model = raw_cached
                 self._reporter.info(
-                    "    [FAIL] Blackboard transcription is empty; refusing to invent notes."
+                    f"    [Blackboard] current cache exists ({len(blackboard_latex)} chars), reusing."
                 )
-                self._db.update_error(
-                    sub_id,
-                    "blackboard",
-                    "blackboard transcription empty; no notes generated",
-                )
-                return None
-
-            editor = BlackboardEditor()
-            board_notes, editor_model = editor.edit(blackboard_latex)
-            if not board_notes.strip():
+                editor = BlackboardEditor()
+                board_notes, editor_model = editor.edit(blackboard_latex)
+                if not board_notes.strip():
+                    raise RuntimeError("blackboard editor produced empty output")
                 self._reporter.info(
-                    "    [FAIL] Blackboard editor produced empty output."
+                    f"    [OK] Blackboard edited transcript: "
+                    f"{len(blackboard_latex)} raw chars -> {len(board_notes)} final chars"
                 )
-                self._db.update_error(
-                    sub_id,
-                    "blackboard-editor",
-                    "LLM transcription editor produced empty output",
+                proofread_board_evidence = blackboard_latex
+            elif prior_board_notes:
+                board_notes = prior_board_notes
+                blackboard_latex = ""
+                blackboard_model = "recovered-prior-final-board-notes"
+                editor_model = "reused-prior-final-board-notes"
+                proofread_board_evidence = ""
+                self._reporter.info(
+                    f"    [Blackboard] raw cache unavailable, but prior final board notes "
+                    f"exist ({len(board_notes)} chars); reusing them verbatim. "
+                    "Vision regeneration is intentionally skipped."
                 )
-                return None
+            else:
+                blackboard_latex, blackboard_model = self._ensure_raw_blackboard(
+                    sub_id, course_title
+                )
+                if not blackboard_latex.strip():
+                    raise RuntimeError("blackboard transcription empty")
+                editor = BlackboardEditor()
+                board_notes, editor_model = editor.edit(blackboard_latex)
+                if not board_notes.strip():
+                    raise RuntimeError("blackboard editor produced empty output")
+                proofread_board_evidence = blackboard_latex
 
-            self._reporter.info(
-                f"    [OK] Blackboard edited transcript: "
-                f"{len(blackboard_latex)} raw chars -> {len(board_notes)} final chars; "
-                "LLM semantic de-duplication + global faithfulness audit + "
-                "strict local render/transcription preflight"
-            )
-
-            # The attachment and appended summary use the speech stream, but the
-            # transcript proofreader may consult timestamp-aligned raw board
-            # frames to correct mathematical terms. The board itself is never
-            # copied into the speech transcript unless the lecturer said it.
             kept_pages = self._db.get_done_ppt_pages(sub_id)
             _, corrected_segments, proofread_model = self._get_proofread_transcript(
                 sub_id,
                 transcript_segments,
                 kept_pages,
-                raw_blackboard=blackboard_latex,
+                raw_blackboard=proofread_board_evidence,
             )
             ai_summary, ai_summary_model = self._generate_traceable_ai_summary(
                 sub_id,
@@ -184,7 +224,7 @@ class BlackboardLectureRunner(BaseLectureRunner):
             )
             model_used = (
                 f"{_NOTES_MODEL_PREFIX}{editor_model}"
-                f"|vision={blackboard_model or 'vision'}"
+                f"|vision={blackboard_model or 'none'}"
                 f"|proofread={proofread_model}"
                 f"|summary={ai_summary_model}"
             )
