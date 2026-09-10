@@ -1,22 +1,21 @@
 """LLM-assisted lossless editing of raw blackboard transcriptions.
 
 The vision stage already produces a high-quality chronological transcription of
-selected full-board frames.  Because a physical blackboard moves vertically and
+selected full-board frames. Because a physical blackboard moves vertically and
 is written incrementally, that raw timeline contains many overlapping snapshots
-of the same material.  This module edits those snapshots into one readable
-Markdown/LaTeX transcript.
+of the same material.
 
-This is deliberately NOT a lecture summarizer.  It does not receive the audio
-transcript and it is instructed to preserve every unique definition, theorem,
-example, proof step and formula.  Its only semantic operations are de-duplication
-of repeated board states, choosing the most complete repeated transcription, and
-normalizing LaTeX for the email renderer.
+This module is NOT a lecture summarizer. It performs conservative, chunked text
+editing: remove repeated board snapshots, keep every unique mathematical step,
+and normalize Markdown/LaTeX for email rendering. Suspiciously short model
+outputs are rejected and the offending source chunk is split and retried.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import statistics
 import time
 from dataclasses import dataclass
 
@@ -27,19 +26,21 @@ from src.runtime import config
 
 EDITOR_MARKER = "### 黑板板书整理稿"
 
-# Keep individual calls comfortably below hosted context limits.  The current
-# 229k-ish raw lecture is normally split into about 9-11 pieces.
-_DEFAULT_RAW_CHUNK_CHARS = 24000
-_DEFAULT_SECOND_PASS_CHARS = 28000
-_DEFAULT_BOUNDARY_CHARS = 4500
+# Smaller than the first implementation on purpose. The 229k-character lecture
+# will normally produce about 14-16 first-pass chunks instead of 10. This costs
+# a few more calls but materially reduces the risk that the editor mistakes a
+# large span of unique proof material for repeated frames.
+_DEFAULT_RAW_CHUNK_CHARS = 16000
+_DEFAULT_SECOND_PASS_CHARS = 20000
+_DEFAULT_BOUNDARY_CHARS = 4000
 _DEFAULT_TIMEOUT = 600
+_MIN_RECURSIVE_CHUNK_CHARS = 6500
+_MAX_SPLIT_DEPTH = 2
 
-# ModelScope already works for the blackboard vision stage, so prefer Qwen text
-# models on the same OpenAI-compatible endpoint.  The known-working VL model is
-# retained as the final ModelScope fallback because it also accepts text-only
-# chat requests.
+# Qwen3-235B-A22B-Instruct-2507 was removed because ModelScope's hosted
+# inference endpoint currently returns "has no provider supported" for it.
+# Qwen3-30B-A3B-Instruct-2507 is confirmed working in this workflow.
 _MODELSCOPE_EDITOR_MODELS = [
-    "Qwen/Qwen3-235B-A22B-Instruct-2507",
     "Qwen/Qwen3-30B-A3B-Instruct-2507",
     "Qwen/Qwen3-VL-8B-Instruct",
 ]
@@ -64,12 +65,13 @@ EDITOR_SYSTEM_PROMPT = r"""
 
 【必须遵守：内容】
 1. 这不是摘要。必须保留所有唯一的教学内容：定义、命题、定理、例子、证明、推导步骤、公式、条件、CHECK、Why、反例、作业或课堂提示。尤其不得为了缩短输出而省略证明步骤。
-2. 删除由黑板上下移动、摄像机重复拍摄、逐步补写造成的重复。同一句/同一公式先出现不完整版本、后出现完整版本时，只保留最完整版本。
-3. 同一内容在不同帧中只有轻微 OCR/LaTeX 差异时，根据前后多行上下文判断是否为同一板书；若确认是同一内容，选择最完整、最一致的版本。不得把数学含义真正不同的两步强行合并。
-4. 不得利用你自己的数学知识补证明、补定义、补条件或改写成教材答案。输入没有出现的数学内容不能新增。
-5. 若两种转写确实冲突且无法从重复上下文判断，保留较完整版本并在其后写“[转写存疑]”，不要猜。
-6. 删除明显非教学噪声，例如随机的“######2016”、摄像头/录播界面标签、无意义姓名地点 OCR、纯粹的“右侧黑板”“下方黑板”等位置描述。若位置描述后面跟着真实板书，只删位置描述，不删板书。
-7. 严格保持课堂出现顺序，不按你的知识体系重新排序。
+2. 只删除“能够从上下文确认是同一块板书重复出现”的内容。若不能确认是重复，宁可保留，也不要删除。
+3. 同一句/同一公式先出现不完整版本、后出现完整版本时，只保留最完整版本。
+4. 同一内容在不同帧中只有轻微 OCR/LaTeX 差异时，根据前后多行上下文判断是否为同一板书；若确认相同，选择最完整、最一致的版本。不得把数学含义真正不同的两步强行合并。
+5. 不得利用你自己的数学知识补证明、补定义、补条件或改写成教材答案。输入没有出现的数学内容不能新增。
+6. 若两种转写确实冲突且无法判断，保留两个版本或保留较完整版本并标注“[转写存疑]”，不要猜。
+7. 删除明显非教学噪声，例如随机的“######2016”、摄像头/录播界面标签、无意义姓名地点 OCR、纯粹的“右侧黑板”“下方黑板”等位置描述。若位置描述后面跟着真实板书，只删位置描述，不删板书。
+8. 严格保持课堂出现顺序，不按你的知识体系重新排序。
 
 【必须遵守：Markdown / LaTeX 邮件兼容性】
 1. 输出必须是 Markdown；直接输出正文，不要解释你的工作。
@@ -92,20 +94,22 @@ EDITOR_SYSTEM_PROMPT = r"""
 
 CHUNK_SYSTEM_PROMPT = EDITOR_SYSTEM_PROMPT + r"""
 
-当前输入只是整节课的一段。你还会看到“上一段整理稿的末尾”。那部分只用于识别跨分段重复：
+当前输入只是整节课的一小段。你还会看到“上一段整理稿的末尾”。那部分只用于识别跨分段重复：
 - 不要重新输出上一段末尾已经完整出现的内容；
-- 如果当前原始板书是在继续补写上一段末尾的一行/一段，则只输出补全后的完整版本，并保留当前新出现的后续步骤；
-- 不得因为只看到局部上下文而概括或省略当前段的唯一内容。
+- 如果当前原始板书是在继续补写上一段末尾的一行/一段，则输出补全后的完整版本以及当前新出现的后续步骤；
+- 当前段可能包含大量唯一证明内容。除非能确认是重复快照，否则不得删除；
+- 不得因为输出看起来较长而主动压缩。
 """
 
 
 SECOND_PASS_SYSTEM_PROMPT = EDITOR_SYSTEM_PROMPT + r"""
 
-当前输入已经是第一轮整理稿，不再包含逐帧原始快照。请做第二轮校订：
-- 只删除第一轮分段边界残留的重复；
-- 统一并修复 LaTeX 邮件兼容格式；
+当前输入已经是第一轮去重稿。第二轮只能处理分段边界残留的重复和 LaTeX 格式问题。
+因为第一轮已经去掉了大量逐帧重复，第二轮原则上应保留绝大多数文本：
+- 只删除能够明确确认的跨块重复；
+- 不再做大幅压缩；
 - 保留所有唯一的定义、例子、定理、证明和推导步骤；
-- 不得把完整转写进一步概括成摘要。
+- 不得把完整转写概括成摘要。
 """
 
 
@@ -120,7 +124,7 @@ REPAIR_SYSTEM_PROMPT = r"""
 - 不使用 aligned/array/cases 等多行环境；
 - 过长 display 公式拆成多个独立 `$$...$$`；
 - 不使用代码块。
-直接输出修复后的全文。
+直接输出修复后的全文，文本长度原则上应与输入接近。
 """.strip()
 
 
@@ -148,32 +152,6 @@ def _strip_code_fence(text: str) -> str:
     return text
 
 
-def _split_at_frame_headings(text: str, target_chars: int) -> list[str]:
-    """Split raw board text without cutting an individual frame snapshot."""
-    starts = [match.start() for match in _FRAME_HEADING_RE.finditer(text)]
-    if not starts:
-        return _split_paragraphs(text, target_chars)
-
-    prefix = text[: starts[0]].strip()
-    pieces: list[str] = []
-    if prefix:
-        pieces.append(prefix)
-    for index, start in enumerate(starts):
-        end = starts[index + 1] if index + 1 < len(starts) else len(text)
-        piece = text[start:end].strip()
-        if piece:
-            pieces.append(piece)
-    return _pack_pieces(pieces, target_chars)
-
-
-def _split_paragraphs(text: str, target_chars: int) -> list[str]:
-    """Split cleaned Markdown at paragraph boundaries for the second pass."""
-    pieces = [piece.strip() for piece in re.split(r"\n\s*\n", text) if piece.strip()]
-    if not pieces:
-        return [text.strip()] if text.strip() else []
-    return _pack_pieces(pieces, target_chars)
-
-
 def _pack_pieces(pieces: list[str], target_chars: int) -> list[str]:
     chunks: list[str] = []
     current: list[str] = []
@@ -191,37 +169,72 @@ def _pack_pieces(pieces: list[str], target_chars: int) -> list[str]:
     return chunks
 
 
+def _split_at_frame_headings(text: str, target_chars: int) -> list[str]:
+    """Split raw board text without cutting one frame snapshot in half."""
+    starts = [match.start() for match in _FRAME_HEADING_RE.finditer(text)]
+    if not starts:
+        return _split_paragraphs(text, target_chars)
+
+    pieces: list[str] = []
+    prefix = text[: starts[0]].strip()
+    if prefix:
+        pieces.append(prefix)
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(text)
+        piece = text[start:end].strip()
+        if piece:
+            pieces.append(piece)
+    return _pack_pieces(pieces, target_chars)
+
+
+def _split_paragraphs(text: str, target_chars: int) -> list[str]:
+    pieces = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    return _pack_pieces(pieces, target_chars) if pieces else ([text] if text else [])
+
+
+def _split_in_two(text: str, raw_phase: bool) -> tuple[str, str] | None:
+    """Split near the middle at a safe frame/paragraph boundary."""
+    if raw_phase:
+        starts = [match.start() for match in _FRAME_HEADING_RE.finditer(text)]
+        candidates = [pos for pos in starts if 0 < pos < len(text)]
+    else:
+        candidates = [m.start() for m in re.finditer(r"\n\s*\n", text)]
+
+    if not candidates:
+        return None
+    midpoint = len(text) / 2
+    split_at = min(candidates, key=lambda pos: abs(pos - midpoint))
+    left = text[:split_at].strip()
+    right = text[split_at:].strip()
+    if min(len(left), len(right)) < 1000:
+        return None
+    return left, right
+
+
 def _outside_math(text: str) -> str:
-    masked = _DISPLAY_RE.sub(" ", text)
-    masked = _INLINE_RE.sub(" ", masked)
-    return masked
+    return _INLINE_RE.sub(" ", _DISPLAY_RE.sub(" ", text))
 
 
 def _format_issues(text: str) -> list[str]:
-    """Cheap deterministic checks for the failure modes seen in email output."""
     issues: list[str] = []
     if not text.strip():
         return ["empty output"]
-
     for env in ("aligned", "array", "cases"):
         if rf"\begin{{{env}}}" in text:
             issues.append(f"contains {env} environment")
-
     oversized = [block for block in _DISPLAY_RE.findall(text) if len(block) > 700]
     if oversized:
         issues.append(f"{len(oversized)} oversized display formula(s)")
-
     bare = _BARE_LATEX_RE.findall(_outside_math(text))
     if bare:
         issues.append(f"{len(bare)} bare LaTeX command(s)")
-
     if text.count("$") % 2:
         issues.append("unbalanced dollar delimiter")
     return issues
 
 
 class BlackboardEditor:
-    """Two-pass chunked editor for a complete raw blackboard timeline."""
+    """Two-pass chunked editor with anti-overcompression quality gates."""
 
     def __init__(self):
         self.providers = self._build_providers()
@@ -230,21 +243,16 @@ class BlackboardEditor:
                 "No model provider available for blackboard editing. "
                 "DASHSCOPE_API_KEY is recommended."
             )
-
         self.raw_chunk_chars = int(
             os.environ.get("BLACKBOARD_EDITOR_CHUNK_CHARS", _DEFAULT_RAW_CHUNK_CHARS)
         )
         self.second_pass_chars = int(
             os.environ.get(
-                "BLACKBOARD_EDITOR_SECOND_PASS_CHARS",
-                _DEFAULT_SECOND_PASS_CHARS,
+                "BLACKBOARD_EDITOR_SECOND_PASS_CHARS", _DEFAULT_SECOND_PASS_CHARS
             )
         )
         self.boundary_chars = int(
-            os.environ.get(
-                "BLACKBOARD_EDITOR_BOUNDARY_CHARS",
-                _DEFAULT_BOUNDARY_CHARS,
-            )
+            os.environ.get("BLACKBOARD_EDITOR_BOUNDARY_CHARS", _DEFAULT_BOUNDARY_CHARS)
         )
         self.timeout = int(
             os.environ.get("BLACKBOARD_EDITOR_TIMEOUT", _DEFAULT_TIMEOUT)
@@ -254,9 +262,6 @@ class BlackboardEditor:
     def _build_providers() -> list[_Provider]:
         providers: list[_Provider] = []
         resolved = config.resolve_model_providers()
-
-        # Prefer ModelScope/Qwen for this task.  It is already the proven route
-        # for blackboard vision and avoids the previously failing giant prompt.
         modelscope = next((p for p in resolved if p["name"] == "modelscope"), None)
         if modelscope:
             override = os.environ.get("BLACKBOARD_EDITOR_MODELS", "").strip()
@@ -276,8 +281,6 @@ class BlackboardEditor:
                 )
             )
 
-        # Other configured providers remain fallbacks.  Do not duplicate the
-        # ModelScope models above.
         for provider in resolved:
             if provider["name"] == "modelscope":
                 continue
@@ -318,12 +321,9 @@ class BlackboardEditor:
                     )
                     choice = response.choices[0]
                     text = _strip_code_fence(choice.message.content or "")
-                    finish_reason = str(
-                        getattr(choice, "finish_reason", "") or ""
-                    )
+                    finish_reason = str(getattr(choice, "finish_reason", "") or "")
                     if not text:
                         raise RuntimeError("empty response")
-
                     elapsed = time.time() - t0
                     usage = getattr(response, "usage", None)
                     usage_text = ""
@@ -333,9 +333,9 @@ class BlackboardEditor:
                             f" completion={getattr(usage, 'completion_tokens', '?')}"
                         )
                     print(
-                        f"[BlackboardEditor] {model_id}: "
-                        f"{len(user_prompt)} chars -> {len(text)} chars "
-                        f"in {elapsed:.0f}s, finish={finish_reason}{usage_text}",
+                        f"[BlackboardEditor] {model_id}: {len(user_prompt)} chars -> "
+                        f"{len(text)} chars in {elapsed:.0f}s, "
+                        f"finish={finish_reason}{usage_text}",
                         flush=True,
                     )
                     return _Result(text, model_id, finish_reason)
@@ -345,67 +345,151 @@ class BlackboardEditor:
                         f"{type(exc).__name__}: {exc}",
                         flush=True,
                     )
-                    errors.append(
-                        f"{model_id}: {type(exc).__name__}: {exc}"
-                    )
-
+                    errors.append(f"{model_id}: {type(exc).__name__}: {exc}")
         raise RuntimeError(
             "All blackboard editor models failed:\n" + "\n".join(errors)
         )
 
-    def _edit_chunks(
+    @staticmethod
+    def _minimum_ratio(phase: str, previous_ratios: list[float]) -> float:
+        """Return a conservative retention floor for this phase.
+
+        Pass 1 is allowed to shrink heavily because adjacent frames duplicate
+        full blackboards. Even there, sudden collapse relative to neighboring
+        chunks is suspicious. Pass 2 should only remove boundary duplicates and
+        therefore must retain most of its input.
+        """
+        if phase == "pass1":
+            floor = 0.08
+            if previous_ratios:
+                typical = statistics.median(previous_ratios[-5:])
+                floor = max(floor, min(0.16, typical * 0.45))
+            return floor
+        if phase == "pass2":
+            floor = 0.52
+            if previous_ratios:
+                typical = statistics.median(previous_ratios[-4:])
+                floor = max(floor, min(0.72, typical * 0.70))
+            return floor
+        return 0.80
+
+    def _edit_one_resilient(
+        self,
+        source: str,
+        *,
+        boundary: str,
+        system_prompt: str,
+        phase: str,
+        phase_label: str,
+        previous_ratios: list[float],
+        depth: int = 0,
+    ) -> tuple[str, list[str], list[float]]:
+        prompt = (
+            "【上一段整理稿末尾——仅用于跨段去重，不要重复输出】\n"
+            f"{boundary or '（无）'}\n\n"
+            "【当前待整理内容】\n"
+            f"{source}"
+        )
+        result = self._call(system_prompt, prompt)
+        ratio = len(result.text) / max(1, len(source))
+        floor = self._minimum_ratio(phase, previous_ratios)
+        suspicious = (
+            result.finish_reason.lower() == "length"
+            or len(result.text) < 500
+            or ratio < floor
+        )
+
+        if not suspicious:
+            print(
+                f"[BlackboardEditor] {phase_label} accepted: "
+                f"{len(source)} -> {len(result.text)} chars "
+                f"(retention={ratio:.1%}, floor={floor:.1%})",
+                flush=True,
+            )
+            return result.text.strip(), [result.model_id], [ratio]
+
+        reason = (
+            "max_tokens truncation"
+            if result.finish_reason.lower() == "length"
+            else f"suspicious compression {ratio:.1%} < {floor:.1%}"
+        )
+        print(
+            f"[BlackboardEditor] {phase_label} rejected: {reason}",
+            flush=True,
+        )
+
+        raw_phase = phase == "pass1"
+        can_split = (
+            depth < _MAX_SPLIT_DEPTH
+            and len(source) >= _MIN_RECURSIVE_CHUNK_CHARS * 2
+        )
+        split = _split_in_two(source, raw_phase=raw_phase) if can_split else None
+        if split is None:
+            raise RuntimeError(
+                f"{phase_label} produced unsafe output and cannot be split further: "
+                f"{len(source)} -> {len(result.text)} chars ({ratio:.1%})"
+            )
+
+        left, right = split
+        print(
+            f"[BlackboardEditor] {phase_label}: retrying as two smaller pieces "
+            f"({len(left)} + {len(right)} chars), depth={depth + 1}",
+            flush=True,
+        )
+        left_text, left_models, left_ratios = self._edit_one_resilient(
+            left,
+            boundary=boundary,
+            system_prompt=system_prompt,
+            phase=phase,
+            phase_label=phase_label + ".a",
+            previous_ratios=previous_ratios,
+            depth=depth + 1,
+        )
+        right_boundary = left_text[-self.boundary_chars:]
+        right_text, right_models, right_ratios = self._edit_one_resilient(
+            right,
+            boundary=right_boundary,
+            system_prompt=system_prompt,
+            phase=phase,
+            phase_label=phase_label + ".b",
+            previous_ratios=previous_ratios + left_ratios,
+            depth=depth + 1,
+        )
+        return (
+            (left_text + "\n\n" + right_text).strip(),
+            left_models + right_models,
+            left_ratios + right_ratios,
+        )
+
+    def _run_pass(
         self,
         chunks: list[str],
         *,
         system_prompt: str,
-        phase_name: str,
+        phase: str,
+        label: str,
     ) -> tuple[str, list[str]]:
-        cleaned: list[str] = []
-        models_used: list[str] = []
+        outputs: list[str] = []
+        models: list[str] = []
+        ratios: list[float] = []
         previous_tail = ""
+        print(f"[BlackboardEditor] {label}: {len(chunks)} chunk(s)", flush=True)
 
-        print(
-            f"[BlackboardEditor] {phase_name}: {len(chunks)} chunk(s)",
-            flush=True,
-        )
         for index, chunk in enumerate(chunks, start=1):
-            boundary = (
-                previous_tail[-self.boundary_chars:]
-                if previous_tail
-                else "（无）"
+            text, used_models, chunk_ratios = self._edit_one_resilient(
+                chunk,
+                boundary=previous_tail[-self.boundary_chars:],
+                system_prompt=system_prompt,
+                phase=phase,
+                phase_label=f"{label} chunk {index}/{len(chunks)}",
+                previous_ratios=ratios,
             )
-            prompt = (
-                f"这是本轮第 {index}/{len(chunks)} 段。\n\n"
-                "【上一段整理稿末尾——仅用于跨段去重，不要重复输出】\n"
-                f"{boundary}\n\n"
-                "【当前待整理内容】\n"
-                f"{chunk}"
-            )
-            result = self._call(system_prompt, prompt)
-            if result.finish_reason.lower() == "length":
-                raise RuntimeError(
-                    f"{phase_name} chunk {index} was truncated by max_tokens"
-                )
+            outputs.append(text)
+            models.extend(used_models)
+            ratios.extend(chunk_ratios)
+            previous_tail = text
 
-            # A chunk can legitimately shrink a lot because raw snapshots are
-            # highly repetitive, but a near-empty response is unsafe.
-            minimum = max(500, int(len(chunk) * 0.03))
-            if len(result.text) < minimum:
-                raise RuntimeError(
-                    f"{phase_name} chunk {index} output suspiciously short: "
-                    f"{len(result.text)} chars for {len(chunk)} input chars"
-                )
-
-            cleaned.append(result.text.strip())
-            previous_tail = result.text
-            models_used.append(result.model_id)
-            print(
-                f"[BlackboardEditor] {phase_name} chunk {index}/{len(chunks)} "
-                f"accepted ({len(chunk)} -> {len(result.text)} chars)",
-                flush=True,
-            )
-
-        return "\n\n".join(cleaned).strip(), models_used
+        return "\n\n".join(outputs).strip(), models
 
     def _repair_if_needed(self, text: str) -> tuple[str, list[str]]:
         issues = _format_issues(text)
@@ -417,18 +501,19 @@ class BlackboardEditor:
             + "; ".join(issues),
             flush=True,
         )
-
-        # Repair in chunks too; never send the entire long lecture in one
-        # request.  No cross-boundary semantic editing is needed at this stage.
         chunks = _split_paragraphs(text, self.second_pass_chars)
         repaired: list[str] = []
         models: list[str] = []
         for index, chunk in enumerate(chunks, start=1):
-            prompt = "【待修复文本】\n" + chunk
-            result = self._call(REPAIR_SYSTEM_PROMPT, prompt)
-            if result.finish_reason.lower() == "length":
+            result = self._call(
+                REPAIR_SYSTEM_PROMPT,
+                "【待修复文本】\n" + chunk,
+            )
+            ratio = len(result.text) / max(1, len(chunk))
+            if result.finish_reason.lower() == "length" or ratio < 0.80:
                 raise RuntimeError(
-                    f"LaTeX repair chunk {index} was truncated by max_tokens"
+                    f"LaTeX repair chunk {index} changed content too aggressively: "
+                    f"{len(chunk)} -> {len(result.text)} chars ({ratio:.1%})"
                 )
             repaired.append(result.text.strip())
             models.append(result.model_id)
@@ -444,13 +529,7 @@ class BlackboardEditor:
         return repaired_text, models
 
     def edit(self, raw_blackboard: str) -> tuple[str, str]:
-        """Return ``(edited_markdown, model_label)``.
-
-        The 220k+ raw timeline is never sent as one prompt.  Pass 1 cleans
-        chronological frame chunks; pass 2 removes cross-chunk repetition and
-        normalizes LaTeX once more.  A narrow repair pass runs only if cheap
-        deterministic checks still detect the failure modes seen in email.
-        """
+        """Return ``(edited_markdown, model_label)`` without one-shot 220k calls."""
         raw = (raw_blackboard or "").strip()
         if not raw:
             return "", ""
@@ -461,23 +540,24 @@ class BlackboardEditor:
             f"{len(raw_chunks)} first-pass chunk(s); no audio transcript added",
             flush=True,
         )
-        pass1, models1 = self._edit_chunks(
+        pass1, models1 = self._run_pass(
             raw_chunks,
             system_prompt=CHUNK_SYSTEM_PROMPT,
-            phase_name="pass 1 / raw snapshot de-duplication",
+            phase="pass1",
+            label="pass 1 / raw snapshot de-duplication",
         )
 
         second_chunks = _split_paragraphs(pass1, self.second_pass_chars)
-        pass2, models2 = self._edit_chunks(
+        pass2, models2 = self._run_pass(
             second_chunks,
             system_prompt=SECOND_PASS_SYSTEM_PROMPT,
-            phase_name="pass 2 / boundary merge + LaTeX normalization",
+            phase="pass2",
+            label="pass 2 / boundary merge + LaTeX normalization",
         )
 
         final_text, repair_models = self._repair_if_needed(pass2)
         if not final_text:
             raise RuntimeError("blackboard editor produced empty final output")
-
         if not final_text.startswith(EDITOR_MARKER):
             final_text = f"{EDITOR_MARKER}\n\n{final_text}"
 
