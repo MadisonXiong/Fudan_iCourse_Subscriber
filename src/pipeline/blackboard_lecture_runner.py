@@ -17,7 +17,7 @@ from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v3/"
+_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v4/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -101,7 +101,7 @@ class BlackboardLectureRunner(BaseLectureRunner):
             model_used = f"{_NOTES_MODEL_PREFIX}{blackboard_model or 'vision'}"
             self._reporter.info(
                 f"    [OK] Blackboard LaTeX notes: {len(blackboard_latex)} raw chars "
-                f"-> {len(notes)} note chars; vertical-movement content stitching; "
+                f"-> {len(notes)} note chars; sliding-canvas sequence alignment; "
                 "no LLM summarization"
             )
             self._db.update_summary(sub_id, notes, model_used)
