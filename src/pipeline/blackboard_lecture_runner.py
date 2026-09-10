@@ -1,23 +1,24 @@
-"""LectureRunner extension for proof-preserving blackboard LaTeX notes.
+"""LectureRunner extension for proof-preserving blackboard notes.
 
-For whitelisted mathematics courses, the final deliverable is a faithful
-transcription-derived LaTeX notebook, not an LLM summary.  The vision pipeline
-transcribes the board frame by frame; a deterministic compiler reconstructs
-continuous board states while preserving changed/new proof steps verbatim.
+For whitelisted mathematics courses, the expensive vision stage creates and
+caches a chronological raw board transcription.  The final student-facing notes
+are then produced by a separate LLM transcription editor that removes repeated
+full-board snapshots and normalizes Markdown/LaTeX without using the audio
+transcript or summarizing away proof steps.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from src.ai.blackboard_notes import compile_blackboard_notes
+from src.ai.blackboard_editor import BlackboardEditor
 from src.ai.blackboard_vision import course_requires_blackboard
 from src.data.blackboard_store import get_blackboard, save_blackboard
 from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
 
 
-_NOTES_MODEL_PREFIX = "blackboard-latex-notes-v4/"
+_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v1/"
 
 
 class BlackboardLectureRunner(BaseLectureRunner):
@@ -42,7 +43,9 @@ class BlackboardLectureRunner(BaseLectureRunner):
         if not sub_id or get_blackboard(self._db, sub_id) is None:
             return False
 
-        return str(existing.get("summary_model") or "").startswith(_NOTES_MODEL_PREFIX)
+        return str(existing.get("summary_model") or "").startswith(
+            _NOTES_MODEL_PREFIX
+        )
 
     def _ensure_blackboard(self, sub_id: str, course_title: str) -> tuple[str, str]:
         cached = get_blackboard(self._db, sub_id)
@@ -82,34 +85,41 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 self._db.update_error(
                     sub_id,
                     "blackboard",
-                    "blackboard transcription empty; no LaTeX notes generated",
+                    "blackboard transcription empty; no notes generated",
                 )
                 return None
 
-            notes = compile_blackboard_notes(blackboard_latex)
+            # Deliberately exclude transcript/transcript_segments here.  The
+            # editor's source of truth is the 229k-ish board timeline only.
+            editor = BlackboardEditor()
+            notes, editor_model = editor.edit(blackboard_latex)
             if not notes.strip():
                 self._reporter.info(
-                    "    [FAIL] Blackboard note compiler produced empty output."
+                    "    [FAIL] Blackboard editor produced empty output."
                 )
                 self._db.update_error(
                     sub_id,
-                    "blackboard-notes",
-                    "deterministic LaTeX note compiler produced empty output",
+                    "blackboard-editor",
+                    "LLM transcription editor produced empty output",
                 )
                 return None
 
-            model_used = f"{_NOTES_MODEL_PREFIX}{blackboard_model or 'vision'}"
+            model_used = (
+                f"{_NOTES_MODEL_PREFIX}{editor_model}"
+                f"|vision={blackboard_model or 'vision'}"
+            )
             self._reporter.info(
-                f"    [OK] Blackboard LaTeX notes: {len(blackboard_latex)} raw chars "
-                f"-> {len(notes)} note chars; sliding-canvas sequence alignment; "
-                "no LLM summarization"
+                f"    [OK] Blackboard edited transcript: "
+                f"{len(blackboard_latex)} raw chars -> {len(notes)} final chars; "
+                "two-pass chunked LLM de-duplication + LaTeX normalization; "
+                "audio transcript excluded; not a lecture summary"
             )
             self._db.update_summary(sub_id, notes, model_used)
             return notes
         except Exception as exc:
             self._reporter.info(
-                f"    [FAIL] Blackboard LaTeX note generation error: "
+                f"    [FAIL] Blackboard editor error: "
                 f"{type(exc).__name__}: {exc}"
             )
-            self._db.update_error(sub_id, "blackboard-notes", str(exc))
+            self._db.update_error(sub_id, "blackboard-editor", str(exc))
             raise
