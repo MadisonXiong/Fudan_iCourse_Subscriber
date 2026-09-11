@@ -53,6 +53,13 @@
   {\color{aipurple}\textbf{〔视觉补全〕}#1}%
 }
 
+\newenvironment{visualrestoreblock}{%
+  \par\smallskip\begingroup\color{aipurple}
+  \noindent\textbf{〔视觉补全〕}\par\smallskip
+}{%
+  \endgroup\par\smallskip
+}
+
 \newenvironment{videolocation}{%
   \par\smallskip\begingroup\color{videoblue}
   \begin{quote}
