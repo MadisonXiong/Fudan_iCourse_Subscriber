@@ -10,6 +10,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from openai import OpenAI
 
@@ -18,8 +19,11 @@ from src.runtime import config
 
 _TIMEOUT = int(os.environ.get("MATH_TRANSCRIPT_TIMEOUT", "300"))
 _BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_BATCH_SIZE", "5")))
-_MIN_RATIO, _MAX_RATIO = 0.65, 2.20
+_MIN_RATIO, _MAX_RATIO = 0.90, 2.20
+_MIN_SOURCE_COVERAGE = 0.88
+_MIN_CLAUSE_COVERAGE = 0.65
 _BOARD_MAX = int(os.environ.get("MATH_TRANSCRIPT_BOARD_CHARS", "4000"))
+_BOARD_CONTEXT_MAX = int(os.environ.get("MATH_TRANSCRIPT_BOARD_CONTEXT_CHARS", "900"))
 _PPT_MAX = int(os.environ.get("MATH_TRANSCRIPT_PPT_CHARS", "1400"))
 _CONTEXT_MAX = int(os.environ.get("MATH_TRANSCRIPT_CONTEXT_CHARS", "700"))
 _BOARD_RE = re.compile(r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$", re.M)
@@ -58,7 +62,7 @@ _SYSTEM = rf"""
 若是极短数学短语也同样标记。只补语音缺口，不抄整段板书/PPT；证据不足时保留原文并可标 `[公式存疑]`。
 
 共同约束：
-7. 保留原转写的顺序、口语语义和全部已有信息；不得总结、润色成教材、扩写证明或补背景知识。
+7. 必须逐句保留原转写的顺序、口语语义和全部已有信息，包括课程介绍、通知、作业、评分、答疑等非数学内容；不得删除句子，不得摘要，不得润色成教材，不得用 PPT/板书文字替换老师的讲述，也不得扩写证明或补背景知识。
 8. 数学用 `$...$` 或 `$$...$$`；不要使用 aligned/array/cases/gathered/split。
 9. 输出严格为下列格式，一个输入 CHUNK 对应一个输出 CHUNK，编号一致且不得遗漏：
 <<<CHUNK 1>>>
@@ -68,7 +72,7 @@ _SYSTEM = rf"""
 """.strip()
 
 _RETRY = rf"""
-上一轮存在缺块或改动过大。重新处理整个批次：逐句保留原文，只做高置信度的局部 ASR 纠错和最小必要公式恢复；ASR 纠错保持黑色，只有本 CHUNK 视觉证据新增的内容才放在 {_VIS_OPEN}...{_VIS_CLOSE} 中；禁止使用相邻上下文补公式，禁止搬运完整定义/定理/证明；每个 CHUNK 长度应接近原转写；必须输出全部编号。
+上一轮存在缺块、删句或改动过大。重新处理整个批次：逐句保留原文，包括所有课程介绍、通知、作业和评分信息；只做高置信度的局部 ASR 纠错和最小必要公式恢复；不得摘要或用板书替换语音。ASR 纠错保持黑色，只有本 CHUNK 视觉证据新增的内容才放在 {_VIS_OPEN}...{_VIS_CLOSE} 中；禁止使用相邻上下文补公式，禁止搬运完整定义/定理/证明；剔除紫色视觉补全后，黑色正文的信息量和长度必须与原转写基本一致；必须输出全部编号。
 """.strip()
 
 
@@ -138,6 +142,23 @@ def _board(raw: str, start: int, end: int) -> str:
     return _trim("\n\n".join(out), _BOARD_MAX, "黑板证据")
 
 
+def _previous_board_context(raw: str, start: int) -> str:
+    """Return the nearest earlier board block for terminology context only."""
+    if not raw:
+        return ""
+    matches = list(_BOARD_RE.finditer(raw))
+    previous = [
+        (i, match)
+        for i, match in enumerate(matches)
+        if _board_time(match) < start
+    ]
+    if not previous:
+        return ""
+    i, match = previous[-1]
+    stop = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+    return _trim(raw[match.start():stop].strip(), _BOARD_CONTEXT_MAX, "前序黑板上下文")
+
+
 def _ppt(pages: list[dict], start: int, end: int) -> str:
     mid = (start + end) // 2
     found = []
@@ -159,6 +180,57 @@ def _safe(source: str, candidate: str) -> bool:
     return _MIN_RATIO <= ratio <= _MAX_RATIO
 
 
+def _spoken_text(candidate: str) -> str:
+    """Remove visual-only additions before checking preservation of speech."""
+    value = re.sub(
+        re.escape(_VIS_OPEN) + r".*?" + re.escape(_VIS_CLOSE),
+        "",
+        str(candidate or ""),
+        flags=re.S,
+    )
+    value = re.sub(r"<[^>]+>", "", value)
+    return value
+
+
+def _comparison_text(text: str) -> str:
+    """Normalize layout punctuation while retaining spoken content characters."""
+    value = re.sub(r"[`$*_#]", "", str(text or ""))
+    value = re.sub(r"[\s，。！？；：、,.!?;:（）()【】\[\]《》<>“”‘’]+", "", value)
+    return value
+
+
+def _source_coverage(source: str, candidate: str) -> float:
+    """Return how much source speech survives in the non-visual candidate."""
+    expected = _comparison_text(source)
+    actual = _comparison_text(_spoken_text(candidate))
+    if not expected or not actual:
+        return 0.0
+    matched = sum(
+        block.size
+        for block in SequenceMatcher(None, expected, actual, autojunk=False).get_matching_blocks()
+    )
+    return matched / len(expected)
+
+
+def _clauses_preserved(source: str, candidate: str) -> bool:
+    """Prevent a locally high overall score from hiding one deleted sentence."""
+    actual = _comparison_text(_spoken_text(candidate))
+    clauses = [
+        _comparison_text(part)
+        for part in re.split(r"[。！？；\n]+", str(source or ""))
+    ]
+    for clause in clauses:
+        if len(clause) < 8:
+            continue
+        matched = sum(
+            block.size
+            for block in SequenceMatcher(None, clause, actual, autojunk=False).get_matching_blocks()
+        )
+        if matched / len(clause) < _MIN_CLAUSE_COVERAGE:
+            return False
+    return True
+
+
 def _valid_candidate(
     source: str,
     candidate: str,
@@ -168,6 +240,10 @@ def _valid_candidate(
 ) -> bool:
     """Reject unsafe rewrites and impossible/malformed visual additions."""
     if not _safe(source, candidate):
+        return False
+    if _source_coverage(source, candidate) < _MIN_SOURCE_COVERAGE:
+        return False
+    if not _clauses_preserved(source, candidate):
         return False
     open_count = candidate.count(_VIS_OPEN)
     close_count = candidate.count(_VIS_CLOSE)
@@ -286,6 +362,8 @@ class MathTranscriptEnhancer:
                 f"【忠实 AI 校订语音转写】\n{seg['text']}\n\n"
                 f"【相邻下文语音（只用于术语判断，禁止复制或补公式）】\n"
                 f"{after or '（无）'}\n\n"
+                f"【前一时段黑板上下文（只用于 ASR 术语判断，禁止据此补公式）】\n"
+                f"{_previous_board_context(raw_board, s) or '（无）'}\n\n"
                 f"【本 CHUNK 的 PPT OCR 证据】\n{_ppt(pages, s, e) or '（无）'}\n\n"
                 f"【本 CHUNK 的黑板视觉证据】\n{_board(raw_board, s, e) or '（无）'}"
             )
@@ -406,7 +484,7 @@ class MathTranscriptEnhancer:
 
         md = [
             "# 数学增强语音转写", "",
-            "> 该版本以忠实 AI 校订转写为底稿：高置信度的上下文 ASR 纠错以正常黑色显示；只有原语音未说清且同时段 PPT/黑板有直接证据的数学内容才以紫色“视觉补全”显示。PDF 前文保留完整忠实校订稿，同一底稿也作为独立附件保留，便于回查。", "",
+            "> 该版本完整保留老师的语音讲述，并以忠实 AI 校订转写为底稿：高置信度的上下文 ASR 纠错以正常黑色显示；只有原语音未说清且同时段 PPT/黑板有直接证据的数学内容才以紫色“视觉补全”显示。忠实校订稿另作为独立附件保留，便于回查。", "",
         ]
         for seg in enhanced:
             md += [
@@ -417,7 +495,7 @@ class MathTranscriptEnhancer:
         for model in models:
             if model and model not in unique:
                 unique.append(model)
-        label = "math-transcript-v3/" + ("+".join(unique) if unique else "no-llm")
+        label = "math-transcript-v4/" + ("+".join(unique) if unique else "no-llm")
         if fallbacks:
             label += f"|safe-base-fallback[{fallbacks}]"
         return MathTranscriptResult("\n".join(md).strip() + "\n", enhanced, label)

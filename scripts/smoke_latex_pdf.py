@@ -128,19 +128,11 @@ $$</span>
 
 于是 <span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕\Rightarrow \forall n\in\mathbb{N}, x_n\to 0</span>。
 '''
-    faithful_transcript = r'''# AI 校订语音转写
-
-## 00:00–03:00
-
-这是经大语言模型校订后保留的完整语音转写，必须出现在 PDF 中。
-'''
     markdown = compose_course_markdown(
         summary,
-        faithful_transcript=faithful_transcript,
         math_transcript=math_transcript,
     )
-    assert "AI 校订语音转写" in markdown
-    assert markdown.index("AI 校订语音转写") < markdown.index("数学增强语音转写")
+    assert markdown.index("数学增强语音转写") > markdown.index("视频定位")
     pdf = render_markdown_pdf(
         markdown,
         title="泛函分析",

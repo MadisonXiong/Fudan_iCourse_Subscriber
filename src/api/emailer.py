@@ -6,7 +6,8 @@ until the final document is typeset; no formula PNG/CID pipeline is involved.
 
 For Functional Analysis, the PDF also contains a separate math-enhanced timed
 transcript.  It may restore ASR-lost formulas only from same-window PPT/board
-evidence; the faithful AI-proofread transcript remains attached independently.
+evidence. The faithful AI-proofread transcript remains attached independently
+for audit.
 """
 
 from __future__ import annotations
@@ -176,9 +177,8 @@ class Emailer:
         plain_lines = [
             "完整课程内容见 LaTeX PDF 附件。",
             "PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。",
-            "PDF 内含完整的 AI 校订语音转写，不会省略老师的讲述。",
-            "泛函分析 PDF 还会加入有视觉证据约束的数学增强转写。",
-            "同一份 AI 校订语音转写也作为独立 Markdown 附件保留，便于审计回查。",
+            "泛函分析 PDF 在原课程笔记之后附有完整的数学增强语音转写。",
+            "忠实 AI 校订语音转写另作为独立 Markdown 附件保留，便于审计回查。",
             "",
         ]
         html_parts = [
@@ -186,8 +186,8 @@ class Emailer:
             'font-size:15px;line-height:1.7;color:#1f2937;max-width:720px;margin:auto;padding:20px;">',
             '<p>完整课程内容见 <strong>LaTeX PDF 附件</strong>。</p>',
             '<p>PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。'
-            'PDF 内含完整的 AI 校订语音转写；泛函分析还会加入有视觉证据约束的数学增强转写。'
-            '同一份 AI 校订语音转写也作为独立 Markdown 附件保留，便于审计回查。</p>',
+            '泛函分析 PDF 在原课程笔记之后附有完整的数学增强语音转写；'
+            '忠实 AI 校订语音转写另作为独立 Markdown 附件保留，便于审计回查。</p>',
         ]
 
         for course_title, lectures in courses.items():
@@ -206,7 +206,7 @@ class Emailer:
                     'border:1px solid #e2e8f0;border-radius:6px;">'
                     f"<strong>{escape(tag + str(item.get('sub_title') or '课堂'))}</strong> "
                     f"<span style=\"color:#64748b\">({escape(str(item.get('date') or ''))})</span><br>"
-                    '<span style="color:#475569">完整笔记、AI 校订语音转写与原生 LaTeX 公式见 PDF 附件。</span>'
+                    '<span style="color:#475569">完整笔记与文末增强语音转写见 PDF 附件。</span>'
                     "</div>"
                 )
         html_parts.append("</div>")
