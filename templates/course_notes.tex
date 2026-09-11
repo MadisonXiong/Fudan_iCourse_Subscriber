@@ -1,0 +1,102 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{longtable,booktabs,array}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+
+\geometry{left=22mm,right=22mm,top=20mm,bottom=22mm}
+\setmainfont{DejaVu Serif}
+\setsansfont{DejaVu Sans}
+\setmonofont{DejaVu Sans Mono}
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+
+\definecolor{aipurple}{HTML}{6D28D9}
+\definecolor{aipurplebg}{HTML}{F5F3FF}
+\definecolor{videoblue}{HTML}{2563EB}
+\definecolor{videobg}{HTML}{EFF6FF}
+\definecolor{muted}{HTML}{64748B}
+\definecolor{rulegray}{HTML}{CBD5E1}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=videoblue,
+  urlcolor=videoblue,
+  citecolor=videoblue,
+  pdfauthor={iCourse Subscriber},
+  pdftitle={$title$}
+}
+
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\setlist{nosep,leftmargin=2em}
+\setcounter{tocdepth}{3}
+\emergencystretch=3em
+
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+
+\newenvironment{ainote}{%
+  \par\medskip\begingroup
+  \color{aipurple}
+  \setlength{\fboxsep}{8pt}%
+  \noindent\fcolorbox{aipurple!45}{aipurplebg}{%
+    \begin{minipage}{0.94\linewidth}
+    \textbf{AI 补充}\par\smallskip
+}{%
+    \end{minipage}}
+  \endgroup\par\medskip
+}
+
+\newcommand{\visualrestore}[1]{%
+  {\color{aipurple}\textbf{〔视觉补全〕}#1}%
+}
+
+\newenvironment{videolocation}{%
+  \par\smallskip\begingroup
+  \color{videoblue}
+  \noindent\colorbox{videobg}{\strut\begin{minipage}{0.94\linewidth}}
+}{%
+  \end{minipage}
+  \endgroup\par\smallskip
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{muted}$title$}
+\fancyhead[R]{\small\color{muted}iCourse Subscriber}
+\fancyfoot[C]{\small\color{muted}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries $title$\par}
+  \vspace{0.45em}
+$if(subtitle)$
+  {\large $subtitle$\par}
+$endif$
+$if(date)$
+  \vspace{0.35em}
+  {\color{muted}$date$\par}
+$endif$
+\end{center}
+
+\vspace{0.75em}
+\hrule
+\vspace{1em}
+
+\tableofcontents
+\newpage
+
+$body$
+
+\end{document}
