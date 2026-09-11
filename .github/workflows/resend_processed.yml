@@ -15,6 +15,8 @@ jobs:
   resend:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      XDG_CACHE_HOME: ${{ github.workspace }}/.cache
 
     steps:
       - name: Check out resend implementation
@@ -37,6 +39,25 @@ jobs:
       - name: Install Python dependencies
         if: steps.cache-pip.outputs.cache-hit != 'true'
         run: pip install -r requirements.txt
+
+      - name: Cache Tectonic bundle
+        uses: actions/cache@v4
+        with:
+          path: .cache/Tectonic
+          key: tectonic-bundle-0.16.9-v1-${{ runner.os }}
+
+      - name: Install native LaTeX PDF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc fonts-noto-cjk
+          curl -L --fail --retry 3 \
+            -o /tmp/tectonic.tar.gz \
+            'https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.16.9/tectonic-0.16.9-x86_64-unknown-linux-gnu.tar.gz'
+          echo 'f3c825128095dc3399ea11c08c18035b33050a216930c295c79e8eb11bd21de4  /tmp/tectonic.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/tectonic.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/tectonic /usr/local/bin/tectonic
+          tectonic --version
+          pandoc --version | head -n 1
 
       - name: Fetch database from data branch
         run: |
@@ -68,6 +89,15 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RESEND_COURSE_IDS: ${{ inputs.course_ids }}
         run: PYTHONPATH=. python -u scripts/resend_processed.py
+
+      - name: Upload LaTeX debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latex-debug-${{ github.run_id }}
+          path: artifacts/latex-debug/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Persist generated math transcript cache
         if: always()
