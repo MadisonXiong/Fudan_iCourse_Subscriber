@@ -30,6 +30,10 @@ _BOARD_RE = re.compile(r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$", re.M)
 _OUT_RE = re.compile(
     r"<<<CHUNK\s+(\d+)>>>\s*(.*?)\s*<<<END\s+CHUNK\s+\1>>>", re.I | re.S
 )
+_PREVIOUS_VISUAL_REF_RE = re.compile(
+    r"(?:这个|那个|上面|前面|刚才|之前)(?:式子|公式|等式|不等式|定义|表达式|板书)"
+    r"|(?:上式|下式|该式|此式|如图|板书上)"
+)
 _VIS_OPEN = '<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕'
 _VIS_CLOSE = "</span>"
 
@@ -56,7 +60,7 @@ _SYSTEM = rf"""
 4. 相邻上下文只用于判断术语和句意，严禁把相邻 CHUNK 的内容复制进当前 CHUNK，尤其严禁据此补公式。
 
 第二阶段——视觉数学恢复（紫色“视觉补全”）：
-5. 每个 CHUNK 的公式证据完全独立。只有标为“本 CHUNK”的 PPT/黑板直接给出对应对象时，才可恢复原语音没有说清楚的变量、集合、映射、量词、等式、不等式或公式。绝不能跨 CHUNK 借公式，也不能凭学科常识补公式。
+5. 优先使用“本 CHUNK”的 PPT/黑板证据恢复原语音没有说清楚的变量、集合、映射、量词、等式、不等式或公式。若老师在当前语音中明确说了“这个式子”“上式”“刚才写的”等指代，才可使用“最近前序板书证据”恢复被指代的公式；没有明确语音指代时，绝不能从前序板书搬运公式，也不能凭学科常识补公式。
 6. 原语音已经明确说出的数学表达可直接规范成 `$...$`，保持正常黑色；原语音没有、仅由本 CHUNK 视觉证据恢复的内容，才必须完整放在：
 {_VIS_OPEN}$...${_VIS_CLOSE}
 若是极短数学短语也同样标记。只补语音缺口，不抄整段板书/PPT；证据不足时保留原文并可标 `[公式存疑]`。
@@ -72,7 +76,7 @@ _SYSTEM = rf"""
 """.strip()
 
 _RETRY = rf"""
-上一轮存在缺块、删句或改动过大。重新处理整个批次：逐句保留原文，包括所有课程介绍、通知、作业和评分信息；只做高置信度的局部 ASR 纠错和最小必要公式恢复；不得摘要或用板书替换语音。ASR 纠错保持黑色，只有本 CHUNK 视觉证据新增的内容才放在 {_VIS_OPEN}...{_VIS_CLOSE} 中；禁止使用相邻上下文补公式，禁止搬运完整定义/定理/证明；剔除紫色视觉补全后，黑色正文的信息量和长度必须与原转写基本一致；必须输出全部编号。
+上一轮存在缺块、删句或改动过大。重新处理整个批次：逐句保留原文，包括所有课程介绍、通知、作业和评分信息；只做高置信度的局部 ASR 纠错和最小必要公式恢复；不得摘要或用板书替换语音。ASR 纠错保持黑色，只有视觉证据新增的内容才放在 {_VIS_OPEN}...{_VIS_CLOSE} 中；相邻语音只能辅助纠错；最近前序板书只有在当前语音明确指代上式时才能用于恢复公式；禁止搬运完整定义/定理/证明；剔除紫色视觉补全后，黑色正文的信息量和长度必须与原转写基本一致；必须输出全部编号。
 """.strip()
 
 
@@ -171,6 +175,22 @@ def _ppt(pages: list[dict], start: int, end: int) -> str:
             found.append((abs(sec - mid), f"[PPT @ {sec//60:02d}:{sec%60:02d}]\n{text}"))
     found.sort(key=lambda x: x[0])
     return _trim("\n\n".join(text for _, text in found), _PPT_MAX, "PPT证据")
+
+
+def _has_formula_evidence(
+    source: str,
+    pages: list[dict],
+    raw_board: str,
+    start: int,
+    end: int,
+) -> bool:
+    """Accept prior-board formula evidence only when speech points back to it."""
+    if _ppt(pages, start, end) or _board(raw_board, start, end):
+        return True
+    return bool(
+        _previous_board_context(raw_board, start)
+        and _PREVIOUS_VISUAL_REF_RE.search(str(source or ""))
+    )
 
 
 def _safe(source: str, candidate: str) -> bool:
@@ -362,7 +382,7 @@ class MathTranscriptEnhancer:
                 f"【忠实 AI 校订语音转写】\n{seg['text']}\n\n"
                 f"【相邻下文语音（只用于术语判断，禁止复制或补公式）】\n"
                 f"{after or '（无）'}\n\n"
-                f"【前一时段黑板上下文（只用于 ASR 术语判断，禁止据此补公式）】\n"
+                f"【最近前序板书证据（用于术语判断；仅在当前语音明确指代上式时可恢复公式）】\n"
                 f"{_previous_board_context(raw_board, s) or '（无）'}\n\n"
                 f"【本 CHUNK 的 PPT OCR 证据】\n{_ppt(pages, s, e) or '（无）'}\n\n"
                 f"【本 CHUNK 的黑板视觉证据】\n{_board(raw_board, s, e) or '（无）'}"
@@ -403,7 +423,9 @@ class MathTranscriptEnhancer:
 
         for i, seg in enumerate(batch, 1):
             s, e = seg["start_ms"] // 1000, seg["end_ms"] // 1000
-            has_visual = bool(_ppt(pages, s, e) or _board(raw_board, s, e))
+            has_visual = _has_formula_evidence(
+                seg["text"], pages, raw_board, s, e
+            )
             if not _valid_candidate(
                 seg["text"],
                 parsed.get(i, ""),
@@ -419,7 +441,9 @@ class MathTranscriptEnhancer:
                 for i in list(bad):
                     seg = batch[i - 1]
                     s, e = seg["start_ms"] // 1000, seg["end_ms"] // 1000
-                    has_visual = bool(_ppt(pages, s, e) or _board(raw_board, s, e))
+                    has_visual = _has_formula_evidence(
+                        seg["text"], pages, raw_board, s, e
+                    )
                     if _valid_candidate(
                         seg["text"],
                         retry_parsed.get(i, ""),
@@ -483,8 +507,8 @@ class MathTranscriptEnhancer:
             fallbacks += failed
 
         md = [
-            "# 数学增强语音转写", "",
-            "> 该版本完整保留老师的语音讲述，并以忠实 AI 校订转写为底稿：高置信度的上下文 ASR 纠错以正常黑色显示；只有原语音未说清且同时段 PPT/黑板有直接证据的数学内容才以紫色“视觉补全”显示。忠实校订稿另作为独立附件保留，便于回查。", "",
+            "# 完整课堂语音转写（AI 校订与公式补全）", "",
+            "> 本附录完整保留老师的语音讲述。大模型依据课程上下文和视觉证据校正 ASR 错误；有直接证据恢复的公式以紫色“视觉补全”显示。忠实校订底稿另作为独立附件保留，便于回查。", "",
         ]
         for seg in enhanced:
             md += [
@@ -495,7 +519,7 @@ class MathTranscriptEnhancer:
         for model in models:
             if model and model not in unique:
                 unique.append(model)
-        label = "math-transcript-v4/" + ("+".join(unique) if unique else "no-llm")
+        label = "math-transcript-v5/" + ("+".join(unique) if unique else "no-llm")
         if fallbacks:
             label += f"|safe-base-fallback[{fallbacks}]"
         return MathTranscriptResult("\n".join(md).strip() + "\n", enhanced, label)
