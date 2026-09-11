@@ -196,7 +196,6 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 sub_id,
                 transcript_segments,
                 kept_pages,
-                course_title=course_title,
                 raw_blackboard=proofread_board_evidence,
             )
             ai_summary, ai_summary_model = self._generate_traceable_ai_summary(

@@ -93,6 +93,7 @@ class Emailer:
         raw_blackboard = board_cached[0] if board_cached else ""
         ppt_pages = db.get_done_ppt_pages(sub_id)
         fingerprint = source_fingerprint(
+            course_title,
             proofread_markdown,
             proofread_segments,
             ppt_pages,
@@ -119,6 +120,7 @@ class Emailer:
             result = self._math_enhancer.enhance(
                 proofread_segments,
                 ppt_pages,
+                course_title=course_title,
                 raw_blackboard=raw_blackboard,
             )
             save_math_transcript(

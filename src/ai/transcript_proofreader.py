@@ -41,25 +41,6 @@ _MODELSCOPE_MODELS = [
     "Qwen/Qwen3-VL-8B-Instruct",
 ]
 
-# High-confidence homophone anchors observed in Functional Analysis lectures.
-# These are prompt evidence rather than blind string replacements: the model
-# still has to check the surrounding sentence, so ordinary uses of words such
-# as "办案" are not rewritten mechanically.
-_COURSE_GLOSSARIES = {
-    "泛函分析": (
-        ("办案分析", "泛函分析"),
-        ("十遍函数", "实变函数"),
-        ("十变函数", "实变函数"),
-        ("赋繁空间", "赋范空间"),
-        ("巴拿赫空间", "巴拿赫空间（Banach space）"),
-        ("希尔伯特空间", "希尔伯特空间（Hilbert space）"),
-        ("有界现行算子", "有界线性算子"),
-        ("柯西列", "柯西列（Cauchy sequence）"),
-        ("闵可夫斯基不等式", "Minkowski 不等式"),
-        ("赫尔德不等式", "Hölder 不等式"),
-    ),
-}
-
 _BOARD_HEADING_RE = re.compile(
     r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$",
     re.MULTILINE,
@@ -82,8 +63,6 @@ SYSTEM_PROMPT = r"""
 6. 不要添加解释、评价、标题、时间戳、Markdown 列表或“AI 补充”。
 7. 数学符号可使用简洁 LaTeX `$...$`，但不必把所有普通口语强行公式化。
 8. 直接输出校订后的【当前时段】正文，不要说明修改了什么。
-9. 必须结合【课程名称】和完整句意修复专业术语同音错字；术语提示只是候选，
-   只有上下文吻合时才采用，不得机械替换。
 """.strip()
 
 
@@ -179,18 +158,6 @@ def _safe_ratio(source: str, candidate: str) -> tuple[bool, float]:
     return _MIN_RATIO <= ratio <= _MAX_RATIO, ratio
 
 
-def _course_glossary(course_title: str) -> str:
-    """Return conservative, course-specific ASR correction hints."""
-    title = str(course_title or "").strip()
-    rows: list[tuple[str, str]] = []
-    for keyword, entries in _COURSE_GLOSSARIES.items():
-        if keyword in title:
-            rows.extend(entries)
-    if not rows:
-        return "（无课程专属术语提示；请依据上下文谨慎校订）"
-    return "\n".join(f"- `{wrong}` → `{right}`" for wrong, right in rows)
-
-
 class TranscriptProofreader:
     def __init__(self):
         resolved = config.resolve_model_providers()
@@ -257,7 +224,6 @@ class TranscriptProofreader:
         segments: list[dict],
         ppt_pages: list[dict] | None,
         *,
-        course_title: str = "",
         raw_blackboard: str = "",
     ) -> ProofreadResult:
         if not segments:
@@ -291,9 +257,6 @@ class TranscriptProofreader:
             )
 
             prompt = (
-                f"【课程名称】{course_title or '（未知）'}\n\n"
-                f"【课程专属术语提示（仅在句意吻合时采用）】\n"
-                f"{_course_glossary(course_title)}\n\n"
                 f"【视频时段】{_fmt(start)}–{_fmt(end)}\n\n"
                 f"【前文语音上下文，只读】\n{before or '（无）'}\n\n"
                 f"【当前时段原始 ASR】\n{current}\n\n"
