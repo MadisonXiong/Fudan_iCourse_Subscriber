@@ -53,7 +53,7 @@ jobs:
           UISPSW: ${{ secrets.UISPSW }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-        run: python scripts/db_shard.py reassemble data/sharded data/icourse.db
+        run: PYTHONPATH=. python scripts/db_shard.py reassemble data/sharded data/icourse.db
 
       - name: Resend stored emails only
         env:
@@ -61,4 +61,4 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           RESEND_COURSE_IDS: ${{ inputs.course_ids }}
-        run: python -u scripts/resend_processed.py
+        run: PYTHONPATH=. python -u scripts/resend_processed.py
