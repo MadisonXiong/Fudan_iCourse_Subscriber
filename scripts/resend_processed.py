@@ -9,6 +9,14 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+
+# Running ``python scripts/resend_processed.py`` makes ``scripts/`` the first
+# import root, so the repository-level ``src`` package is otherwise invisible.
+# Add the repository root explicitly before importing project modules.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from src.api.emailer import Emailer
 from src.data.database import Database
