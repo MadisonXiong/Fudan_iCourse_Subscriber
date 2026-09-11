@@ -1,9 +1,8 @@
 """Compact PDF-first course email delivery.
 
-The previous HTML path rendered every LaTeX expression as an inline CID image.
-Math-heavy lectures could therefore contain hundreds of MIME image parts and be
-rejected by Gmail.  The new path keeps the email body intentionally small and
-attaches one PDF per lecture, where formulas are rendered in the document.
+Email bodies stay intentionally small.  Complete notes are compiled by Pandoc +
+Tectonic into native vector PDFs, so mathematical expressions remain real LaTeX
+until the final document is typeset; no formula PNG/CID pipeline is involved.
 
 For Functional Analysis, the PDF also contains a separate math-enhanced timed
 transcript.  It may restore ASR-lost formulas only from same-window PPT/board
@@ -24,7 +23,6 @@ from html import escape
 
 from src.ai.blackboard_vision import course_requires_blackboard
 from src.ai.math_transcript_enhancer import MathTranscriptEnhancer
-from src.api.pdf_renderer import build_course_pdf, pdf_filename
 from src.data.blackboard_store import get_blackboard
 from src.data.database import Database
 from src.data.math_transcript_store import (
@@ -34,6 +32,7 @@ from src.data.math_transcript_store import (
     source_fingerprint,
 )
 from src.data.transcript_store import load_proofread
+from src.pdf.latex_renderer import build_course_pdf, pdf_filename
 from src.runtime import config
 
 
@@ -139,8 +138,8 @@ class Emailer:
         except Exception as exc:
             # Delivery must still succeed if the optional enhancement API is down.
             print(
-                f"[Emailer] Math enhancement unavailable; PDF will use faithful "
-                f"transcript instead: {type(exc).__name__}: {exc}",
+                f"[Emailer] Math enhancement unavailable; PDF will contain the "
+                f"stored course notes only: {type(exc).__name__}: {exc}",
                 flush=True,
             )
             return ""
@@ -152,7 +151,7 @@ class Emailer:
             return data, pdf_filename(item)
         except Exception as exc:
             print(
-                f"[Emailer] PDF generation failed for {item.get('sub_id')}: "
+                f"[Emailer] LaTeX PDF generation failed for {item.get('sub_id')}: "
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
@@ -173,17 +172,19 @@ class Emailer:
             subject += "（含 PPT 识别·更新）"
 
         plain_lines = [
-            "课程内容已改为 PDF 附件发送，以避免数学公式产生数百个 CID 图片。",
-            "PDF 包含完整课程笔记；泛函分析还会在 PDF 中加入有视觉证据约束的数学增强转写。",
+            "完整课程内容见 LaTeX PDF 附件。",
+            "PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。",
+            "泛函分析 PDF 还会加入有视觉证据约束的数学增强转写。",
             "忠实 AI 校订语音转写仍作为独立附件保留，用于核对原视频。",
             "",
         ]
         html_parts = [
             '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;'
             'font-size:15px;line-height:1.7;color:#1f2937;max-width:720px;margin:auto;padding:20px;">',
-            '<p>课程内容已改为 <strong>PDF 附件</strong>发送，以避免数学公式产生数百个 CID 图片。</p>',
-            '<p>PDF 包含完整课程笔记；泛函分析还会加入有视觉证据约束的数学增强转写。'
-            '忠实 AI 校订语音转写仍作为独立附件保留，用于核对原视频。</p>',
+            '<p>完整课程内容见 <strong>LaTeX PDF 附件</strong>。</p>',
+            '<p>PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。'
+            '泛函分析还会加入有视觉证据约束的数学增强转写；忠实 AI 校订语音转写'
+            '仍作为独立附件保留，用于核对原视频。</p>',
         ]
 
         for course_title, lectures in courses.items():
@@ -202,7 +203,7 @@ class Emailer:
                     'border:1px solid #e2e8f0;border-radius:6px;">'
                     f"<strong>{escape(tag + str(item.get('sub_title') or '课堂'))}</strong> "
                     f"<span style=\"color:#64748b\">({escape(str(item.get('date') or ''))})</span><br>"
-                    '<span style="color:#475569">完整笔记与公式见 PDF 附件。</span>'
+                    '<span style="color:#475569">完整笔记与原生 LaTeX 公式见 PDF 附件。</span>'
                     "</div>"
                 )
         html_parts.append("</div>")
@@ -237,7 +238,9 @@ class Emailer:
                 msg.attach(part)
                 pdf_count += 1
             else:
-                # Do not lose the notes if ReportLab/CodeCogs encounters an edge case.
+                # Never lose the stored notes if Pandoc/Tectonic encounters an
+                # unexpected LaTeX edge case.  Debug .tex/.log files are saved
+                # separately by the renderer and uploaded by the workflow.
                 summary = str(item.get("summary") or "").strip()
                 if summary:
                     fallback = MIMEText(summary, "plain", "utf-8")
@@ -264,7 +267,7 @@ class Emailer:
                 transcript_count += 1
 
         print(
-            f"[Emailer] Attachments: pdf={pdf_count}, "
+            f"[Emailer] Attachments: latex_pdf={pdf_count}, "
             f"faithful_transcript={transcript_count}, "
             f"markdown_fallback={markdown_fallback_count}; CID images=0",
             flush=True,
