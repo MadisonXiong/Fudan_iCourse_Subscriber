@@ -93,3 +93,12 @@ jobs:
               assert row["blackboard_model"] == "test-model"
               check.conn.close()
           PY
+
+      - name: Upload LaTeX debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latex-debug-${{ github.run_id }}
+          path: artifacts/latex-debug/
+          if-no-files-found: ignore
+          retention-days: 7
