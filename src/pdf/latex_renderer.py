@@ -34,7 +34,12 @@ _DEBUG_ROOT = Path(
 _REPAIR_ENABLED = os.environ.get("FICS_LATEX_REPAIR_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
-_REPAIR_ATTEMPTS = max(0, int(os.environ.get("FICS_LATEX_REPAIR_ATTEMPTS", "3")))
+# Real lecture notes can contain several independent malformed math fragments.
+# A repair attempt is compiler-driven and local, so allowing more iterations is
+# safer than abandoning the PDF after the first few unrelated errors.  The loop
+# still stops immediately once Tectonic succeeds, and every accepted proposal is
+# audited and recompiled.
+_REPAIR_ATTEMPTS = max(0, int(os.environ.get("FICS_LATEX_REPAIR_ATTEMPTS", "12")))
 
 
 class LatexPdfError(RuntimeError):
