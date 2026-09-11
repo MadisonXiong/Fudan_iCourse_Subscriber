@@ -1,10 +1,12 @@
 """Normalize FiCS Markdown annotations before Pandoc/LaTeX conversion.
 
-The stored notes intentionally contain a small amount of HTML so email/web
-renderers can distinguish teacher content from model-authored additions.  Pandoc
-can preserve the same semantics more reliably if those HTML markers are first
-converted to fenced Divs/Spans with explicit classes.  A Lua filter then maps
-those classes to LaTeX environments/macros.
+Stored notes contain small HTML provenance markers.  Convert them into Pandoc
+semantic structures while preserving real math nodes.  In particular, visual
+restoration output from an LLM may contain ``$ formula $`` (spaces immediately
+inside the delimiters) or block ``$$...$$``.  Pandoc does not reliably parse
+those forms inside an inline bracketed span, which previously turned dollars
+and underscores into escaped text and produced invalid LaTeX.  We normalize
+inline math and represent display-math visual restorations as fenced Divs.
 """
 
 from __future__ import annotations
@@ -29,13 +31,16 @@ _VIDEO_LINE_RE = re.compile(
     r'^\s*\*\*视频定位：(.+?)\*\*\s*$',
     re.MULTILINE,
 )
+_VIS_LABEL_RE = re.compile(r'^\s*〔视觉补全〕\s*')
+_DISPLAY_MATH_RE = re.compile(r'^\s*\$\$\s*(.*?)\s*\$\$\s*$', re.DOTALL)
+_INLINE_MATH_RE = re.compile(r'\$(?!\$)\s*([^$\n]+?)\s*\$(?!\$)')
 
 
 def _clean_ai_inner(inner: str) -> str:
     inner = _AI_LABEL_RE.sub("", inner, count=1)
     inner = _BR_RE.sub("\n", inner)
     # The only strong/em tags expected inside these annotation blocks are
-    # presentation markup.  Preserve their text and let Markdown/LaTeX handle it.
+    # presentation markup. Preserve their text and let Markdown/LaTeX handle it.
     inner = re.sub(r'</?(?:strong|em)[^>]*>', "", inner, flags=re.IGNORECASE)
     return inner.strip()
 
@@ -45,12 +50,63 @@ def _ai_note(match: re.Match) -> str:
     return f"\n\n::: {{.ai-note}}\n{inner}\n:::\n\n"
 
 
+def _normalize_inline_math(text: str) -> str:
+    """Make ``$ formula $`` parse as Pandoc math without changing the formula."""
+
+    def repl(match: re.Match) -> str:
+        return "$" + match.group(1).strip() + "$"
+
+    return _INLINE_MATH_RE.sub(repl, text)
+
+
+def _looks_like_raw_math(text: str) -> bool:
+    """Detect model output that forgot math delimiters but is clearly TeX math."""
+    return bool(
+        re.search(
+            r"\\(?:frac|sum|int|lim|forall|exists|Rightarrow|Leftrightarrow|"
+            r"langle|rangle|mathbb|ell|infty|varepsilon|begin|left|right|"
+            r"subset|in|to|geq|leq|cdot|overline)\b|[_^]",
+            text,
+        )
+    )
+
+
 def _visual_restore(match: re.Match) -> str:
+    """Convert one visual-provenance HTML span into safe Pandoc structures.
+
+    Display math cannot legally live inside Pandoc's inline ``Span`` node, so a
+    visual restoration containing exactly one ``$$...$$`` block becomes a
+    fenced Div.  Inline formulas remain spans, allowing the Lua filter to color
+    them and add the provenance label without rasterizing anything.
+    """
     inner = _BR_RE.sub(" ", match.group(1)).strip()
-    inner = re.sub(r'^\s*〔视觉补全〕\s*', "", inner)
+    inner = _VIS_LABEL_RE.sub("", inner, count=1).strip()
     if not inner:
         return ""
-    return f"[〔视觉补全〕{inner}]{{.visual-restored}}"
+
+    display = _DISPLAY_MATH_RE.match(inner)
+    if display:
+        formula = display.group(1).strip()
+        return (
+            "\n\n::: {.visual-restored-block}\n"
+            "$$\n"
+            f"{formula}\n"
+            "$$\n"
+            ":::\n\n"
+        )
+
+    inner = _normalize_inline_math(inner)
+
+    # A few model responses violate the contract by returning bare TeX such as
+    # ``\Rightarrow ...``.  Treat it as math rather than allowing Pandoc to
+    # escape underscores/backslashes into text.  This only adds delimiters; it
+    # does not invent or rewrite mathematical content.
+    if "$" not in inner and _looks_like_raw_math(inner):
+        inner = f"${inner.strip()}$"
+
+    # Do not repeat the human-visible label here.  \visualrestore itself adds
+    # 〔视觉补全〕, while the Span contains only the restored source content.
+    return f"[{inner}]{{.visual-restored}}"
 
 
 def _video_location(match: re.Match) -> str:
@@ -79,7 +135,7 @@ def compose_course_markdown(
     """Build the Markdown body for one course-note PDF.
 
     The faithful ASR transcript intentionally stays outside the PDF as a separate
-    audit attachment.  Only the evidence-constrained math-enhanced transcript is
+    audit attachment. Only the evidence-constrained math-enhanced transcript is
     appended to the reading PDF.
     """
     parts = [preprocess_markdown(summary)]
