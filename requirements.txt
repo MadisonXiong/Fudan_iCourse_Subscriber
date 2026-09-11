@@ -9,4 +9,3 @@ psutil
 pygments
 rapidocr-onnxruntime
 imagehash
-reportlab
