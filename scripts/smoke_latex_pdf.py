@@ -12,9 +12,39 @@ if str(_REPO_ROOT) not in sys.path:
 
 from src.pdf.latex_preprocessor import compose_course_markdown
 from src.pdf.latex_renderer import render_markdown_pdf
+from src.pdf.latex_repairer import apply_repair_patch, parse_repair_patch
+
+
+def _smoke_patch_protocol() -> None:
+    """Validate the LLM patch protocol without requiring any API secret in CI."""
+    source = "\n".join(
+        [
+            r"before",
+            r"\[L^p(X,\mu)=\left\{f\]",
+            r"为 $X$ 上可测函数且",
+            r"\[\int_X |f|^p\,d\mu<\infty\right\}.\]",
+            r"after",
+        ]
+    ) + "\n"
+    response = r'''<<<START_LINE>>>2<<<END_START_LINE>>>
+<<<END_LINE>>>4<<<END_END_LINE>>>
+<<<REPLACEMENT>>>
+\[
+L^p(X,\mu)=\left\{f\text{ 为 }X\text{ 上可测函数且 }\int_X|f|^p\,d\mu<\infty\right\}.
+\]
+<<<END_REPLACEMENT>>>'''
+    patch = parse_repair_patch(response)
+    assert patch is not None
+    repaired, before = apply_repair_patch(source, patch)
+    assert r"\left\{" in repaired and r"\right\}" in repaired
+    assert "为" in repaired and "可测函数且" in repaired
+    assert r"\[L^p" in before
+    assert repaired.endswith("after\n")
 
 
 def main() -> int:
+    _smoke_patch_protocol()
+
     summary = r'''# 泛函分析测试
 
 设 $X$ 为非空集合，若
