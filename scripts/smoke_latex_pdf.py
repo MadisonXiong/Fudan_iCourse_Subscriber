@@ -10,36 +10,66 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from src.pdf.latex_layout_repairer import (
+    _semantic_fingerprint,
+    _validate_replacement,
+    overflow_score,
+    overfull_issues,
+)
 from src.pdf.latex_preprocessor import compose_course_markdown, preprocess_markdown
 from src.pdf.latex_renderer import render_markdown_pdf
-from src.pdf.latex_repairer import apply_repair_patch, parse_repair_patch
+from src.pdf.latex_repairer import compiler_error_line
 
 
-def _smoke_patch_protocol() -> None:
-    """Validate the LLM patch protocol without requiring any API secret in CI."""
-    source = "\n".join(
+def _smoke_repair_helpers() -> None:
+    """Validate compiler-local and layout-only repair guards without API calls."""
+    compiler_log = "error: notes.tex:296: Missing \\right. inserted\n"
+    assert compiler_error_line(compiler_log) == 296
+
+    overflow_log = "\n".join(
         [
-            r"before",
-            r"\[L^p(X,\mu)=\left\{f\]",
-            r"为 $X$ 上可测函数且",
-            r"\[\int_X |f|^p\,d\mu<\infty\right\}.\]",
-            r"after",
+            "warning: notes.tex:115: Overfull \\hbox (194.91815pt too wide) detected at line 115",
+            "warning: notes.tex:746: Overfull \\hbox (278.6047pt too wide) detected at line 746",
+            "warning: notes.tex:780: Underfull \\hbox (badness 3557) in paragraph at lines 779--780",
         ]
-    ) + "\n"
-    response = r'''<<<START_LINE>>>2<<<END_START_LINE>>>
-<<<END_LINE>>>4<<<END_END_LINE>>>
-<<<REPLACEMENT>>>
-\[
-L^p(X,\mu)=\left\{f\text{ 为 }X\text{ 上可测函数且 }\int_X|f|^p\,d\mu<\infty\right\}.
-\]
-<<<END_REPLACEMENT>>>'''
-    patch = parse_repair_patch(response)
-    assert patch is not None
-    repaired, before = apply_repair_patch(source, patch)
-    assert r"\left\{" in repaired and r"\right\}" in repaired
-    assert "为" in repaired and "可测函数且" in repaired
-    assert r"\[L^p" in before
-    assert repaired.endswith("after\n")
+    )
+    issues = overfull_issues(overflow_log, min_pt=24)
+    assert [round(item.width_pt, 3) for item in issues] == [278.605, 194.918]
+    assert round(overflow_score(overflow_log), 3) == 473.523
+
+    before = r'''\[
+A=B+C+D+E+F+G
+\]'''
+    after = r'''\[
+\begin{aligned}
+A&=B+C+D\\
+ &\quad+E+F+G
+\end{aligned}
+\]'''
+    # Layout metadata may change, but mathematical/content tokens must not.
+    assert _semantic_fingerprint(before) == _semantic_fingerprint(after).replace(r"\quad", "") is False
+
+    # A semantically identical reflow should pass the strict guard.
+    safe_after = r'''\[
+\begin{aligned}
+A&=B+C+D\\
+&+E+F+G
+\end{aligned}
+\]'''
+    _validate_replacement(before, safe_after)
+
+    changed = r'''\[
+\begin{aligned}
+A&=B+C+D\\
+&+E+F+H
+\end{aligned}
+\]'''
+    try:
+        _validate_replacement(before, changed)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("layout guard accepted changed mathematical content")
 
 
 def _smoke_visual_preprocessor() -> None:
@@ -61,7 +91,7 @@ bare: <span data-visual-restored="true">〔视觉补全〕\Rightarrow \forall n\
 
 
 def main() -> int:
-    _smoke_patch_protocol()
+    _smoke_repair_helpers()
     _smoke_visual_preprocessor()
 
     summary = r'''# 泛函分析测试
