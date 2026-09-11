@@ -10,18 +10,59 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.pdf.latex_preprocessor import compose_course_markdown
+from src.pdf.latex_preprocessor import compose_course_markdown, preprocess_markdown
 from src.pdf.latex_renderer import render_markdown_pdf
-from src.pdf.latex_repairer import compiler_error_line
+from src.pdf.latex_repairer import apply_repair_patch, parse_repair_patch
 
 
-def _smoke_repair_diagnostic() -> None:
-    log = "warning: something\nerror: notes.tex:296: Missing \\right. inserted\n"
-    assert compiler_error_line(log) == 296
+def _smoke_patch_protocol() -> None:
+    """Validate the LLM patch protocol without requiring any API secret in CI."""
+    source = "\n".join(
+        [
+            r"before",
+            r"\[L^p(X,\mu)=\left\{f\]",
+            r"为 $X$ 上可测函数且",
+            r"\[\int_X |f|^p\,d\mu<\infty\right\}.\]",
+            r"after",
+        ]
+    ) + "\n"
+    response = r'''<<<START_LINE>>>2<<<END_START_LINE>>>
+<<<END_LINE>>>4<<<END_END_LINE>>>
+<<<REPLACEMENT>>>
+\[
+L^p(X,\mu)=\left\{f\text{ 为 }X\text{ 上可测函数且 }\int_X|f|^p\,d\mu<\infty\right\}.
+\]
+<<<END_REPLACEMENT>>>'''
+    patch = parse_repair_patch(response)
+    assert patch is not None
+    repaired, before = apply_repair_patch(source, patch)
+    assert r"\left\{" in repaired and r"\right\}" in repaired
+    assert "为" in repaired and "可测函数且" in repaired
+    assert r"\[L^p" in before
+    assert repaired.endswith("after\n")
+
+
+def _smoke_visual_preprocessor() -> None:
+    """Cover visual-math forms seen in real model output."""
+    raw = r'''inline: <span data-visual-restored="true">〔视觉补全〕$ d(x_n, x_m) < \varepsilon $</span>
+
+block: <span data-visual-restored="true">〔视觉补全〕$$
+\text{泛函分析} \\
+\int_X |f|^p\,d\mu < \infty
+$$</span>
+
+bare: <span data-visual-restored="true">〔视觉补全〕\Rightarrow \forall n\in\mathbb{N}, x_n\to 0</span>
+'''
+    cooked = preprocess_markdown(raw)
+    assert "〔视觉补全〕" not in cooked
+    assert "$d(x_n, x_m) < \\varepsilon$" in cooked
+    assert "::: {.visual-restored-block}" in cooked
+    assert "$\\Rightarrow \\forall n\\in\\mathbb{N}, x_n\\to 0$" in cooked
 
 
 def main() -> int:
-    _smoke_repair_diagnostic()
+    _smoke_patch_protocol()
+    _smoke_visual_preprocessor()
 
     summary = r'''# 泛函分析测试
 
@@ -43,7 +84,13 @@ $$
 
 ## 03:00–06:00
 
-对称性：<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕$d(x,y)=d(y,x)$</span>。
+对称性：<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕$ d(x,y)=d(y,x) $</span>。
+
+<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕$$
+\int_X |f|^p\,d\mu < \infty
+$$</span>
+
+于是 <span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕\Rightarrow \forall n\in\mathbb{N}, x_n\to 0</span>。
 '''
     markdown = compose_course_markdown(
         summary,
