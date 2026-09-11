@@ -14,10 +14,10 @@ import json
 from datetime import datetime
 
 
-# v2 aligns proofreading chunks to the same 3-minute windows used by summary
-# provenance. Bumping the prefix prevents reuse of any earlier 4-minute cache.
-PROOFREAD_MODEL_PREFIX = "proofread-transcript-v2/"
-PROOFREAD_BOARD_MODEL_PREFIX = "proofread-transcript-v2-board/"
+# v3 adds course-aware terminology repair.  Bumping the prefix prevents stale
+# v2 transcripts (including known homophone errors) from being reused.
+PROOFREAD_MODEL_PREFIX = "proofread-transcript-v3/"
+PROOFREAD_BOARD_MODEL_PREFIX = "proofread-transcript-v3-board/"
 
 
 def _loads_segments(value: str | None) -> list[dict] | None:
