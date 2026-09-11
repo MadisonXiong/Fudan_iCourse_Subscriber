@@ -5,6 +5,7 @@ from unittest.mock import patch
 from src.ai.math_transcript_enhancer import (
     MathTranscriptEnhancer,
     _clauses_preserved,
+    _comparison_text,
     _correct_high_confidence_asr,
     _has_formula_evidence,
     _source_coverage,
@@ -14,6 +15,11 @@ from src.api.emailer import Emailer
 from src.data.math_transcript_store import (
     MATH_TRANSCRIPT_VERSION,
     source_fingerprint,
+)
+from scripts.resend_processed import (
+    _estimated_duration,
+    _raw_transcript_markdown,
+    _reconstruct_timed_segments,
 )
 
 
@@ -155,6 +161,30 @@ def main() -> None:
             {"sub_id": "lecture-1", "course_title": "泛函分析"}
         )
     assert appendix == faithful_markdown
+
+    legacy = (
+        "首先介绍课程要求。作业每周提交一次。"
+        + "这一段旧版转写没有任何标点但仍然必须完整保存" * 20
+    )
+    duration = _estimated_duration(
+        legacy,
+        "**视频定位：01:36:00–01:45:00**",
+        [{"created_sec": 7200}],
+        "#### 02:30:00\n板书",
+    )
+    assert duration == 9000
+    rebuilt = _reconstruct_timed_segments(legacy, duration)
+    assert rebuilt
+    assert max(len(segment["text"]) for segment in rebuilt) <= 160
+    assert rebuilt[0]["start_ms"] == 0
+    assert rebuilt[-1]["end_ms"] == duration * 1000
+    assert all(
+        left["end_ms"] < right["start_ms"]
+        for left, right in zip(rebuilt, rebuilt[1:])
+    )
+    assert _comparison_text("".join(x["text"] for x in rebuilt)) == _comparison_text(legacy)
+    fallback = _raw_transcript_markdown(rebuilt)
+    assert all(segment["text"] in fallback for segment in rebuilt)
     print("math transcript v5 smoke checks passed")
 
 

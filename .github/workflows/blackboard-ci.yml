@@ -52,6 +52,9 @@ jobs:
           XDG_CACHE_HOME: ${{ github.workspace }}/.cache
         run: python scripts/smoke_latex_pdf.py
 
+      - name: Smoke-test complete transcript appendix and historical fallback
+        run: python scripts/smoke_math_transcript_enhancer.py
+
       - name: Smoke-test blackboard parser, schema, and DB merge
         run: |
           python - <<'PY'
