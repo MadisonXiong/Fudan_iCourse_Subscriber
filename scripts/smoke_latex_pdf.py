@@ -11,6 +11,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.pdf.latex_layout_repairer import (
+    _deterministic_relation_reflow,
     _validate_replacement,
     overflow_score,
     overfull_issues,
@@ -35,6 +36,22 @@ def _smoke_repair_helpers() -> None:
     issues = overfull_issues(overflow_log, min_pt=24)
     assert [round(item.width_pt, 3) for item in issues] == [278.605, 194.918]
     assert round(overflow_score(overflow_log), 3) == 473.523
+
+    real_tex_log = "Overfull \\hbox (194.91815pt too wide) detected at line 122"
+    real_issues = overfull_issues(real_tex_log, min_pt=24)
+    assert [(item.line, round(item.width_pt, 3)) for item in real_issues] == [
+        (122, 194.918)
+    ]
+
+    fourier = r'''\[
+\frac{1}{2\pi}\int_0^{2\pi}e^{-int}\left(\int_0^{2\pi}K(s,t)x(s)\,ds\right)dt
+\Rightarrow 2\pi C_n=\int_0^{2\pi}\int_0^{2\pi}K(s,t)e^{-int}\left(\sum_{p\in\mathbb Z}a_pe^{ipt}\right)ds\,dt
+=\sum_{p\in\mathbb Z}a_p\left(\int_0^{2\pi}\int_0^{2\pi}K(s,t)e^{ipt-int}ds\,dt\right)
+\]'''
+    reflowed = _deterministic_relation_reflow(fourier)
+    assert reflowed is not None
+    assert r"\begin{multlined}" in reflowed
+    _validate_replacement(fourier, reflowed)
 
     before = r'''\[
 A=B+C+D+E+F+G
@@ -111,10 +128,19 @@ $$</span>
 
 于是 <span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕\Rightarrow \forall n\in\mathbb{N}, x_n\to 0</span>。
 '''
+    faithful_transcript = r'''# AI 校订语音转写
+
+## 00:00–03:00
+
+这是经大语言模型校订后保留的完整语音转写，必须出现在 PDF 中。
+'''
     markdown = compose_course_markdown(
         summary,
+        faithful_transcript=faithful_transcript,
         math_transcript=math_transcript,
     )
+    assert "AI 校订语音转写" in markdown
+    assert markdown.index("AI 校订语音转写") < markdown.index("数学增强语音转写")
     pdf = render_markdown_pdf(
         markdown,
         title="泛函分析",

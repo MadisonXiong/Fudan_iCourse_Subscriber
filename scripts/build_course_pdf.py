@@ -27,14 +27,22 @@ def main() -> int:
     parser.add_argument("--subtitle", default="")
     parser.add_argument("--date", default="")
     parser.add_argument("--math-transcript", type=Path)
+    parser.add_argument("--faithful-transcript", type=Path)
     args = parser.parse_args()
 
     summary = args.input.read_text(encoding="utf-8")
     math_transcript = ""
     if args.math_transcript:
         math_transcript = args.math_transcript.read_text(encoding="utf-8")
+    faithful_transcript = ""
+    if args.faithful_transcript:
+        faithful_transcript = args.faithful_transcript.read_text(encoding="utf-8")
 
-    md = compose_course_markdown(summary, math_transcript=math_transcript)
+    md = compose_course_markdown(
+        summary,
+        faithful_transcript=faithful_transcript,
+        math_transcript=math_transcript,
+    )
     pdf = render_markdown_pdf(
         md,
         title=args.title,

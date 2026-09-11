@@ -25,9 +25,14 @@ _TIMEOUT = int(os.environ.get("FICS_LATEX_LAYOUT_TIMEOUT", "120"))
 _MIN_OVERFULL_PT = float(os.environ.get("FICS_LATEX_LAYOUT_MIN_OVERFULL_PT", "24"))
 _MAX_BLOCK_LINES = max(8, int(os.environ.get("FICS_LATEX_LAYOUT_MAX_BLOCK_LINES", "80")))
 
-_OVERFULL_RE = re.compile(
+_OVERFULL_PREFIX_RE = re.compile(
     r"(?:warning:\s*)?(?:notes\.tex|[^\s/:]+\.tex):(\d+):\s*"
     r"Overfull \\hbox \(([0-9]+(?:\.[0-9]+)?)pt too wide\)",
+    re.I,
+)
+_OVERFULL_TEX_LOG_RE = re.compile(
+    r"Overfull \\hbox \(([0-9]+(?:\.[0-9]+)?)pt too wide\)"
+    r"[^\n]*?at lines?\s+(\d+)",
     re.I,
 )
 _CODE_FENCE_RE = re.compile(r"```(?:latex|tex)?\s*\n?(.*?)\n?```", re.I | re.S)
@@ -97,11 +102,18 @@ class LayoutRepairResult:
 
 
 def overfull_issues(output: str, *, min_pt: float = 0.0) -> list[OverfullIssue]:
-    issues = [
-        OverfullIssue(line=int(line), width_pt=float(width))
-        for line, width in _OVERFULL_RE.findall(str(output or ""))
+    raw = str(output or "")
+    pairs = {
+        (int(line), float(width))
+        for line, width in _OVERFULL_PREFIX_RE.findall(raw)
         if float(width) >= float(min_pt)
-    ]
+    }
+    pairs.update(
+        (int(line), float(width))
+        for width, line in _OVERFULL_TEX_LOG_RE.findall(raw)
+        if float(width) >= float(min_pt)
+    )
+    issues = [OverfullIssue(line=line, width_pt=width) for line, width in pairs]
     return sorted(issues, key=lambda item: item.width_pt, reverse=True)
 
 
@@ -197,6 +209,109 @@ def _validate_replacement(before: str, replacement: str) -> None:
         raise LatexLayoutRepairError("layout replacement did not introduce a line-breaking construct")
 
 
+_RELATIONS = (r"\Longleftrightarrow", r"\Longrightarrow", r"\Leftrightarrow", r"\Rightarrow", "=")
+_MAX_REFLOW_SOURCE_CHARS = 112
+
+
+def _top_level_relation_positions(body: str) -> list[int]:
+    """Locate relation tokens outside braces and delimiter pairs."""
+    positions: list[int] = []
+    brace_depth = 0
+    delimiter_depth = 0
+    i = 0
+    while i < len(body):
+        char = body[i]
+        if char == "{" and (i == 0 or body[i - 1] != "\\"):
+            brace_depth += 1
+            i += 1
+            continue
+        if char == "}" and (i == 0 or body[i - 1] != "\\"):
+            brace_depth = max(0, brace_depth - 1)
+            i += 1
+            continue
+        if char in "([" and (i == 0 or body[i - 1] != "\\"):
+            delimiter_depth += 1
+            i += 1
+            continue
+        if char in ")]" and (i == 0 or body[i - 1] != "\\"):
+            delimiter_depth = max(0, delimiter_depth - 1)
+            i += 1
+            continue
+        if brace_depth == 0 and delimiter_depth == 0:
+            token = next((value for value in _RELATIONS if body.startswith(value, i)), None)
+            if token is not None:
+                positions.append(i)
+                i += len(token)
+                continue
+        i += 1
+    return positions
+
+
+def _top_level_left_positions(body: str) -> list[int]:
+    r"""Locate top-level ``\left`` groups that are safe continuation points."""
+    positions: list[int] = []
+    brace_depth = 0
+    delimiter_depth = 0
+    i = 0
+    while i < len(body):
+        if brace_depth == 0 and delimiter_depth == 0 and body.startswith(r"\left", i):
+            positions.append(i)
+        char = body[i]
+        if char == "{" and (i == 0 or body[i - 1] != "\\"):
+            brace_depth += 1
+        elif char == "}" and (i == 0 or body[i - 1] != "\\"):
+            brace_depth = max(0, brace_depth - 1)
+        elif char in "([" and (i == 0 or body[i - 1] != "\\"):
+            delimiter_depth += 1
+        elif char in ")]" and (i == 0 or body[i - 1] != "\\"):
+            delimiter_depth = max(0, delimiter_depth - 1)
+        i += 1
+    return positions
+
+
+def _split_long_piece(piece: str) -> list[str]:
+    """Split a long product before a top-level parenthesized factor."""
+    if len(piece) <= _MAX_REFLOW_SOURCE_CHARS:
+        return [piece]
+    candidates = [
+        pos for pos in _top_level_left_positions(piece)
+        if 16 <= pos <= len(piece) - 16
+    ]
+    if not candidates:
+        return [piece]
+    midpoint = len(piece) / 2
+    split_at = min(candidates, key=lambda pos: abs(pos - midpoint))
+    return [piece[:split_at].rstrip(), piece[split_at:].lstrip()]
+
+
+def _deterministic_relation_reflow(block: str) -> str | None:
+    """Break a long relation chain without changing its mathematical tokens."""
+    match = re.fullmatch(r"\s*\\\[\s*(.*?)\s*\\\]\s*", str(block or ""), re.S)
+    if not match or _STRUCTURED_MATH.search(block):
+        return None
+    body = match.group(1).strip()
+    if len(body) < 140:
+        return None
+    positions = [pos for pos in _top_level_relation_positions(body) if pos > 0]
+    if not positions:
+        return None
+    relation_pieces = [body[:positions[0]].rstrip()]
+    relation_pieces.extend(
+        body[start:stop].strip()
+        for start, stop in zip(positions, positions[1:] + [len(body)])
+    )
+    pieces = [part for piece in relation_pieces for part in _split_long_piece(piece)]
+    if any(not piece for piece in pieces):
+        return None
+    replacement = (
+        "\\[\n\\begin{multlined}\n"
+        + " \\\\\n".join(pieces)
+        + "\n\\end{multlined}\n\\]"
+    )
+    _validate_replacement(block, replacement)
+    return replacement
+
+
 def _apply_block(tex: str, start: int, end: int, replacement: str) -> str:
     lines = str(tex or "").splitlines()
     new_lines = lines[: start - 1] + replacement.splitlines() + lines[end:]
@@ -246,6 +361,22 @@ def repair_overfull_math(tex: str, compiler_output: str) -> LayoutRepairResult:
         raise LatexLayoutRepairError("no severe repairable display-math overflow was found")
 
     issue, start, end, before = selected
+    deterministic = _deterministic_relation_reflow(before)
+    if deterministic is not None:
+        return LayoutRepairResult(
+            tex=_apply_block(tex, start, end, deterministic),
+            audit=LayoutAudit(
+                model="deterministic-relation-reflow",
+                compiler_line=issue.line,
+                overflow_pt=issue.width_pt,
+                start_line=start,
+                end_line=end,
+                before=before,
+                replacement=deterministic,
+                raw_response="",
+                elapsed_sec=0.0,
+            ),
+        )
     prompt = (
         f"Tectonic 报告该公式约超出页面 {issue.width_pt:.1f}pt。\n"
         f"原文件第 {start}--{end} 行：\n"
