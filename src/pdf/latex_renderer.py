@@ -90,6 +90,22 @@ def _run_capture(command: list[str], *, cwd: Path) -> tuple[int, str]:
     return int(proc.returncode), proc.stdout or ""
 
 
+def _with_tex_log(output: str, workdir: Path) -> str:
+    """Combine Tectonic stdout with the real TeX log diagnostics.
+
+    Tectonic's process output can omit non-fatal ``Overfull \\hbox`` warnings;
+    they are still present in ``notes.log``.  Layout repair must inspect both.
+    """
+    log_path = workdir / "notes.log"
+    if not log_path.exists():
+        return str(output or "")
+    try:
+        tex_log = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return str(output or "")
+    return str(output or "") + "\n\n--- notes.log ---\n" + tex_log
+
+
 def _run(command: list[str], *, cwd: Path, label: str) -> str:
     returncode, output = _run_capture(command, cwd=cwd)
     if returncode != 0:
@@ -233,7 +249,11 @@ def _apply_layout_repairs(
         tex_path.write_text(candidate_tex, encoding="utf-8")
         if pdf_path.exists():
             pdf_path.unlink()
+        log_path = workdir / "notes.log"
+        if log_path.exists():
+            log_path.unlink()
         returncode, candidate_output = _run_capture(tectonic_cmd, cwd=workdir)
+        candidate_output = _with_tex_log(candidate_output, workdir)
         outputs.append(candidate_output)
 
         candidate_ok = returncode == 0 and pdf_path.exists() and pdf_path.stat().st_size >= 1000
@@ -342,7 +362,11 @@ def render_markdown_pdf(
             for compile_index in range(max_repairs + 1):
                 if pdf_path.exists():
                     pdf_path.unlink()
+                log_path = workdir / "notes.log"
+                if log_path.exists():
+                    log_path.unlink()
                 returncode, tectonic_output = _run_capture(tectonic_cmd, cwd=workdir)
+                tectonic_output = _with_tex_log(tectonic_output, workdir)
                 compiler_outputs.append(tectonic_output)
 
                 if returncode == 0:
@@ -423,7 +447,7 @@ def render_markdown_pdf(
 
 
 def build_course_pdf(item: dict, *, math_transcript: str = "") -> bytes:
-    """Build one complete reading PDF while keeping faithful ASR separate."""
+    """Build one complete PDF containing notes and the full proofread ASR."""
     course = str(item.get("course_title") or "课程")
     sub = str(item.get("sub_title") or "课堂")
     date = str(item.get("date") or "")
@@ -433,6 +457,7 @@ def build_course_pdf(item: dict, *, math_transcript: str = "") -> bytes:
 
     markdown_text = compose_course_markdown(
         summary,
+        faithful_transcript=str(item.get("transcript_attachment") or ""),
         math_transcript=str(math_transcript or ""),
     )
     return render_markdown_pdf(

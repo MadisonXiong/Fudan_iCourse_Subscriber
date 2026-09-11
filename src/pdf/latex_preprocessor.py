@@ -130,15 +130,23 @@ def preprocess_markdown(text: str) -> str:
 def compose_course_markdown(
     summary: str,
     *,
+    faithful_transcript: str = "",
     math_transcript: str = "",
 ) -> str:
     """Build the Markdown body for one course-note PDF.
 
-    The faithful ASR transcript intentionally stays outside the PDF as a separate
-    audit attachment. Only the evidence-constrained math-enhanced transcript is
-    appended to the reading PDF.
+    The full AI-proofread transcript is part of the PDF and is also kept as a
+    separate audit attachment by ``Emailer``.  Functional Analysis may append a
+    second, visually enhanced reading transcript afterwards.
     """
     parts = [preprocess_markdown(summary)]
+    if str(faithful_transcript or "").strip():
+        parts.extend(
+            [
+                "\\newpage",
+                preprocess_markdown(faithful_transcript),
+            ]
+        )
     if str(math_transcript or "").strip():
         parts.extend(
             [
