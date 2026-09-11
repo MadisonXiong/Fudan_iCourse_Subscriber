@@ -1,8 +1,9 @@
-"""Resend already-processed lecture emails without invoking ASR/OCR/LLMs.
+"""Resend already-processed lecture emails without rerunning ASR/OCR/summaries.
 
-This script is deliberately read-only with respect to lecture processing state.
-It loads stored summaries and durable proofread transcript attachments from the
-SQLite database and sends them again to the current RECEIVER_EMAIL.
+Stored summaries and faithful proofread transcripts are reused.  Functional
+Analysis may additionally build the evidence-constrained math-enhanced transcript
+once if its durable cache is absent; that optional enhancement is then persisted
+by the resend workflow for future zero-cost reuse.
 """
 
 from __future__ import annotations
@@ -89,9 +90,8 @@ def main() -> int:
     failures = 0
     attachment_count = 0
 
-    # Send one lecture per message.  Large math-heavy lectures can contain
-    # hundreds of inline CID images; batching every historical lecture into a
-    # single MIME message can exceed provider/client size limits.
+    # One lecture per message keeps each PDF/transcript pair independently
+    # deliverable and avoids recreating the oversized historical MIME messages.
     for index, row in enumerate(rows, start=1):
         item = _email_item(db, row)
         if item.get("transcript_attachment"):
