@@ -15,6 +15,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      XDG_CACHE_HOME: ${{ github.workspace }}/.cache
 
     steps:
       - uses: actions/checkout@v4
@@ -35,11 +37,24 @@ jobs:
         if: steps.cache-pip.outputs.cache-hit != 'true'
         run: pip install -r requirements.txt
 
-      - name: Install ffmpeg
+      - name: Cache Tectonic bundle
+        uses: actions/cache@v4
+        with:
+          path: .cache/Tectonic
+          key: tectonic-bundle-0.16.9-v1-${{ runner.os }}
+
+      - name: Install ffmpeg and native LaTeX PDF toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
+          sudo apt-get install -y ffmpeg pandoc fonts-noto-cjk
+          curl -L --fail --retry 3 \
+            -o /tmp/tectonic.tar.gz \
+            'https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.16.9/tectonic-0.16.9-x86_64-unknown-linux-gnu.tar.gz'
+          echo 'f3c825128095dc3399ea11c08c18035b33050a216930c295c79e8eb11bd21de4  /tmp/tectonic.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/tectonic.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/tectonic /usr/local/bin/tectonic
+          tectonic --version
+          pandoc --version | head -n 1
 
       - name: Cache ASR models
         id: cache-models
@@ -163,6 +178,15 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
         run: python -u main.py
+
+      - name: Upload LaTeX debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latex-debug-${{ github.run_id }}
+          path: artifacts/latex-debug/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Deploy database to data branch
         if: always()
