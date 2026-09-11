@@ -447,7 +447,7 @@ def render_markdown_pdf(
 
 
 def build_course_pdf(item: dict, *, math_transcript: str = "") -> bytes:
-    """Build one complete PDF containing notes and the full proofread ASR."""
+    """Build the existing notes PDF, appending the complete enhanced transcript."""
     course = str(item.get("course_title") or "课程")
     sub = str(item.get("sub_title") or "课堂")
     date = str(item.get("date") or "")
@@ -457,7 +457,6 @@ def build_course_pdf(item: dict, *, math_transcript: str = "") -> bytes:
 
     markdown_text = compose_course_markdown(
         summary,
-        faithful_transcript=str(item.get("transcript_attachment") or ""),
         math_transcript=str(math_transcript or ""),
     )
     return render_markdown_pdf(
