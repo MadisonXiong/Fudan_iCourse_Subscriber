@@ -4,8 +4,13 @@ The goal is not to rewrite a lecture into polished prose. It is to correct
 obvious ASR mistakes while preserving what the lecturer actually said and the
 video timeline. Each 3-minute window is proofread independently with nearby PPT
 OCR; Functional Analysis can additionally supply timestamped raw blackboard
-frames as evidence. Every emitted attachment chunk must actually pass an AI
-proofreading call; unreviewed raw ASR is never silently labelled as proofread.
+frames as evidence.
+
+A single unsafe model rewrite must not abort an entire lecture. If a first
+proofreading result changes a window too aggressively, that window is retried
+once with a stricter anti-expansion prompt. If the retry is still unsafe, the
+original ASR is retained verbatim and explicitly marked as an unverified/raw
+fallback rather than being silently labelled as AI-proofread.
 """
 
 from __future__ import annotations
@@ -28,6 +33,8 @@ from src.runtime import config
 _CHUNK_SEC = int(os.environ.get("TRANSCRIPT_PROOFREAD_CHUNK_SEC", "180"))
 _CONTEXT_SEC = 45
 _TIMEOUT = int(os.environ.get("TRANSCRIPT_PROOFREAD_TIMEOUT", "300"))
+_MIN_RATIO = 0.55
+_MAX_RATIO = 1.55
 
 _MODELSCOPE_MODELS = [
     "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -56,6 +63,19 @@ SYSTEM_PROMPT = r"""
 6. 不要添加解释、评价、标题、时间戳、Markdown 列表或“AI 补充”。
 7. 数学符号可使用简洁 LaTeX `$...$`，但不必把所有普通口语强行公式化。
 8. 直接输出校订后的【当前时段】正文，不要说明修改了什么。
+""".strip()
+
+
+STRICT_RETRY_SYSTEM_PROMPT = r"""
+你是“极保守的课堂 ASR 校对器”。上一轮校订因为对原始语音改动过大而被安全检查拒绝。
+
+这一次必须严格执行：
+1. 只修改【当前时段原始 ASR】中明确可由上下文、PPT 或黑板证据确认的错字、术语、英文、人名和标点。
+2. 严禁把 PPT、黑板上的完整定义、定理、公式、证明步骤补进逐字稿，除非原始 ASR 中已经明显说到了对应内容。
+3. 严禁扩写、解释、总结、润色成教材语言；严禁重复前后文。
+4. 尽量保持原始 ASR 的句子数量、信息量和长度。若不确定，宁可保留原 ASR，并在局部加 `[转写存疑]`。
+5. 输出长度原则上应与原始 ASR 接近，不得明显变长或明显变短。
+6. 不要输出标题、时间戳、说明、列表或修改理由，只输出当前时段正文。
 """.strip()
 
 
@@ -133,6 +153,11 @@ def _board_in_window(raw_board: str, start: int, end: int) -> str:
     return joined or "（该时段无可用黑板视觉证据）"
 
 
+def _safe_ratio(source: str, candidate: str) -> tuple[bool, float]:
+    ratio = len(candidate) / max(1, len(source))
+    return _MIN_RATIO <= ratio <= _MAX_RATIO, ratio
+
+
 class TranscriptProofreader:
     def __init__(self):
         resolved = config.resolve_model_providers()
@@ -158,7 +183,7 @@ class TranscriptProofreader:
         if not self.providers:
             raise ValueError("No model provider available for transcript proofreading")
 
-    def _call(self, prompt: str) -> tuple[str, str]:
+    def _call(self, prompt: str, *, system_prompt: str = SYSTEM_PROMPT) -> tuple[str, str]:
         errors: list[str] = []
         for provider_name, client, models in self.providers:
             for model in models:
@@ -168,7 +193,7 @@ class TranscriptProofreader:
                     response = client.chat.completions.create(
                         model=model,
                         messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "system", "content": system_prompt},
                             {"role": "user", "content": prompt},
                         ],
                         temperature=0.05,
@@ -207,6 +232,7 @@ class TranscriptProofreader:
         max_end = max(_segment_bounds(seg)[1] for seg in segments)
         chunks: list[dict] = []
         models: list[str] = []
+        fallback_windows = 0
 
         for start in range(0, max_end + 1, _CHUNK_SEC):
             end = min(max_end, start + _CHUNK_SEC)
@@ -238,20 +264,62 @@ class TranscriptProofreader:
                 f"【同时段 PPT OCR 校对证据】\n{ppt}\n\n"
                 f"【同时段黑板视觉校对证据】\n{board}"
             )
+
             corrected, model = self._call(prompt)
-            ratio = len(corrected) / max(1, len(current))
-            if not (0.55 <= ratio <= 1.55):
-                raise RuntimeError(
-                    "AI proofreading changed a transcript window too aggressively: "
-                    f"{_fmt(start)}–{_fmt(end)}, "
-                    f"{len(current)} -> {len(corrected)} ({ratio:.1%})"
+            safe, ratio = _safe_ratio(current, corrected)
+            fallback = False
+
+            if not safe:
+                print(
+                    "[TranscriptProofreader] unsafe first pass for "
+                    f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
+                    f"{len(corrected)} ({ratio:.1%}); retrying conservatively.",
+                    flush=True,
                 )
-            models.append(model)
+                retry_prompt = (
+                    prompt
+                    + "\n\n【安全重试要求】\n"
+                    + f"原始 ASR 长度为 {len(current)} 个字符。"
+                    + "上一轮输出因改动过大被拒绝。请只做最小必要校正，"
+                    + "不要补充任何板书/PPT 中但原 ASR 没有说出的内容。"
+                )
+                retried, retry_model = self._call(
+                    retry_prompt,
+                    system_prompt=STRICT_RETRY_SYSTEM_PROMPT,
+                )
+                retry_safe, retry_ratio = _safe_ratio(current, retried)
+                models.extend([model, retry_model])
+
+                if retry_safe:
+                    corrected = retried
+                    model = retry_model
+                    ratio = retry_ratio
+                    print(
+                        "[TranscriptProofreader] conservative retry accepted for "
+                        f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
+                        f"{len(corrected)} ({ratio:.1%})",
+                        flush=True,
+                    )
+                else:
+                    fallback = True
+                    fallback_windows += 1
+                    corrected = current
+                    print(
+                        "[TranscriptProofreader] conservative retry still unsafe for "
+                        f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
+                        f"{len(retried)} ({retry_ratio:.1%}); preserving raw ASR "
+                        "and marking this window as unverified instead of aborting lecture.",
+                        flush=True,
+                    )
+            else:
+                models.append(model)
+
             chunks.append(
                 {
                     "start_ms": start * 1000,
                     "end_ms": end * 1000,
                     "text": corrected.strip(),
+                    "proofread_status": "raw_fallback" if fallback else "ai_proofread",
                 }
             )
 
@@ -261,15 +329,21 @@ class TranscriptProofreader:
         markdown_parts = [
             "# AI 校订语音转写",
             "",
-            "> 本附件由原始 ASR 经 AI 结合同时段课件/板书证据校订。AI 只用于纠正明显识别错误；无法可靠判断处标记为 `[转写存疑]`。",
+            "> 本附件以原始 ASR 为底稿，由 AI 结合同时段课件/板书证据校订。AI 只用于纠正明显识别错误；无法可靠判断处尽量保留原文。若某个时段的 AI 校订未通过安全检查，该时段会明确标为“原始 ASR 回退”，不会把可疑扩写伪装成已校订内容。",
             "",
         ]
         for chunk in chunks:
             s = chunk["start_ms"] // 1000
             e = chunk["end_ms"] // 1000
-            markdown_parts.extend(
-                [f"### {_fmt(s)}–{_fmt(e)}", "", chunk["text"], ""]
-            )
+            markdown_parts.extend([f"### {_fmt(s)}–{_fmt(e)}", ""])
+            if chunk.get("proofread_status") == "raw_fallback":
+                markdown_parts.extend(
+                    [
+                        "> ⚠️ 本时段 AI 校订未通过安全检查，以下保留原始 ASR；内容可能存在识别错误。",
+                        "",
+                    ]
+                )
+            markdown_parts.extend([chunk["text"], ""])
 
         prefix = (
             PROOFREAD_BOARD_MODEL_PREFIX
@@ -277,6 +351,13 @@ class TranscriptProofreader:
             else PROOFREAD_MODEL_PREFIX
         )
         model_label = "+".join(dict.fromkeys(models))
+        if fallback_windows:
+            model_label += f"+raw-fallback[{fallback_windows}]"
+            print(
+                f"[TranscriptProofreader] completed with {fallback_windows} raw-ASR "
+                "fallback window(s); all other windows passed AI proofreading.",
+                flush=True,
+            )
         return ProofreadResult(
             markdown="\n".join(markdown_parts).strip(),
             segments=chunks,
