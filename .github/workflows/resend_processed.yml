@@ -9,12 +9,12 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   resend:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Check out resend implementation
@@ -56,12 +56,64 @@ jobs:
           UISPSW: ${{ secrets.UISPSW }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-        run: python scripts/db_shard.py reassemble data/sharded data/icourse.db
+        run: PYTHONPATH=. python scripts/db_shard.py reassemble data/sharded data/icourse.db
 
       - name: Resend stored emails only
         env:
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RESEND_COURSE_IDS: ${{ inputs.course_ids }}
-        run: python -u scripts/resend_processed.py
+        run: PYTHONPATH=. python -u scripts/resend_processed.py
+
+      - name: Persist generated math transcript cache
+        if: always()
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f data/icourse.db ]; then
+            echo "No database file, skipping cache persistence."
+            exit 0
+          fi
+
+          git fetch origin data --depth=1 2>/dev/null || true
+          DEPLOY_DB=data/icourse.db
+          if git rev-parse origin/data >/dev/null 2>&1 && \
+             git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            rm -rf data/remote_sharded
+            mkdir -p data/remote_sharded/shards
+            git show origin/data:data/icourse-index.enc > data/remote_sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/remote_sharded/shards/$base"
+            done
+            python scripts/db_shard.py reassemble data/remote_sharded data/remote.db
+            python scripts/merge_db.py data/icourse.db data/remote.db
+            DEPLOY_DB=data/remote.db
+          fi
+
+          rm -rf data/sharded_out
+          mkdir -p data/sharded_out
+          python scripts/db_shard.py shard "$DEPLOY_DB" data/sharded_out
+
+          rm -rf /tmp/db_resend_deploy
+          mkdir -p /tmp/db_resend_deploy/data/shards
+          cp data/sharded_out/icourse-index.enc /tmp/db_resend_deploy/data/
+          cp data/sharded_out/shards/*.db.gz.enc /tmp/db_resend_deploy/data/shards/
+          cd /tmp/db_resend_deploy
+          git init -q
+          git checkout -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -q -m "chore: persist resend math transcript cache"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --force origin data
