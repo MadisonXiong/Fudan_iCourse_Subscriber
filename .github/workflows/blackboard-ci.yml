@@ -14,8 +14,6 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      XDG_CACHE_HOME: ${{ github.workspace }}/.cache
     steps:
       - uses: actions/checkout@v4
 
@@ -27,19 +25,11 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Cache Tectonic bundle
-        uses: actions/cache@v4
-        with:
-          path: .cache/Tectonic
-          key: tectonic-bundle-0.16.9-v1-${{ runner.os }}
-
       - name: Install native LaTeX PDF toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y pandoc fonts-noto-cjk
-          curl -L --fail --retry 3 \
-            -o /tmp/tectonic.tar.gz \
-            'https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.16.9/tectonic-0.16.9-x86_64-unknown-linux-gnu.tar.gz'
+          curl -L --fail --retry 3 -o /tmp/tectonic.tar.gz 'https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.16.9/tectonic-0.16.9-x86_64-unknown-linux-gnu.tar.gz'
           echo 'f3c825128095dc3399ea11c08c18035b33050a216930c295c79e8eb11bd21de4  /tmp/tectonic.tar.gz' | sha256sum -c -
           tar -xzf /tmp/tectonic.tar.gz -C /tmp
           sudo install -m 0755 /tmp/tectonic /usr/local/bin/tectonic
@@ -52,45 +42,9 @@ jobs:
           python -c "import main"
 
       - name: Smoke-test native LaTeX PDF pipeline
-        run: |
-          python - <<'PY'
-          from src.pdf.latex_preprocessor import compose_course_markdown
-          from src.pdf.latex_renderer import render_markdown_pdf
-
-          summary = r'''# 泛函分析测试
-
-设 $X$ 为非空集合，若
-
-$$
-d(x,z) \le d(x,y)+d(y,z),
-$$
-
-则满足三角不等式。
-
-<div data-ai-note="true" style="color:#6d28d9;"><strong>AI 补充</strong><br>
-这里的公式应由 Tectonic 原生排版，而不是 PNG。
-</div>
-
-**视频定位：00:03:00–00:06:00**
-'''
-          math_transcript = r'''# 数学增强语音转写
-
-## 03:00–06:00
-
-对称性：<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕$d(x,y)=d(y,x)$</span>。
-'''
-          md = compose_course_markdown(summary, math_transcript=math_transcript)
-          pdf = render_markdown_pdf(
-              md,
-              title="泛函分析",
-              subtitle="CI 测试",
-              date="2026-09-11",
-              debug_id="ci-native-latex",
-          )
-          assert pdf.startswith(b"%PDF")
-          assert len(pdf) > 5000
-          print(f"native LaTeX PDF smoke test: {len(pdf)} bytes")
-          PY
+        env:
+          XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+        run: python scripts/smoke_latex_pdf.py
 
       - name: Smoke-test blackboard parser, schema, and DB merge
         run: |
@@ -98,11 +52,7 @@ $$
           import os
           import tempfile
 
-          from src.ai.blackboard_vision import (
-              BlackboardVision,
-              VisionFrame,
-              course_requires_blackboard,
-          )
+          from src.ai.blackboard_vision import BlackboardVision, VisionFrame, course_requires_blackboard
           from src.data.blackboard_store import save_blackboard
           from src.data.database import Database
           from scripts.merge_db import merge
@@ -113,9 +63,7 @@ $$
 
           frames = [VisionFrame(frame_id=1, timestamp_sec=30, path="unused.jpg")]
           parsed = BlackboardVision._parse_response(
-              "<<<FRAME id=1 ts=30 status=board>>>\n"
-              "$$x_n \\rightharpoonup x$$\n"
-              "<<<END_FRAME>>>",
+              "<<<FRAME id=1 ts=30 status=board>>>\n$$x_n \\rightharpoonup x$$\n<<<END_FRAME>>>",
               frames,
               "test-model",
           )
@@ -125,34 +73,17 @@ $$
           with tempfile.TemporaryDirectory() as td:
               local_path = os.path.join(td, "local.db")
               remote_path = os.path.join(td, "remote.db")
-
               local = Database(local_path)
               local.upsert_course("1", "泛函分析", "Teacher")
               local.insert_lecture("10", "1", "lecture", "2026-09-09")
-              save_blackboard(
-                  local,
-                  "10",
-                  "### 黑板板书 LaTeX 转写\n\n$$x_n \\rightharpoonup x$$",
-                  "test-model",
-              )
+              save_blackboard(local, "10", "### 黑板板书 LaTeX 转写\n\n$$x_n \\rightharpoonup x$$", "test-model")
               local.conn.close()
-
               remote = Database(remote_path)
               remote.conn.close()
               merge(local_path, remote_path)
-
               check = Database(remote_path)
               row = check.get_lecture("10")
               assert row["blackboard_latex"]
               assert row["blackboard_model"] == "test-model"
               check.conn.close()
           PY
-
-      - name: Upload LaTeX debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: latex-debug-${{ github.run_id }}
-          path: artifacts/latex-debug/
-          if-no-files-found: ignore
-          retention-days: 7
