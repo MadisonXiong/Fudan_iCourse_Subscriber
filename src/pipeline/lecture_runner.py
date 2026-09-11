@@ -205,6 +205,7 @@ class LectureRunner:
         transcript_segments: list[dict] | None,
         ppt_pages: list[dict],
         *,
+        course_title: str = "",
         raw_blackboard: str = "",
     ) -> tuple[str, list[dict], str]:
         """Return durable AI-proofread transcript and timed chunks."""
@@ -233,6 +234,7 @@ class LectureRunner:
         result = self._proofreader.proofread(
             transcript_segments,
             ppt_pages,
+            course_title=course_title,
             raw_blackboard=raw_blackboard,
         )
         save_proofread(
@@ -256,6 +258,7 @@ class LectureRunner:
                 sub_id,
                 transcript_segments,
                 kept_pages,
+                course_title=course_title,
             )
             corrected_flat = " ".join(
                 str(seg.get("text") or "").strip()
