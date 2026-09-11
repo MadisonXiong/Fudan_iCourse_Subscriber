@@ -187,7 +187,10 @@ def _ensure_proofread(
             flush=True,
         )
     if not segments:
-        return "", [], proofreader
+        raise RuntimeError(
+            f"historical lecture {sub_id} has no persisted ASR text or timing segments; "
+            "refusing to send a PDF without the required transcript appendix"
+        )
 
     fallback_markdown = _raw_transcript_markdown(segments)
     try:
