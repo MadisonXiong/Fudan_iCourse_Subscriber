@@ -1,7 +1,7 @@
 """Durable cache for evidence-constrained math-enhanced transcripts.
 
 The project currently preserves selected SQLite ``meta`` prefixes when concurrent
-workflow databases are merged.  To avoid a schema migration while keeping the
+workflow databases are merged. To avoid a schema migration while keeping the
 new transcript durable, this cache intentionally uses the already-preserved
 ``blackboard_cache_blob:`` namespace with a more specific sub-prefix.
 """
@@ -13,8 +13,8 @@ import json
 from datetime import datetime
 
 
-MATH_TRANSCRIPT_VERSION = 1
-_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v1:"
+MATH_TRANSCRIPT_VERSION = 2
+_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v2:"
 
 
 def source_fingerprint(
@@ -37,10 +37,7 @@ def source_fingerprint(
     )
     digest.update(b"\0ppt\0")
     compact_pages = [
-        {
-            "created_sec": page.get("created_sec"),
-            "text": page.get("text"),
-        }
+        {"created_sec": page.get("created_sec"), "text": page.get("text")}
         for page in (ppt_pages or [])
     ]
     digest.update(
