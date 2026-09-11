@@ -28,6 +28,15 @@ function Div(el)
     return out
   end
 
+  if has_class(el.classes, "visual-restored-block") then
+    local out = {pandoc.RawBlock("latex", "\\begin{visualrestoreblock}")}
+    for _, block in ipairs(el.content) do
+      table.insert(out, block)
+    end
+    table.insert(out, pandoc.RawBlock("latex", "\\end{visualrestoreblock}"))
+    return out
+  end
+
   return nil
 end
 
