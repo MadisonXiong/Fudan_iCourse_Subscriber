@@ -1,12 +1,16 @@
 """Offline smoke checks for course-aware math transcript enhancement."""
 
+from unittest.mock import patch
+
 from src.ai.math_transcript_enhancer import (
     MathTranscriptEnhancer,
     _clauses_preserved,
     _correct_high_confidence_asr,
+    _has_formula_evidence,
     _source_coverage,
     _valid_candidate,
 )
+from src.api.emailer import Emailer
 from src.data.math_transcript_store import (
     MATH_TRANSCRIPT_VERSION,
     source_fingerprint,
@@ -19,6 +23,16 @@ class _UnavailableEnhancer(MathTranscriptEnhancer):
 
     def _call(self, prompt: str):
         raise RuntimeError("offline smoke test")
+
+
+class _BrokenEnhancer:
+    def enhance(self, *args, **kwargs):
+        raise RuntimeError("enhancement unavailable")
+
+
+class _FakeDb:
+    def get_done_ppt_pages(self, sub_id: str):
+        return []
 
 
 def main() -> None:
@@ -44,10 +58,13 @@ def main() -> None:
     assert "【课程名称】泛函分析" in prompt
     assert "前一段提到实变函数" in prompt
     assert "后一段继续讨论赋范空间" in prompt
-    assert "前一时段黑板上下文" in prompt
+    assert "最近前序板书证据" in prompt
     assert "泛函分析与实变函数" in prompt
     assert "本 CHUNK 的 PPT OCR 证据" in prompt
-    assert MATH_TRANSCRIPT_VERSION == 4
+    prior_board = "#### 00:00\n$x+y=0$"
+    assert not _has_formula_evidence("下面继续讲。", [], prior_board, 1, 2)
+    assert _has_formula_evidence("刚才这个式子很重要。", [], prior_board, 1, 2)
+    assert MATH_TRANSCRIPT_VERSION == 5
     fp_a = source_fingerprint("泛函分析", "稿", source, [], "")
     fp_b = source_fingerprint("高等数理统计", "稿", source, [], "")
     assert fp_a != fp_b
@@ -118,8 +135,27 @@ def main() -> None:
     assert "办案分析" not in result.markdown
     assert "十遍函数" not in result.markdown
     assert "data-visual-restored" not in result.markdown
-    assert result.model_label.startswith("math-transcript-v4/")
-    print("math transcript v4 smoke checks passed")
+    assert "完整课堂语音转写" in result.markdown
+    assert result.model_label.startswith("math-transcript-v5/")
+
+    faithful_markdown = "# AI 校订语音转写\n\n完整老师讲述。"
+    emailer = object.__new__(Emailer)
+    emailer._db = _FakeDb()
+    emailer._math_enhancer = _BrokenEnhancer()
+    with (
+        patch(
+            "src.api.emailer.load_proofread",
+            return_value=(faithful_markdown, source, "proofread-v2"),
+        ),
+        patch("src.api.emailer.course_requires_blackboard", return_value=True),
+        patch("src.api.emailer.get_blackboard", return_value=None),
+        patch("src.api.emailer.load_math_transcript", return_value=None),
+    ):
+        appendix = emailer._complete_transcript(
+            {"sub_id": "lecture-1", "course_title": "泛函分析"}
+        )
+    assert appendix == faithful_markdown
+    print("math transcript v5 smoke checks passed")
 
 
 if __name__ == "__main__":

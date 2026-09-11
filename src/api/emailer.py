@@ -4,10 +4,10 @@ Email bodies stay intentionally small.  Complete notes are compiled by Pandoc +
 Tectonic into native vector PDFs, so mathematical expressions remain real LaTeX
 until the final document is typeset; no formula PNG/CID pipeline is involved.
 
-For Functional Analysis, the PDF also contains a separate math-enhanced timed
-transcript.  It may restore ASR-lost formulas only from same-window PPT/board
-evidence. The faithful AI-proofread transcript remains attached independently
-for audit.
+Every PDF appends the complete AI-proofread classroom transcript after the
+existing notes. Functional Analysis additionally receives contextual ASR
+correction and evidence-constrained formula restoration. The conservative
+proofread transcript remains attached independently for audit.
 """
 
 from __future__ import annotations
@@ -75,20 +75,24 @@ class Emailer:
             self._db = Database()
         return self._db
 
-    def _math_transcript(self, item: dict) -> str:
-        """Return cached/generated evidence-constrained math transcript when applicable."""
+    def _complete_transcript(self, item: dict) -> str:
+        """Return the mandatory complete transcript appendix for this PDF."""
         course_title = str(item.get("course_title") or "")
         sub_id = str(item.get("sub_id") or "")
-        if not sub_id or not course_requires_blackboard(course_title):
-            return ""
+        stored_markdown = str(item.get("transcript_attachment") or "").strip()
+        if not sub_id:
+            return stored_markdown
 
         db = self._database()
         proofread = load_proofread(db, sub_id)
         if not proofread:
-            return ""
+            return stored_markdown
         proofread_markdown, proofread_segments, _ = proofread
+        proofread_markdown = str(proofread_markdown or stored_markdown).strip()
+        if not course_requires_blackboard(course_title):
+            return proofread_markdown
         if not proofread_segments:
-            return ""
+            return proofread_markdown
 
         board_cached = get_blackboard(db, sub_id)
         raw_blackboard = board_cached[0] if board_cached else ""
@@ -139,18 +143,19 @@ class Emailer:
             )
             return result.markdown
         except Exception as exc:
-            # Delivery must still succeed if the optional enhancement API is down.
+            # The transcript appendix is mandatory. If enhancement is down,
+            # preserve the complete AI-proofread text rather than omitting it.
             print(
-                f"[Emailer] Math enhancement unavailable; PDF will contain the "
-                f"stored course notes only: {type(exc).__name__}: {exc}",
+                f"[Emailer] Math enhancement unavailable; preserving the complete "
+                f"AI-proofread transcript appendix: {type(exc).__name__}: {exc}",
                 flush=True,
             )
-            return ""
+            return proofread_markdown
 
     def _build_pdf(self, item: dict) -> tuple[bytes | None, str]:
-        math_transcript = self._math_transcript(item)
+        complete_transcript = self._complete_transcript(item)
         try:
-            data = build_course_pdf(item, math_transcript=math_transcript)
+            data = build_course_pdf(item, math_transcript=complete_transcript)
             return data, pdf_filename(item)
         except Exception as exc:
             print(
@@ -177,7 +182,7 @@ class Emailer:
         plain_lines = [
             "完整课程内容见 LaTeX PDF 附件。",
             "PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。",
-            "泛函分析 PDF 在原课程笔记之后附有完整的数学增强语音转写。",
+            "PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式。",
             "忠实 AI 校订语音转写另作为独立 Markdown 附件保留，便于审计回查。",
             "",
         ]
@@ -186,7 +191,7 @@ class Emailer:
             'font-size:15px;line-height:1.7;color:#1f2937;max-width:720px;margin:auto;padding:20px;">',
             '<p>完整课程内容见 <strong>LaTeX PDF 附件</strong>。</p>',
             '<p>PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。'
-            '泛函分析 PDF 在原课程笔记之后附有完整的数学增强语音转写；'
+            'PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式；'
             '忠实 AI 校订语音转写另作为独立 Markdown 附件保留，便于审计回查。</p>',
         ]
 

@@ -116,7 +116,7 @@ $$
 
 **视频定位：00:03:00–00:06:00**
 '''
-    math_transcript = r'''# 数学增强语音转写
+    math_transcript = r'''# 完整课堂语音转写（AI 校订与公式补全）
 
 ## 03:00–06:00
 
@@ -132,7 +132,7 @@ $$</span>
         summary,
         math_transcript=math_transcript,
     )
-    assert markdown.index("数学增强语音转写") > markdown.index("视频定位")
+    assert markdown.index("完整课堂语音转写") > markdown.index("视频定位")
     pdf = render_markdown_pdf(
         markdown,
         title="泛函分析",
