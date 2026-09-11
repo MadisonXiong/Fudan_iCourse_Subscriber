@@ -1,0 +1,64 @@
+name: Resend Processed Emails
+
+on:
+  workflow_dispatch:
+    inputs:
+      course_ids:
+        description: "Optional comma-separated course IDs; leave blank to resend all processed lectures"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Python packages
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.pythonLocation }}/lib/python*/site-packages
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python dependencies
+        if: steps.cache-pip.outputs.cache-hit != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Fetch database from data branch
+        run: |
+          mkdir -p data/sharded/shards
+          git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data"
+          git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+          shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+          for path in $shard_paths; do
+            base=$(basename "$path")
+            git show "origin/data:$path" > "data/sharded/shards/$base"
+          done
+          echo "Loaded $(ls data/sharded/shards | wc -l) shard(s)."
+
+      - name: Reassemble database
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: python scripts/db_shard.py reassemble data/sharded data/icourse.db
+
+      - name: Resend stored emails only
+        env:
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          RESEND_COURSE_IDS: ${{ inputs.course_ids }}
+        run: python -u scripts/resend_processed.py
