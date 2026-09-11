@@ -1,10 +1,10 @@
 """True LaTeX PDF pipeline: Markdown -> Pandoc -> .tex -> Tectonic -> PDF.
 
 No formula is rasterized. Mathematics stays as LaTeX until Tectonic typesets the
-whole document into a native vector PDF. If real lecture content contains an
-ambiguous broken LaTeX structure, a tightly-scoped LLM repair agent may patch
-only the compiler-local region; Tectonic must then compile the repaired source
-before the patch is accepted.
+whole document into a native vector PDF. Compiler errors may be repaired by a
+tightly-scoped LLM syntax pass. Once the document compiles, severe over-wide
+display equations may receive a second, semantic-preserving layout-only pass.
+Tectonic remains the final authority for both stages.
 """
 
 from __future__ import annotations
@@ -18,6 +18,11 @@ import tempfile
 import time
 from pathlib import Path
 
+from src.pdf.latex_layout_repairer import (
+    LatexLayoutRepairError,
+    overflow_score,
+    repair_overfull_math,
+)
 from src.pdf.latex_preprocessor import compose_course_markdown
 from src.pdf.latex_repairer import LatexRepairError, repair_latex
 
@@ -35,11 +40,13 @@ _REPAIR_ENABLED = os.environ.get("FICS_LATEX_REPAIR_ENABLED", "1").strip().lower
     "0", "false", "no", "off"
 }
 # Real lecture notes can contain several independent malformed math fragments.
-# A repair attempt is compiler-driven and local, so allowing more iterations is
-# safer than abandoning the PDF after the first few unrelated errors.  The loop
-# still stops immediately once Tectonic succeeds, and every accepted proposal is
-# audited and recompiled.
 _REPAIR_ATTEMPTS = max(0, int(os.environ.get("FICS_LATEX_REPAIR_ATTEMPTS", "12")))
+_LAYOUT_ENABLED = os.environ.get("FICS_LATEX_LAYOUT_REPAIR_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+# Layout repair is a quality pass, not a correctness pass.  Keep the budget
+# modest and always fall back to the last already-valid PDF if it cannot help.
+_LAYOUT_ATTEMPTS = max(0, int(os.environ.get("FICS_LATEX_LAYOUT_REPAIR_ATTEMPTS", "4")))
 
 
 class LatexPdfError(RuntimeError):
@@ -118,6 +125,30 @@ def _write_repair_state(
     )
 
 
+def _write_layout_state(
+    workdir: Path,
+    *,
+    audits: list[dict],
+    compiler_outputs: list[str],
+) -> None:
+    payload = {
+        "layout_repair_count": len(audits),
+        "repairs": audits,
+        "compiler_attempts": [
+            {
+                "attempt": i + 1,
+                "overflow_score": overflow_score(text),
+                "tail": text[-12000:],
+            }
+            for i, text in enumerate(compiler_outputs)
+        ],
+    }
+    (workdir / "layout-audit.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _persist_debug(workdir: Path, debug_id: str, error: Exception, *, suffix: str = "") -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     tail = f"-{suffix}" if suffix else ""
@@ -130,6 +161,7 @@ def _persist_debug(workdir: Path, debug_id: str, error: Exception, *, suffix: st
         "notes.original.tex",
         "notes.repaired.tex",
         "repair-audit.json",
+        "layout-audit.json",
     ):
         source = workdir / name
         if source.exists():
@@ -139,21 +171,112 @@ def _persist_debug(workdir: Path, debug_id: str, error: Exception, *, suffix: st
 
 
 def _persist_successful_repair(workdir: Path, debug_id: str) -> Path:
-    """Keep an audit trail even when an LLM repair ultimately compiles."""
+    """Keep an audit trail when syntax and/or layout repair changed the TeX."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     target = _DEBUG_ROOT / f"{_safe_name(debug_id, 'lecture')}-{stamp}-repair-success"
     target.mkdir(parents=True, exist_ok=True)
     for name in (
         "notes.md",
+        "notes.tex",
         "notes.original.tex",
         "notes.repaired.tex",
         "repair-audit.json",
+        "layout-audit.json",
         "notes.log",
     ):
         source = workdir / name
         if source.exists():
             shutil.copy2(source, target / name)
     return target
+
+
+def _apply_layout_repairs(
+    *,
+    workdir: Path,
+    tex_path: Path,
+    pdf_path: Path,
+    tectonic_cmd: list[str],
+    current_tex: str,
+    successful_output: str,
+) -> tuple[str, bytes, str, list[dict], list[str]]:
+    """Improve severe display-math overflows without risking PDF delivery.
+
+    The input PDF has already compiled successfully.  Every candidate layout is
+    compiled again and accepted only if the aggregate severe-overflow score
+    decreases.  Any model/compile/quality failure simply returns the last valid
+    PDF rather than failing the email.
+    """
+    if not pdf_path.exists():
+        raise LatexPdfError("layout pass requires an already-valid notes.pdf")
+
+    valid_tex = current_tex
+    valid_pdf = pdf_path.read_bytes()
+    valid_output = successful_output
+    audits: list[dict] = []
+    outputs: list[str] = [successful_output]
+
+    if not _LAYOUT_ENABLED or _LAYOUT_ATTEMPTS <= 0:
+        return valid_tex, valid_pdf, valid_output, audits, outputs
+
+    score = overflow_score(valid_output)
+    if score <= 0:
+        return valid_tex, valid_pdf, valid_output, audits, outputs
+
+    for _ in range(_LAYOUT_ATTEMPTS):
+        try:
+            proposal = repair_overfull_math(valid_tex, valid_output)
+        except LatexLayoutRepairError as exc:
+            print(f"[LaTeX Layout] stop: {exc}", flush=True)
+            break
+
+        candidate_tex = proposal.tex
+        tex_path.write_text(candidate_tex, encoding="utf-8")
+        if pdf_path.exists():
+            pdf_path.unlink()
+        returncode, candidate_output = _run_capture(tectonic_cmd, cwd=workdir)
+        outputs.append(candidate_output)
+
+        candidate_ok = returncode == 0 and pdf_path.exists() and pdf_path.stat().st_size >= 1000
+        if not candidate_ok:
+            print(
+                "[LaTeX Layout] rejected candidate because Tectonic no longer compiled; "
+                "keeping previous valid PDF",
+                flush=True,
+            )
+            tex_path.write_text(valid_tex, encoding="utf-8")
+            pdf_path.write_bytes(valid_pdf)
+            break
+
+        candidate_score = overflow_score(candidate_output)
+        # Require a meaningful improvement, not a line-number reshuffle that
+        # merely reproduces the same overfull warning elsewhere.
+        if candidate_score >= score - 1.0:
+            print(
+                f"[LaTeX Layout] rejected candidate: overflow score {score:.1f} -> "
+                f"{candidate_score:.1f}; keeping previous valid PDF",
+                flush=True,
+            )
+            tex_path.write_text(valid_tex, encoding="utf-8")
+            pdf_path.write_bytes(valid_pdf)
+            break
+
+        valid_tex = candidate_tex
+        valid_pdf = pdf_path.read_bytes()
+        valid_output = candidate_output
+        audits.append(proposal.audit.as_dict())
+        print(
+            f"[LaTeX Layout] accepted: overflow score {score:.1f} -> {candidate_score:.1f}",
+            flush=True,
+        )
+        score = candidate_score
+        if score <= 0:
+            break
+
+    tex_path.write_text(valid_tex, encoding="utf-8")
+    pdf_path.write_bytes(valid_pdf)
+    if audits:
+        _write_layout_state(workdir, audits=audits, compiler_outputs=outputs)
+    return valid_tex, valid_pdf, valid_output, audits, outputs
 
 
 def render_markdown_pdf(
@@ -164,13 +287,7 @@ def render_markdown_pdf(
     date: str = "",
     debug_id: str = "course",
 ) -> bytes:
-    """Render already-preprocessed course Markdown as a native LaTeX PDF.
-
-    Compilation is attempted on the untouched Pandoc output first. Only after a
-    concrete Tectonic failure may the constrained LLM repair agent patch one
-    compiler-local region. Every proposal is recompiled; the model cannot make a
-    repair "valid" by itself.
-    """
+    """Render already-preprocessed course Markdown as a native LaTeX PDF."""
     pandoc = _require_tool("pandoc")
     tectonic = _require_tool("tectonic")
     if not _TEMPLATE.exists() or not _FILTER.exists():
@@ -233,6 +350,16 @@ def render_markdown_pdf(
                         raise LatexPdfError(
                             "Tectonic reported success but did not produce a valid notes.pdf"
                         )
+
+                    current_tex, final_pdf, final_output, layout_audits, _ = _apply_layout_repairs(
+                        workdir=workdir,
+                        tex_path=tex_path,
+                        pdf_path=pdf_path,
+                        tectonic_cmd=tectonic_cmd,
+                        current_tex=current_tex,
+                        successful_output=tectonic_output,
+                    )
+
                     if repair_audits:
                         _write_repair_state(
                             workdir,
@@ -241,24 +368,24 @@ def render_markdown_pdf(
                             audits=repair_audits,
                             compiler_outputs=compiler_outputs,
                         )
+
+                    if repair_audits or layout_audits:
                         audit_dir = _persist_successful_repair(workdir, debug_id)
                         print(
-                            f"[LaTeX PDF] Accepted {len(repair_audits)} LLM repair(s) "
-                            f"after successful Tectonic compilation; audit={audit_dir}",
+                            f"[LaTeX PDF] Accepted syntax_repairs={len(repair_audits)}, "
+                            f"layout_repairs={len(layout_audits)}; audit={audit_dir}",
                             flush=True,
                         )
+
                     print(
                         f"[LaTeX PDF] Built native PDF: {len(markdown_text)} markdown chars -> "
-                        f"{pdf_path.stat().st_size} bytes; "
-                        f"pandoc_log={len(pandoc_output)}, tectonic_log={len(tectonic_output)}, "
-                        f"repairs={len(repair_audits)}",
+                        f"{len(final_pdf)} bytes; pandoc_log={len(pandoc_output)}, "
+                        f"tectonic_log={len(final_output)}, syntax_repairs={len(repair_audits)}, "
+                        f"layout_repairs={len(layout_audits)}, overflow_score={overflow_score(final_output):.1f}",
                         flush=True,
                     )
-                    return pdf_path.read_bytes()
+                    return final_pdf
 
-                # No model is called unless the untouched/current document has
-                # genuinely failed Tectonic. The final failed compile is not
-                # followed by another repair attempt.
                 if compile_index >= max_repairs:
                     tail = tectonic_output[-12000:]
                     raise LatexPdfError(
