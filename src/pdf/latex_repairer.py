@@ -28,6 +28,9 @@ _FORBIDDEN = re.compile(
     r"\\(?:documentclass|usepackage|input|include|write18|openout|read|catcode|csname|newcommand|renewcommand|def)\b",
     re.IGNORECASE,
 )
+_STRUCTURAL_LINE_RE = re.compile(
+    r"^\\(?:hypertarget|(?:sub)*section|paragraph)\b"
+)
 
 _SYSTEM = r"""
 你是 LaTeX 局部编译错误修复器。
@@ -121,6 +124,23 @@ def _clean_response(text: str) -> str | None:
 def _validate_replacement(before: str, replacement: str) -> None:
     if _FORBIDDEN.search(replacement):
         raise LatexRepairError("model replacement contains a forbidden LaTeX command")
+    if "```" in replacement:
+        raise LatexRepairError("model replacement contains an unterminated code fence")
+    # Pandoc-generated headings are known-good document structure.  A local
+    # syntax repair must never duplicate, delete, rename, or re-brace them;
+    # doing so can turn one bad formula into a permanent ``Too many }`` loop.
+    before_structure = [
+        line.strip()
+        for line in before.splitlines()
+        if _STRUCTURAL_LINE_RE.match(line.strip())
+    ]
+    replacement_structure = [
+        line.strip()
+        for line in replacement.splitlines()
+        if _STRUCTURAL_LINE_RE.match(line.strip())
+    ]
+    if replacement_structure != before_structure:
+        raise LatexRepairError("model replacement changed Pandoc heading structure")
     ratio = len(replacement) / max(1, len(before))
     if ratio < _MIN_RATIO or ratio > _MAX_RATIO:
         raise LatexRepairError(

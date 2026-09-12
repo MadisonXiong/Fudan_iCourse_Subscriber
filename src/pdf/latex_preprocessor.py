@@ -33,8 +33,13 @@ _VIDEO_LINE_RE = re.compile(
 )
 _VIS_LABEL_RE = re.compile(r'^\s*〔视觉补全〕\s*')
 _DISPLAY_MATH_RE = re.compile(r'^\s*\$\$\s*(.*?)\s*\$\$\s*$', re.DOTALL)
-_INLINE_MATH_RE = re.compile(r'\$(?!\$)\s*([^$\n]+?)\s*\$(?!\$)')
+_INLINE_MATH_RE = re.compile(
+    r'(?<![\\$])\$(?!\$)([^$\n]*?)(?<!\\)\$(?!\$)'
+)
 _DISPLAY_BLOCK_RE = re.compile(r'\$\$(.*?)\$\$', re.DOTALL)
+_BRACKETED_VISUAL_RE = re.compile(
+    r'\[([^\[\]\n]+)\]\{\.visual-restored\}'
+)
 _SAFE_SPLIT_MATH_TEXT_RE = re.compile(
     r'^[\s\u3000\u4e00-\u9fffA-Za-z0-9，。；：、（）()“”‘’·,.!?+\-]+$'
 )
@@ -55,7 +60,14 @@ def _ai_note(match: re.Match) -> str:
 
 
 def _normalize_inline_math(text: str) -> str:
-    """Make ``$ formula $`` parse as Pandoc math without changing the formula."""
+    """Make ``$ formula $`` parse as Pandoc math without changing the formula.
+
+    Pandoc deliberately treats spaces immediately inside dollar delimiters as
+    literal text.  Math-enhanced transcripts produced by an LLM commonly use
+    that readable-but-incompatible spelling.  Normalize every *single-dollar*
+    inline span before Pandoc sees it, while leaving ``$$`` display math and
+    escaped currency dollars untouched.
+    """
 
     def repl(match: re.Match) -> str:
         return "$" + match.group(1).strip() + "$"
@@ -146,10 +158,23 @@ def _looks_like_raw_math(text: str) -> bool:
         re.search(
             r"\\(?:frac|sum|int|lim|forall|exists|Rightarrow|Leftrightarrow|"
             r"langle|rangle|mathbb|ell|infty|varepsilon|begin|left|right|"
-            r"subset|in|to|geq|leq|cdot|overline)\b|[_^]",
+            r"subset|in|to|geq|leq|cdot|overline|iff|Leftrightarrow)\b|[_^]",
             text,
         )
     )
+
+
+def _normalize_bracketed_visual(match: re.Match) -> str:
+    r"""Add math delimiters to an already-semantic bare visual formula.
+
+    Cached enhanced transcripts can already contain Pandoc bracketed spans,
+    bypassing :func:`_visual_restore`.  A bare ``\iff`` or norm expression in
+    such a span would otherwise place math-only commands in LaTeX text mode.
+    """
+    inner = match.group(1)
+    if "$" not in inner and _looks_like_raw_math(inner):
+        return f"[${inner.strip()}$]{{.visual-restored}}"
+    return match.group(0)
 
 
 def _visual_restore(match: re.Match) -> str:
@@ -203,8 +228,13 @@ def preprocess_markdown(text: str) -> str:
     """Convert FiCS-specific HTML annotations into Pandoc semantic classes."""
     text = str(text or "").replace("\r\n", "\n")
     text = _merge_split_display_delimiters(text)
+    # This must apply to the whole transcript, not only to purple visual
+    # restoration spans.  Otherwise ``$ A \subseteq X $`` becomes literal
+    # ``\$ A \subseteq X \$`` in Pandoc's TeX and cannot compile.
+    text = _normalize_inline_math(text)
     text = _AI_NOTE_RE.sub(_ai_note, text)
     text = _VISUAL_RE.sub(_visual_restore, text)
+    text = _BRACKETED_VISUAL_RE.sub(_normalize_bracketed_visual, text)
     text = _VIDEO_LINE_RE.sub(_video_location, text)
     return text.strip()
 

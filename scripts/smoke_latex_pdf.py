@@ -22,7 +22,11 @@ from src.pdf.latex_preprocessor import (
     preprocess_markdown,
 )
 from src.pdf.latex_renderer import render_markdown_pdf
-from src.pdf.latex_repairer import compiler_error_line
+from src.pdf.latex_repairer import (
+    LatexRepairError,
+    _validate_replacement as validate_syntax_replacement,
+    compiler_error_line,
+)
 
 
 def _smoke_repair_helpers() -> None:
@@ -81,6 +85,21 @@ A&=B+C+D\\
     else:
         raise AssertionError("layout guard accepted changed mathematical content")
 
+    generated_heading = r'''\hypertarget{section-27}{%
+\subsection{01:21:00--01:24:00}\label{section-27}}
+
+正文'''
+    duplicated_heading = generated_heading.replace(
+        "\n\n正文",
+        "\n\\subsection{01:21:00--01:24:00}\\label{section-27}}\n\n正文",
+    )
+    try:
+        validate_syntax_replacement(generated_heading, duplicated_heading)
+    except LatexRepairError:
+        pass
+    else:
+        raise AssertionError("syntax guard accepted changed Pandoc heading structure")
+
 
 def _smoke_visual_preprocessor() -> None:
     """Cover visual-math forms seen in real model output."""
@@ -98,6 +117,25 @@ bare: <span data-visual-restored="true">〔视觉补全〕\Rightarrow \forall n\
     assert "$d(x_n, x_m) < \\varepsilon$" in cooked
     assert "::: {.visual-restored-block}" in cooked
     assert "$\\Rightarrow \\forall n\\in\\mathbb{N}, x_n\\to 0$" in cooked
+
+    # Real enhanced transcripts frequently place spaces inside dollar math.
+    # Pandoc otherwise emits literal ``\\$`` and the resulting TeX fails at
+    # commands such as ``\\subseteq`` and ``\\varepsilon``.
+    spaced_math = (
+        r"设 $ A \subseteq X $，且 $ x,y \in A $；金额 \$5 不应改变。"
+        "\n\n$$\n A = B \n$$"
+    )
+    normalized = preprocess_markdown(spaced_math)
+    assert r"$A \subseteq X$" in normalized
+    assert r"$x,y \in A$" in normalized
+    assert r"\$5" in normalized
+    assert "$$\n A = B \n$$" in normalized
+
+    cached_bare_visual = r"[\|x\|=0 \iff x=0.]{.visual-restored}"
+    assert (
+        preprocess_markdown(cached_bare_visual)
+        == r"[$\|x\|=0 \iff x=0.$]{.visual-restored}"
+    )
 
     split_set = r'''① 记
 $$L^p(X,\mu) = \left\{ f$$
@@ -145,6 +183,8 @@ $$
 ## 03:00–06:00
 
 对称性：<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕$ d(x,y)=d(y,x) $</span>。
+
+设 $ A \subseteq X $，并取 $ x,y \in A $。这些普通黑色公式也必须被 Pandoc 识别。
 
 <span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕$$
 \int_X |f|^p\,d\mu < \infty
