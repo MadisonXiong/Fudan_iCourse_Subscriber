@@ -46,6 +46,13 @@ _PREVIOUS_VISUAL_REF_RE = re.compile(
 )
 _VIS_OPEN = '<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕'
 _VIS_CLOSE = "</span>"
+_RETRY_DELAY_RE = re.compile(
+    r"(?:retry\s+in\s+|retryDelay['\"\s:]+['\"]?)([0-9]+(?:\.[0-9]+)?)s",
+    re.I,
+)
+_RATE_LIMIT_RETRIES = max(
+    0, int(os.environ.get("MATH_TRANSCRIPT_RATE_LIMIT_RETRIES", "2"))
+)
 
 # Course-scoped replacements whose meaning is unambiguous even if the model is
 # unavailable.  They are applied only to the readable enhanced copy, never to
@@ -434,41 +441,55 @@ class MathTranscriptEnhancer:
         for provider, client, models in self.providers:
             for model in models:
                 model_id = f"{provider}/{model}"
-                t0 = time.time()
-                try:
-                    request = dict(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=.03,
-                        max_tokens=max_tokens,
-                        timeout=_TIMEOUT,
-                    )
-                    # Gemini 3 thinking defaults to medium.  Guide extraction
-                    # and transcript editing need a long visible response more
-                    # than deep hidden reasoning, so keep thinking low and
-                    # reserve the completion budget for the actual transcript.
-                    if provider == "gemini":
-                        request["reasoning_effort"] = "low"
-                    resp = client.chat.completions.create(**request)
-                    choice = resp.choices[0]
-                    text = (choice.message.content or "").strip()
-                    if not text:
-                        raise RuntimeError("empty response")
-                    if str(getattr(choice, "finish_reason", "") or "").lower() == "length":
-                        raise RuntimeError("truncated response")
-                    print(
-                        f"[MathTranscript:{stage}] {model_id}: "
-                        f"{len(prompt)} -> {len(text)} chars "
-                        f"in {time.time()-t0:.0f}s", flush=True
-                    )
-                    return text, model_id
-                except Exception as exc:
-                    msg = f"{model_id}: {type(exc).__name__}: {exc}"
-                    errors.append(msg)
-                    print(f"[MathTranscript] {msg}", flush=True)
+                for attempt in range(_RATE_LIMIT_RETRIES + 1):
+                    t0 = time.time()
+                    try:
+                        request = dict(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": prompt},
+                            ],
+                            temperature=.03,
+                            max_tokens=max_tokens,
+                            timeout=_TIMEOUT,
+                        )
+                        # Gemini 3 thinking defaults to medium.  Guide
+                        # extraction and transcript editing need a long visible
+                        # response more than deep hidden reasoning.
+                        if provider == "gemini":
+                            request["reasoning_effort"] = "low"
+                        resp = client.chat.completions.create(**request)
+                        choice = resp.choices[0]
+                        text = (choice.message.content or "").strip()
+                        if not text:
+                            raise RuntimeError("empty response")
+                        if str(getattr(choice, "finish_reason", "") or "").lower() == "length":
+                            raise RuntimeError("truncated response")
+                        print(
+                            f"[MathTranscript:{stage}] {model_id}: "
+                            f"{len(prompt)} -> {len(text)} chars "
+                            f"in {time.time()-t0:.0f}s", flush=True
+                        )
+                        return text, model_id
+                    except Exception as exc:
+                        detail = f"{type(exc).__name__}: {exc}"
+                        delay_match = _RETRY_DELAY_RE.search(str(exc))
+                        rate_limited = "429" in str(exc) or "ratelimit" in detail.lower()
+                        if rate_limited and delay_match and attempt < _RATE_LIMIT_RETRIES:
+                            delay = min(60.0, max(1.0, float(delay_match.group(1)) + 1.0))
+                            print(
+                                f"[MathTranscript:{stage}] {model_id}: rate limited; "
+                                f"waiting {delay:.0f}s before retry "
+                                f"{attempt + 1}/{_RATE_LIMIT_RETRIES}",
+                                flush=True,
+                            )
+                            time.sleep(delay)
+                            continue
+                        msg = f"{model_id}: {detail}"
+                        errors.append(msg)
+                        print(f"[MathTranscript] {msg}", flush=True)
+                        break
         raise RuntimeError("All math transcript models failed: " + " | ".join(errors))
 
     def _global_review_guide(
