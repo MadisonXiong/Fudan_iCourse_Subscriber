@@ -13,8 +13,8 @@ import json
 from datetime import datetime
 
 
-MATH_TRANSCRIPT_VERSION = 8
-_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v8:"
+MATH_TRANSCRIPT_VERSION = 9
+_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v9:"
 
 
 def source_fingerprint(
@@ -63,8 +63,8 @@ def _key(sub_id: str) -> str:
     return f"{_KEY_PREFIX}{sub_id}"
 
 
-def load_math_transcript(db, sub_id: str) -> dict | None:
-    raw = db.read_meta(_key(str(sub_id)))
+def _load_version(db, sub_id: str, version: int) -> dict | None:
+    raw = db.read_meta(f"blackboard_cache_blob:math-transcript-v{version}:{sub_id}")
     if not raw:
         return None
     try:
@@ -73,13 +73,26 @@ def load_math_transcript(db, sub_id: str) -> dict | None:
         return None
     if not isinstance(payload, dict):
         return None
-    if int(payload.get("version") or 0) != MATH_TRANSCRIPT_VERSION:
+    if int(payload.get("version") or 0) != version:
         return None
     if not str(payload.get("markdown") or "").strip():
         return None
     if not isinstance(payload.get("segments"), list):
         return None
     return payload
+
+
+def load_math_transcript(db, sub_id: str) -> dict | None:
+    return _load_version(db, str(sub_id), MATH_TRANSCRIPT_VERSION)
+
+
+def load_first_pass_seed(db, sub_id: str) -> dict | None:
+    """Reuse v7's fully generated evidence-aware transcript as v9 input.
+
+    v8 may contain API fallbacks because its run exhausted the provider balance;
+    v7 is the last successfully completed first-pass/visual cache.
+    """
+    return _load_version(db, str(sub_id), 7)
 
 
 def save_math_transcript(

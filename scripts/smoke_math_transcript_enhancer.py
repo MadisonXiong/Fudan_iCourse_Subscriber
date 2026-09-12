@@ -103,7 +103,7 @@ def main() -> None:
     prior_board = "#### 00:00\n$x+y=0$"
     assert not _has_formula_evidence("下面继续讲。", [], prior_board, 1, 2)
     assert _has_formula_evidence("刚才这个式子很重要。", [], prior_board, 1, 2)
-    assert MATH_TRANSCRIPT_VERSION == 8
+    assert MATH_TRANSCRIPT_VERSION == 9
     fp_a = source_fingerprint("泛函分析", "总结甲", "稿", source, [], "")
     fp_b = source_fingerprint("泛函分析", "总结乙", "稿", source, [], "")
     assert fp_a != fp_b
@@ -214,20 +214,16 @@ def main() -> None:
 
     # Contextual ASR cleanup must still run when no visual evidence exists or
     # the model API is unavailable; it stays black (no visual-restored span).
-    result = _UnavailableEnhancer().enhance(
-        [{"start_ms": 0, "end_ms": 1000, "text": original}],
-        [],
-        course_title="泛函分析",
-    )
-    assert "泛函分析" in result.markdown
-    assert "实变函数的文物课程" in result.markdown
-    assert "办案分析" not in result.markdown
-    assert "十遍函数" not in result.markdown
-    assert "data-visual-restored" not in result.markdown
-    assert "完整课堂语音转写" in result.markdown
-    assert result.model_label.startswith("math-transcript-v8/")
-    assert "final-review-fallback[1]" in result.model_label
-    assert "全部内容生成后" in result.markdown
+    try:
+        _UnavailableEnhancer().enhance(
+            [{"start_ms": 0, "end_ms": 1000, "text": original}],
+            [],
+            course_title="泛函分析",
+        )
+    except RuntimeError as exc:
+        assert "editorial review incomplete" in str(exc)
+    else:
+        raise AssertionError("an unreviewed transcript was accepted")
 
     faithful_markdown = "# AI 校订语音转写\n\n完整老师讲述。"
     emailer = object.__new__(Emailer)
@@ -241,11 +237,16 @@ def main() -> None:
         patch("src.api.emailer.course_requires_blackboard", return_value=True),
         patch("src.api.emailer.get_blackboard", return_value=None),
         patch("src.api.emailer.load_math_transcript", return_value=None),
+        patch("src.api.emailer.load_first_pass_seed", return_value=None),
     ):
-        appendix = emailer._complete_transcript(
-            {"sub_id": "lecture-1", "course_title": "泛函分析"}
-        )
-    assert appendix == faithful_markdown
+        try:
+            emailer._complete_transcript(
+                {"sub_id": "lecture-1", "course_title": "泛函分析"}
+            )
+        except RuntimeError as exc:
+            assert "unreviewed transcript" in str(exc)
+        else:
+            raise AssertionError("emailer accepted an unreviewed transcript")
 
     legacy = (
         "首先介绍课程要求。作业每周提交一次。"
@@ -270,7 +271,7 @@ def main() -> None:
     assert _comparison_text("".join(x["text"] for x in rebuilt)) == _comparison_text(legacy)
     fallback = _raw_transcript_markdown(rebuilt)
     assert all(segment["text"] in fallback for segment in rebuilt)
-    print("math transcript v8 editorial-review smoke checks passed")
+    print("math transcript v9 required-editorial-review smoke checks passed")
 
 
 if __name__ == "__main__":

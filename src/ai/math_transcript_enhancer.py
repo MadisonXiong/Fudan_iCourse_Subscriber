@@ -401,7 +401,7 @@ class MathTranscriptEnhancer:
         for p in config.resolve_model_providers():
             models = list(p["models"])
             if p["name"] == "modelscope":
-                models = override or ["Qwen/Qwen3-30B-A3B-Instruct-2507"]
+                models = override or models
             self.providers.append(
                 (p["name"], OpenAI(api_key=p["api_key"], base_url=p["base_url"]), tuple(models))
             )
@@ -837,6 +837,7 @@ class MathTranscriptEnhancer:
         course_title: str = "",
         raw_blackboard: str = "",
         summary_reference: str = "",
+        first_pass_segments=None,
     ):
         source = [
             x for x in (self._normalise(s) for s in proofread_segments or []) if x is not None
@@ -848,25 +849,42 @@ class MathTranscriptEnhancer:
             for seg in source
         ]
         pages = ppt_pages or []
+        seeded = [
+            x for x in (self._normalise(s) for s in first_pass_segments or [])
+            if x is not None
+        ]
+        seed_matches = len(seeded) == len(source) and all(
+            a["start_ms"] == b["start_ms"] and a["end_ms"] == b["end_ms"]
+            for a, b in zip(seeded, source)
+        )
         enhanced, models, fallbacks = [], [], 0
-        batches = (len(source) + _BATCH - 1) // _BATCH
-        for start in range(0, len(source), _BATCH):
-            batch = source[start:start + _BATCH]
+        if seed_matches:
+            enhanced = seeded
+            models.append("cached-evidence-pass-v7")
             print(
-                f"[MathTranscript] batch {start//_BATCH+1}/{batches}: {len(batch)} chunk(s)",
+                f"[MathTranscript] Reusing {len(seeded)} v7 evidence-aware chunks; "
+                "reserving model capacity for required editorial review.",
                 flush=True,
             )
-            out, used, failed = self._batch(
-                batch,
-                pages,
-                raw_blackboard,
-                course_title=course_title,
-                source=source,
-                batch_start=start,
-            )
-            enhanced.extend(out)
-            models.extend(used)
-            fallbacks += failed
+        else:
+            batches = (len(source) + _BATCH - 1) // _BATCH
+            for start in range(0, len(source), _BATCH):
+                batch = source[start:start + _BATCH]
+                print(
+                    f"[MathTranscript] batch {start//_BATCH+1}/{batches}: {len(batch)} chunk(s)",
+                    flush=True,
+                )
+                out, used, failed = self._batch(
+                    batch,
+                    pages,
+                    raw_blackboard,
+                    course_title=course_title,
+                    source=source,
+                    batch_start=start,
+                )
+                enhanced.extend(out)
+                models.extend(used)
+                fallbacks += failed
 
         enhanced, final_models, final_fallbacks = self._final_review(
             enhanced,
@@ -874,6 +892,11 @@ class MathTranscriptEnhancer:
             summary_reference=summary_reference,
         )
         models.extend(final_models)
+        if final_fallbacks:
+            raise RuntimeError(
+                f"editorial review incomplete: {final_fallbacks}/{len(enhanced)} "
+                "chunks were not accepted"
+            )
 
         md = [
             "# 完整课堂语音转写（AI 校订与公式补全）", "",
@@ -888,7 +911,7 @@ class MathTranscriptEnhancer:
         for model in models:
             if model and model not in unique:
                 unique.append(model)
-        label = "math-transcript-v8/" + ("+".join(unique) if unique else "no-llm")
+        label = "math-transcript-v9/" + ("+".join(unique) if unique else "no-llm")
         if fallbacks:
             label += f"|safe-base-fallback[{fallbacks}]"
         if final_fallbacks:

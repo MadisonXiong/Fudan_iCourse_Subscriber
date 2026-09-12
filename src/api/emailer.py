@@ -28,6 +28,7 @@ from src.data.blackboard_store import get_blackboard
 from src.data.database import Database
 from src.data.math_transcript_store import (
     cache_matches,
+    load_first_pass_seed,
     load_math_transcript,
     save_math_transcript,
     source_fingerprint,
@@ -102,12 +103,14 @@ class Emailer:
                 f"[Emailer] Building evidence-constrained math transcript for {sub_id}...",
                 flush=True,
             )
+            prior = load_first_pass_seed(db, sub_id)
             result = self._math_enhancer.enhance(
                 proofread_segments,
                 ppt_pages,
                 course_title=course_title,
                 raw_blackboard=raw_blackboard,
                 summary_reference=summary_reference,
+                first_pass_segments=(prior or {}).get("segments"),
             )
             save_math_transcript(
                 db,
@@ -124,14 +127,14 @@ class Emailer:
             )
             return result.markdown
         except Exception as exc:
-            # The transcript appendix is mandatory. If enhancement is down,
-            # preserve the complete AI-proofread text rather than omitting it.
             print(
-                f"[Emailer] Math enhancement unavailable; preserving the complete "
-                f"AI-proofread transcript appendix: {type(exc).__name__}: {exc}",
+                f"[Emailer] Required editorial transcript review failed: "
+                f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
-            return proofread_markdown
+            raise RuntimeError(
+                "refusing to send an unreviewed transcript appendix"
+            ) from exc
 
     def _build_pdf(self, item: dict) -> tuple[bytes, str]:
         complete_transcript = self._complete_transcript(item)
