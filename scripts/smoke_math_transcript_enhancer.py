@@ -221,7 +221,7 @@ def main() -> None:
             course_title="泛函分析",
         )
     except RuntimeError as exc:
-        assert "editorial review incomplete" in str(exc)
+        assert "required" in str(exc) or "editorial review incomplete" in str(exc)
     else:
         raise AssertionError("an unreviewed transcript was accepted")
 

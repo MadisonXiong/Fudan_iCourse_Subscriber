@@ -479,23 +479,22 @@ class MathTranscriptEnhancer:
             "AI课程总结参考",
         )
         summary_guide = "（AI课程总结不可用）"
-        if summary:
-            try:
-                summary_guide, model = self._call_with_system(
-                    f"【课程名称】{course_title or '（未知）'}\n"
-                    f"【AI 课程总结参考】\n{summary}\n\n"
-                    "请提取用于校订课堂逐字稿的课程主线、数学术语、定义和公式记法。",
-                    system=_FINAL_GUIDE_SYSTEM,
-                    max_tokens=2200,
-                    stage="summary-reference-guide",
-                )
-                models.append(model)
-            except Exception as exc:
-                print(
-                    f"[MathTranscript:summary-reference-guide] unavailable: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
+        if not summary:
+            raise RuntimeError("AI course summary reference is required")
+        try:
+            summary_guide, model = self._call_with_system(
+                f"【课程名称】{course_title or '（未知）'}\n"
+                f"【AI 课程总结参考】\n{summary}\n\n"
+                "请提取用于校订课堂逐字稿的课程主线、数学术语、定义和公式记法。",
+                system=_FINAL_GUIDE_SYSTEM,
+                max_tokens=2200,
+                stage="summary-reference-guide",
+            )
+            models.append(model)
+        except Exception as exc:
+            raise RuntimeError(
+                "required AI course-summary reference review is unavailable"
+            ) from exc
 
         blocks = [
             f"## {_fmt(seg['start_ms'])}–{_fmt(seg['end_ms'])}\n{seg['text']}"
@@ -540,7 +539,7 @@ class MathTranscriptEnhancer:
                 )
 
         if not partials:
-            return "（全课指南不可用；仅进行保守逐段终审）", models
+            raise RuntimeError("required full-lecture guide review is unavailable")
         if len(partials) == 1:
             return _trim(partials[0], _FINAL_GUIDE_MAX, "全课术语指南"), models
 
