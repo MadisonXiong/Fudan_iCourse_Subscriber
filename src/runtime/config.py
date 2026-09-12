@@ -50,7 +50,7 @@ MODEL_PROVIDERS: list[dict] = [
         "base_url_env": "GEMINI_BASE_URL",
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "models": [
-            "gemini-2.5-flash",
+            "gemini-3.6-flash",
             "gemini-3-flash-preview",
         ],
     }

@@ -398,7 +398,13 @@ class MathTranscriptEnhancer:
             if x.strip()
         ]
         self.providers = []
-        for p in config.resolve_model_providers():
+        providers = config.resolve_model_providers()
+        # The editorial pass is long and ModelScope's free balance may be
+        # exhausted independently of a newly configured Gemini key. Prefer a
+        # working Gemini provider here instead of paying two doomed retries on
+        # every batch before reaching it.
+        providers.sort(key=lambda p: 0 if p["name"] == "gemini" else 1)
+        for p in providers:
             models = list(p["models"])
             if p["name"] == "modelscope":
                 models = override or models
@@ -526,7 +532,7 @@ class MathTranscriptEnhancer:
                 guide, model = self._call_with_system(
                     prompt,
                     system=_FINAL_GUIDE_SYSTEM,
-                    max_tokens=1800,
+                    max_tokens=5000,
                     stage=f"global-guide-{index}",
                 )
                 partials.append(guide)
