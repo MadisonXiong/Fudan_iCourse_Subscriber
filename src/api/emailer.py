@@ -7,12 +7,12 @@ until the final document is typeset; no formula PNG/CID pipeline is involved.
 Every PDF appends the complete AI-proofread classroom transcript after the
 existing notes. Functional Analysis additionally receives contextual ASR
 correction and evidence-constrained formula restoration. The conservative
-proofread transcript remains attached independently for audit.
+proofread transcript remains persisted in the database for audit, but email
+delivery exposes one final PDF rather than implementation-format Markdown.
 """
 
 from __future__ import annotations
 
-import re
 import smtplib
 import time
 from collections import OrderedDict
@@ -33,33 +33,11 @@ from src.data.math_transcript_store import (
     source_fingerprint,
 )
 from src.data.transcript_store import load_proofread
-from src.pdf.latex_renderer import build_course_pdf, pdf_filename
+from src.pdf.latex_renderer import LatexPdfError, build_course_pdf, pdf_filename
 from src.runtime import config
 
-
-def _safe_filename(raw: str, fallback: str) -> str:
-    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "-", raw).strip(" .-")
-    return cleaned or fallback
-
-
-def _attachment_filename(item: dict) -> str:
-    raw = (
-        f"{item.get('course_title','课程')}-"
-        f"{item.get('sub_title','课堂')}-AI校订语音转写.md"
-    )
-    return _safe_filename(raw, "AI校订语音转写.md")
-
-
-def _summary_filename(item: dict) -> str:
-    raw = (
-        f"{item.get('course_title','课程')}-"
-        f"{item.get('sub_title','课堂')}-课程笔记.md"
-    )
-    return _safe_filename(raw, "课程笔记.md")
-
-
 class Emailer:
-    """Send small notification bodies plus PDF/traceability attachments."""
+    """Send small notification bodies plus complete PDF attachments."""
 
     def __init__(self):
         self.host = config.SMTP_HOST
@@ -152,7 +130,7 @@ class Emailer:
             )
             return proofread_markdown
 
-    def _build_pdf(self, item: dict) -> tuple[bytes | None, str]:
+    def _build_pdf(self, item: dict) -> tuple[bytes, str]:
         complete_transcript = self._complete_transcript(item)
         try:
             data = build_course_pdf(item, math_transcript=complete_transcript)
@@ -163,7 +141,10 @@ class Emailer:
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
-            return None, ""
+            raise LatexPdfError(
+                "refusing to send Markdown fallback: the required complete PDF "
+                f"could not be built for {item.get('sub_id')}"
+            ) from exc
 
     def send(self, items: list[dict]) -> bool:
         if not items:
@@ -183,7 +164,7 @@ class Emailer:
             "完整课程内容见 LaTeX PDF 附件。",
             "PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。",
             "PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式。",
-            "忠实 AI 校订语音转写另作为独立 Markdown 附件保留，便于审计回查。",
+            "忠实 AI 校订底稿保存在系统中，邮件仅发送最终 PDF。",
             "",
         ]
         html_parts = [
@@ -192,7 +173,7 @@ class Emailer:
             '<p>完整课程内容见 <strong>LaTeX PDF 附件</strong>。</p>',
             '<p>PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。'
             'PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式；'
-            '忠实 AI 校订语音转写另作为独立 Markdown 附件保留，便于审计回查。</p>',
+            '忠实 AI 校订底稿保存在系统中，邮件仅发送最终 PDF。</p>',
         ]
 
         for course_title, lectures in courses.items():
@@ -230,54 +211,25 @@ class Emailer:
         alt.attach(MIMEText(html, "html", "utf-8"))
         msg.attach(alt)
 
-        pdf_count = 0
-        transcript_count = 0
-        markdown_fallback_count = 0
+        # Build every PDF before opening SMTP. A compiler failure is a failed
+        # delivery, never a green run that silently substitutes .md files.
+        try:
+            rendered = [self._build_pdf(item) for item in items]
+        except LatexPdfError as exc:
+            print(f"[Emailer] Delivery aborted: {exc}", flush=True)
+            return False
 
-        for item in items:
-            pdf_data, filename = self._build_pdf(item)
-            if pdf_data:
-                part = MIMEApplication(pdf_data, _subtype="pdf")
-                part.add_header(
-                    "Content-Disposition",
-                    "attachment",
-                    filename=("utf-8", "", filename),
-                )
-                msg.attach(part)
-                pdf_count += 1
-            else:
-                # Never lose the stored notes if Pandoc/Tectonic encounters an
-                # unexpected LaTeX edge case.  Debug .tex/.log files are saved
-                # separately by the renderer and uploaded by the workflow.
-                summary = str(item.get("summary") or "").strip()
-                if summary:
-                    fallback = MIMEText(summary, "plain", "utf-8")
-                    fallback.add_header(
-                        "Content-Disposition",
-                        "attachment",
-                        filename=("utf-8", "", _summary_filename(item)),
-                    )
-                    msg.attach(fallback)
-                    markdown_fallback_count += 1
-
-            transcript_md = str(item.get("transcript_attachment") or "").strip()
-            if transcript_md:
-                transcript_name = (
-                    item.get("transcript_filename") or _attachment_filename(item)
-                )
-                transcript_part = MIMEText(transcript_md, "plain", "utf-8")
-                transcript_part.add_header(
-                    "Content-Disposition",
-                    "attachment",
-                    filename=("utf-8", "", str(transcript_name)),
-                )
-                msg.attach(transcript_part)
-                transcript_count += 1
+        for pdf_data, filename in rendered:
+            part = MIMEApplication(pdf_data, _subtype="pdf")
+            part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=("utf-8", "", filename),
+            )
+            msg.attach(part)
 
         print(
-            f"[Emailer] Attachments: latex_pdf={pdf_count}, "
-            f"faithful_transcript={transcript_count}, "
-            f"markdown_fallback={markdown_fallback_count}; CID images=0",
+            f"[Emailer] Attachments: latex_pdf={len(rendered)}, markdown=0; CID images=0",
             flush=True,
         )
 

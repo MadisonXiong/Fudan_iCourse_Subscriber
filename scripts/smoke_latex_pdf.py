@@ -16,7 +16,11 @@ from src.pdf.latex_layout_repairer import (
     overflow_score,
     overfull_issues,
 )
-from src.pdf.latex_preprocessor import compose_course_markdown, preprocess_markdown
+from src.pdf.latex_preprocessor import (
+    _merge_split_display_delimiters,
+    compose_course_markdown,
+    preprocess_markdown,
+)
 from src.pdf.latex_renderer import render_markdown_pdf
 from src.pdf.latex_repairer import compiler_error_line
 
@@ -94,6 +98,26 @@ bare: <span data-visual-restored="true">〔视觉补全〕\Rightarrow \forall n\
     assert "$d(x_n, x_m) < \\varepsilon$" in cooked
     assert "::: {.visual-restored-block}" in cooked
     assert "$\\Rightarrow \\forall n\\in\\mathbb{N}, x_n\\to 0$" in cooked
+
+    split_set = r'''① 记
+$$L^p(X,\mu) = \left\{ f$$
+
+为
+
+$$X$$
+
+上可测函数且
+
+$$\int_X |f|^p d\mu < \infty \right\}.$$
+'''
+    merged = _merge_split_display_delimiters(split_set)
+    assert merged.count("$$") == 2
+    assert r"\left\{ f \text{为} X \text{上可测函数且}" in merged
+    assert r"\infty \right\}." in merged
+
+    # Never consume Markdown structure while looking for a matching delimiter.
+    unsafe = "$$A=\\left\\{x$$\n\n## 新章节\n\n$$x>0\\right\\}$$"
+    assert _merge_split_display_delimiters(unsafe) == unsafe
 
 
 def main() -> int:

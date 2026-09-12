@@ -34,6 +34,10 @@ _VIDEO_LINE_RE = re.compile(
 _VIS_LABEL_RE = re.compile(r'^\s*〔视觉补全〕\s*')
 _DISPLAY_MATH_RE = re.compile(r'^\s*\$\$\s*(.*?)\s*\$\$\s*$', re.DOTALL)
 _INLINE_MATH_RE = re.compile(r'\$(?!\$)\s*([^$\n]+?)\s*\$(?!\$)')
+_DISPLAY_BLOCK_RE = re.compile(r'\$\$(.*?)\$\$', re.DOTALL)
+_SAFE_SPLIT_MATH_TEXT_RE = re.compile(
+    r'^[\s\u3000\u4e00-\u9fffA-Za-z0-9，。；：、（）()“”‘’·,.!?+\-]+$'
+)
 
 
 def _clean_ai_inner(inner: str) -> str:
@@ -57,6 +61,83 @@ def _normalize_inline_math(text: str) -> str:
         return "$" + match.group(1).strip() + "$"
 
     return _INLINE_MATH_RE.sub(repl, text)
+
+
+def _delimiter_balance(formula: str) -> int:
+    """Return the unmatched ``\\left`` count in one TeX fragment."""
+    return len(re.findall(r"\\left\b", formula)) - len(
+        re.findall(r"\\right\b", formula)
+    )
+
+
+def _plain_gap_as_tex(gap: str) -> str | None:
+    """Convert short prose between accidentally split math blocks to TeX text."""
+    compact = re.sub(r"\s+", " ", str(gap or "")).strip()
+    if not compact:
+        return ""
+    if len(compact) > 160 or not _SAFE_SPLIT_MATH_TEXT_RE.fullmatch(compact):
+        return None
+    escaped = (
+        compact.replace("&", r"\&")
+        .replace("%", r"\%")
+        .replace("#", r"\#")
+        .replace("_", r"\_")
+    )
+    return rf"\text{{{escaped}}}"
+
+
+def _merge_split_display_delimiters(text: str) -> str:
+    """Merge display blocks that accidentally split one left/right formula.
+
+    OCR/LLM output sometimes emits one set-builder expression as three display
+    blocks, such as ``$$\\left\\{f$$ 为 $$X$$ 上可测且
+    $$...\\right\\}$$``. Pandoc creates three independent displays and
+    Tectonic rejects the unmatched delimiters. This deterministic repair keeps
+    every math fragment and places only short intervening prose in ``\\text{}``.
+    """
+    source = str(text or "")
+    blocks = list(_DISPLAY_BLOCK_RE.finditer(source))
+    if not blocks:
+        return source
+
+    out: list[str] = []
+    cursor = 0
+    i = 0
+    while i < len(blocks):
+        first = blocks[i]
+        balance = _delimiter_balance(first.group(1))
+        if balance <= 0:
+            i += 1
+            continue
+
+        pieces = [first.group(1).strip()]
+        j = i
+        safe = True
+        while balance > 0 and j + 1 < len(blocks):
+            following = blocks[j + 1]
+            gap_tex = _plain_gap_as_tex(source[blocks[j].end():following.start()])
+            if gap_tex is None:
+                safe = False
+                break
+            if gap_tex:
+                pieces.append(gap_tex)
+            pieces.append(following.group(1).strip())
+            balance += _delimiter_balance(following.group(1))
+            j += 1
+
+        if not safe or balance != 0:
+            i += 1
+            continue
+
+        out.append(source[cursor:first.start()])
+        out.append("$$\n" + " ".join(piece for piece in pieces if piece) + "\n$$")
+        cursor = blocks[j].end()
+        i = j + 1
+
+    if not out:
+        return source
+    out.append(source[cursor:])
+    return "".join(out)
 
 
 def _looks_like_raw_math(text: str) -> bool:
@@ -121,6 +202,7 @@ def _video_location(match: re.Match) -> str:
 def preprocess_markdown(text: str) -> str:
     """Convert FiCS-specific HTML annotations into Pandoc semantic classes."""
     text = str(text or "").replace("\r\n", "\n")
+    text = _merge_split_display_delimiters(text)
     text = _AI_NOTE_RE.sub(_ai_note, text)
     text = _VISUAL_RE.sub(_visual_restore, text)
     text = _VIDEO_LINE_RE.sub(_video_location, text)
@@ -135,8 +217,8 @@ def compose_course_markdown(
     """Build the Markdown body for one course-note PDF.
 
     Keep the existing course notes intact, then append the complete readable
-    math-enhanced transcript. The conservative proofread transcript remains a
-    separate audit attachment managed by ``Emailer``.
+    math-enhanced transcript. The conservative proofread transcript remains
+    persisted as an audit source, rather than becoming a second email file.
     """
     parts = [preprocess_markdown(summary)]
     if str(math_transcript or "").strip():
