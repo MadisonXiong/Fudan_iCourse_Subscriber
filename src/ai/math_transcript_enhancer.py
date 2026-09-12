@@ -436,7 +436,7 @@ class MathTranscriptEnhancer:
                 model_id = f"{provider}/{model}"
                 t0 = time.time()
                 try:
-                    resp = client.chat.completions.create(
+                    request = dict(
                         model=model,
                         messages=[
                             {"role": "system", "content": system},
@@ -446,6 +446,13 @@ class MathTranscriptEnhancer:
                         max_tokens=max_tokens,
                         timeout=_TIMEOUT,
                     )
+                    # Gemini 3 thinking defaults to medium.  Guide extraction
+                    # and transcript editing need a long visible response more
+                    # than deep hidden reasoning, so keep thinking low and
+                    # reserve the completion budget for the actual transcript.
+                    if provider == "gemini":
+                        request["reasoning_effort"] = "low"
+                    resp = client.chat.completions.create(**request)
                     choice = resp.choices[0]
                     text = (choice.message.content or "").strip()
                     if not text:
@@ -491,9 +498,10 @@ class MathTranscriptEnhancer:
             summary_guide, model = self._call_with_system(
                 f"【课程名称】{course_title or '（未知）'}\n"
                 f"【AI 课程总结参考】\n{summary}\n\n"
-                "请提取用于校订课堂逐字稿的课程主线、数学术语、定义和公式记法。",
+                "请提取用于校订课堂逐字稿的课程主线、数学术语、定义和公式记法。"
+                "只保留明确有用的条目，总长度不超过 1600 个汉字。",
                 system=_FINAL_GUIDE_SYSTEM,
-                max_tokens=2200,
+                max_tokens=8000,
                 stage="summary-reference-guide",
             )
             models.append(model)
@@ -526,13 +534,14 @@ class MathTranscriptEnhancer:
                 f"【由 AI 课程总结提取的校对参考】\n{summary_guide}\n\n"
                 f"【全课术语审校分段 {index}/{len(groups)}；连续完整 CHUNK】\n\n"
                 + "\n\n".join(group)
-                + "\n\n请提取本分段供全课终审使用的术语与一致性指南。"
+                + "\n\n请提取本分段供全课终审使用的术语与一致性指南；"
+                "只保留高置信度条目，总长度不超过 2000 个汉字。"
             )
             try:
                 guide, model = self._call_with_system(
                     prompt,
                     system=_FINAL_GUIDE_SYSTEM,
-                    max_tokens=5000,
+                    max_tokens=10000,
                     stage=f"global-guide-{index}",
                 )
                 partials.append(guide)
@@ -555,13 +564,14 @@ class MathTranscriptEnhancer:
             + "\n\n".join(
                 f"### 分段 {i}\n{guide}" for i, guide in enumerate(partials, 1)
             )
-            + "\n\n请去重、合并为一份保守的全课术语与一致性指南。"
+            + "\n\n请去重、合并为一份保守的全课术语与一致性指南；"
+            "总长度不超过 2400 个汉字。"
         )
         try:
             merged, model = self._call_with_system(
                 merge_prompt,
                 system=_FINAL_GUIDE_SYSTEM,
-                max_tokens=2400,
+                max_tokens=8000,
                 stage="global-guide-merge",
             )
             models.append(model)
@@ -620,7 +630,7 @@ class MathTranscriptEnhancer:
             text, model = self._call_with_system(
                 prompt,
                 system=_FINAL_REVIEW_SYSTEM,
-                max_tokens=9000,
+                max_tokens=12000,
                 stage="final-review",
             )
             models.append(model)
@@ -648,7 +658,7 @@ class MathTranscriptEnhancer:
                 retry, model = self._call_with_system(
                     prompt + "\n\n" + _FINAL_RETRY,
                     system=_FINAL_REVIEW_SYSTEM,
-                    max_tokens=9000,
+                    max_tokens=12000,
                     stage="final-review-retry",
                 )
                 models.append(model)
@@ -891,6 +901,7 @@ class MathTranscriptEnhancer:
                 models.extend(used)
                 fallbacks += failed
 
+        editorial_input = [dict(seg) for seg in enhanced]
         enhanced, final_models, final_fallbacks = self._final_review(
             enhanced,
             course_title=course_title,
@@ -901,6 +912,30 @@ class MathTranscriptEnhancer:
             raise RuntimeError(
                 f"editorial review incomplete: {final_fallbacks}/{len(enhanced)} "
                 "chunks were not accepted"
+            )
+
+        changed = sum(
+            1 for before, after in zip(editorial_input, enhanced)
+            if str(before.get("text") or "").strip()
+            != str(after.get("text") or "").strip()
+        )
+        before_chars = sum(
+            len(str(seg.get("text") or ""))
+            for seg in editorial_input
+        )
+        after_chars = sum(len(str(seg.get("text") or "")) for seg in enhanced)
+        required_changed = max(1, len(enhanced) // 5)
+        print(
+            f"[MathTranscript:editorial] accepted={len(enhanced)}/{len(enhanced)}, "
+            f"changed={changed}/{len(enhanced)}, "
+            f"chars={before_chars}->{after_chars}, "
+            f"minimum_changed={required_changed}",
+            flush=True,
+        )
+        if changed < required_changed:
+            raise RuntimeError(
+                "editorial review made too few substantive chunk edits: "
+                f"{changed}/{len(enhanced)} (required {required_changed})"
             )
 
         md = [
