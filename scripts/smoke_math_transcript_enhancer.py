@@ -15,6 +15,7 @@ from src.ai.math_transcript_enhancer import (
     _correct_high_confidence_asr,
     _has_formula_evidence,
     _source_coverage,
+    _valid_final_candidate,
     _valid_candidate,
 )
 from src.api.emailer import Emailer
@@ -40,6 +41,26 @@ class _UnavailableEnhancer(MathTranscriptEnhancer):
 class _BrokenEnhancer:
     def enhance(self, *args, **kwargs):
         raise RuntimeError("enhancement unavailable")
+
+
+class _FinalReviewEnhancer(MathTranscriptEnhancer):
+    """Deterministic model double covering the full-transcript second pass."""
+
+    def __init__(self):
+        self.saw_complete_transcript = False
+
+    def _call_with_system(self, prompt, *, system, max_tokens, stage):
+        if stage == "global-guide":
+            self.saw_complete_transcript = "赋饭空间" in prompt and "整堂课" in prompt
+            return "- 赋饭空间 → 赋范空间（全课重复语境确认）", "test/global-guide"
+        if stage == "final-review":
+            return (
+                "<<<CHUNK 1>>>\n"
+                "这里继续完整讨论赋范空间的定义和性质，老师提醒大家结合实变函数复习。\n"
+                "<<<END CHUNK 1>>>",
+                "test/final-review",
+            )
+        raise AssertionError(f"unexpected stage: {stage}")
 
 
 class _FakeDb:
@@ -76,7 +97,7 @@ def main() -> None:
     prior_board = "#### 00:00\n$x+y=0$"
     assert not _has_formula_evidence("下面继续讲。", [], prior_board, 1, 2)
     assert _has_formula_evidence("刚才这个式子很重要。", [], prior_board, 1, 2)
-    assert MATH_TRANSCRIPT_VERSION == 5
+    assert MATH_TRANSCRIPT_VERSION == 6
     fp_a = source_fingerprint("泛函分析", "稿", source, [], "")
     fp_b = source_fingerprint("高等数理统计", "稿", source, [], "")
     assert fp_a != fp_b
@@ -96,6 +117,40 @@ def main() -> None:
         course_title="泛函分析",
         has_visual_evidence=True,
     )
+
+    visual = (
+        '<span data-visual-restored="true" style="color:#7c3aed;">'
+        '〔视觉补全〕$d(x,y)=d(y,x)$</span>'
+    )
+    final_source = "这里办案分析继续讨论度量。" + visual
+    final_good = "这里泛函分析继续讨论度量。" + visual
+    assert _valid_final_candidate(
+        final_source,
+        final_good,
+        course_title="泛函分析",
+    )
+    assert not _valid_final_candidate(
+        final_source,
+        final_good.replace("d(x,y)", "d(x,z)"),
+        course_title="泛函分析",
+    )
+
+    second_pass = _FinalReviewEnhancer()
+    reviewed, review_models, review_fallbacks = second_pass._final_review(
+        [
+            {
+                "start_ms": 0,
+                "end_ms": 180000,
+                "text": "这里继续完整讨论赋饭空间的定义和性质，老师提醒大家结合实变函数复习。",
+            }
+        ],
+        course_title="泛函分析",
+    )
+    assert second_pass.saw_complete_transcript
+    assert reviewed[0]["text"].startswith("这里继续完整讨论赋范空间")
+    assert reviewed[0]["final_review_status"] == "ai_final_reviewed"
+    assert review_models == ["test/global-guide", "test/final-review"]
+    assert review_fallbacks == 0
 
     full_speech = (
         "首先欢迎大家选修泛函分析课程。作业每周一收发，平时成绩占百分之三十，"
@@ -148,7 +203,9 @@ def main() -> None:
     assert "十遍函数" not in result.markdown
     assert "data-visual-restored" not in result.markdown
     assert "完整课堂语音转写" in result.markdown
-    assert result.model_label.startswith("math-transcript-v5/")
+    assert result.model_label.startswith("math-transcript-v6/")
+    assert "final-review-fallback[1]" in result.model_label
+    assert "全部内容生成后" in result.markdown
 
     faithful_markdown = "# AI 校订语音转写\n\n完整老师讲述。"
     emailer = object.__new__(Emailer)
@@ -191,7 +248,7 @@ def main() -> None:
     assert _comparison_text("".join(x["text"] for x in rebuilt)) == _comparison_text(legacy)
     fallback = _raw_transcript_markdown(rebuilt)
     assert all(segment["text"] in fallback for segment in rebuilt)
-    print("math transcript v5 smoke checks passed")
+    print("math transcript v6 two-pass smoke checks passed")
 
 
 if __name__ == "__main__":

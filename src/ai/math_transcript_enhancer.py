@@ -1,8 +1,10 @@
 """Readable math transcript built on top of the faithful audit transcript.
 
-This optional second layer may make high-confidence contextual ASR corrections
-and restore formulas from same-window PPT/blackboard evidence.  The faithful
-AI-proofread transcript is never modified and remains the audit trail.
+The first pass may make high-confidence contextual ASR corrections and restore
+formulas from same-window PPT/blackboard evidence.  After every chunk exists, a
+second model pass reads the complete lecture for terminology consistency and
+then reviews every chunk again.  The faithful AI-proofread transcript is never
+modified and remains the audit trail.
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ _BOARD_MAX = int(os.environ.get("MATH_TRANSCRIPT_BOARD_CHARS", "4000"))
 _BOARD_CONTEXT_MAX = int(os.environ.get("MATH_TRANSCRIPT_BOARD_CONTEXT_CHARS", "900"))
 _PPT_MAX = int(os.environ.get("MATH_TRANSCRIPT_PPT_CHARS", "1400"))
 _CONTEXT_MAX = int(os.environ.get("MATH_TRANSCRIPT_CONTEXT_CHARS", "700"))
+_FINAL_GUIDE_MAX = int(os.environ.get("MATH_TRANSCRIPT_FINAL_GUIDE_CHARS", "6000"))
 _BOARD_RE = re.compile(r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$", re.M)
 _OUT_RE = re.compile(
     r"<<<CHUNK\s+(\d+)>>>\s*(.*?)\s*<<<END\s+CHUNK\s+\1>>>", re.I | re.S
@@ -77,6 +80,44 @@ _SYSTEM = rf"""
 
 _RETRY = rf"""
 上一轮存在缺块、删句或改动过大。重新处理整个批次：逐句保留原文，包括所有课程介绍、通知、作业和评分信息；只做高置信度的局部 ASR 纠错和最小必要公式恢复；不得摘要或用板书替换语音。ASR 纠错保持黑色，只有视觉证据新增的内容才放在 {_VIS_OPEN}...{_VIS_CLOSE} 中；相邻语音只能辅助纠错；最近前序板书只有在当前语音明确指代上式时才能用于恢复公式；禁止搬运完整定义/定理/证明；剔除紫色视觉补全后，黑色正文的信息量和长度必须与原转写基本一致；必须输出全部编号。
+""".strip()
+
+_FINAL_GUIDE_SYSTEM = """
+你是数学课堂转写的全稿术语审校员。你会读到按时间排列的完整增强转写。
+
+你的任务不是重写课程，而是提取供第二轮逐段终审使用的全局一致性指南：
+- 课程中反复出现的数学术语、人物名、教材名、英文词和符号记法；
+- 根据全课重复语境可以高置信度确认的 ASR 同音/近音错误及“错误 → 正确”映射；
+- 前后不一致但能够依据重复出现内容确定的称呼或记号。
+
+不得补充课堂未出现的知识，不得依据常识猜测孤立疑难句，不得把视觉公式当成老师说过的话。
+只输出简短的项目列表；证据不足的项目不要写。不要输出改写后的转写。
+""".strip()
+
+_FINAL_REVIEW_SYSTEM = rf"""
+你是数学课堂“完整转写终审员”。第一轮增强已经完成；现在依据全课术语指南和相邻段落，对每个 CHUNK 再校对一遍。
+
+允许：
+1. 修正高置信度 ASR 同音/近音错误、数学术语、人物名、教材名和英文词；
+2. 修正明显错误的断句、标点及已有数学表达的 $...$ 记法；
+3. 统一全课已经反复确认的术语和符号称呼。
+
+禁止：
+1. 不得删除、摘要、润色、扩写或改变老师的意思、顺序和信息量；不确定处保留原文或标 `[语音存疑]`；
+2. 不得新增公式或知识。第二轮没有视觉证据输入，不能进行新的视觉补全；
+3. 输入中所有从 `{_VIS_OPEN}` 开始到 `{_VIS_CLOSE}` 结束的紫色视觉补全必须逐字、逐符号、原位置保留，不能修改、删除、复制或新增；
+4. 相邻段落和全课指南只用于判断当前 CHUNK 的词语，不能复制到当前段；
+5. 一个输入 CHUNK 对应一个输出 CHUNK，编号一致，不得遗漏。
+
+严格输出：
+<<<CHUNK 1>>>
+终审后的完整正文
+<<<END CHUNK 1>>>
+不得在 CHUNK 块之外输出任何内容。
+""".strip()
+
+_FINAL_RETRY = """
+上一轮终审存在漏句、改动过大或视觉补全被改写。请重新逐句核对：只做高置信度局部纠错；完整保留全部口语信息；所有紫色视觉补全必须与输入逐字相同并保持原位置；不得新增公式；输出全部编号。
 """.strip()
 
 
@@ -289,6 +330,45 @@ def _valid_candidate(
     return True
 
 
+def _visual_fragments(text: str) -> list[str]:
+    """Return complete visual-restoration fragments in source order."""
+    return re.findall(
+        re.escape(_VIS_OPEN) + r".*?" + re.escape(_VIS_CLOSE),
+        str(text or ""),
+        flags=re.S,
+    )
+
+
+def _valid_final_candidate(source: str, candidate: str, *, course_title: str) -> bool:
+    """Accept only a complete, conservative second-pass textual correction."""
+    if not _safe(source, candidate):
+        return False
+    # The final pass has no visual evidence and therefore may neither add nor
+    # alter formula restorations accepted by the evidence-aware first pass.
+    if _visual_fragments(candidate) != _visual_fragments(source):
+        return False
+    source_spoken = _spoken_text(source)
+    corrected_source = _correct_high_confidence_asr(source_spoken, course_title)
+    if _source_coverage(corrected_source, candidate) < _MIN_SOURCE_COVERAGE:
+        return False
+    if not _clauses_preserved(corrected_source, _spoken_text(candidate)):
+        return False
+    corrected_candidate = _spoken_text(candidate)
+    title = str(course_title or "")
+    for keyword, replacements in _HIGH_CONFIDENCE_ASR.items():
+        if keyword not in title:
+            continue
+        for wrong, right in replacements:
+            if (
+                right in corrected_source
+                and corrected_candidate.count(right) < corrected_source.count(right)
+            ):
+                return False
+            if wrong not in corrected_source and wrong in corrected_candidate:
+                return False
+    return True
+
+
 def _parse(text: str, n: int) -> dict[int, str]:
     out = {}
     for m in _OUT_RE.finditer(text or ""):
@@ -317,6 +397,21 @@ class MathTranscriptEnhancer:
             raise ValueError("No model provider available for math transcript enhancement")
 
     def _call(self, prompt: str) -> tuple[str, str]:
+        return self._call_with_system(
+            prompt,
+            system=_SYSTEM,
+            max_tokens=9000,
+            stage="enhance",
+        )
+
+    def _call_with_system(
+        self,
+        prompt: str,
+        *,
+        system: str,
+        max_tokens: int,
+        stage: str,
+    ) -> tuple[str, str]:
         errors = []
         for provider, client, models in self.providers:
             for model in models:
@@ -326,11 +421,11 @@ class MathTranscriptEnhancer:
                     resp = client.chat.completions.create(
                         model=model,
                         messages=[
-                            {"role": "system", "content": _SYSTEM},
+                            {"role": "system", "content": system},
                             {"role": "user", "content": prompt},
                         ],
                         temperature=.03,
-                        max_tokens=9000,
+                        max_tokens=max_tokens,
                         timeout=_TIMEOUT,
                     )
                     choice = resp.choices[0]
@@ -340,7 +435,8 @@ class MathTranscriptEnhancer:
                     if str(getattr(choice, "finish_reason", "") or "").lower() == "length":
                         raise RuntimeError("truncated response")
                     print(
-                        f"[MathTranscript] {model_id}: {len(prompt)} -> {len(text)} chars "
+                        f"[MathTranscript:{stage}] {model_id}: "
+                        f"{len(prompt)} -> {len(text)} chars "
                         f"in {time.time()-t0:.0f}s", flush=True
                     )
                     return text, model_id
@@ -349,6 +445,178 @@ class MathTranscriptEnhancer:
                     errors.append(msg)
                     print(f"[MathTranscript] {msg}", flush=True)
         raise RuntimeError("All math transcript models failed: " + " | ".join(errors))
+
+    def _global_review_guide(
+        self,
+        enhanced: list[dict],
+        *,
+        course_title: str,
+    ) -> tuple[str, list[str]]:
+        """Have the model read the complete assembled transcript once."""
+        complete = "\n\n".join(
+            f"## {_fmt(seg['start_ms'])}–{_fmt(seg['end_ms'])}\n{seg['text']}"
+            for seg in enhanced
+        )
+        prompt = (
+            f"【课程名称】{course_title or '（未知）'}\n\n"
+            "【完整第一轮增强转写；覆盖整堂课】\n"
+            f"{complete}\n\n"
+            "请生成供逐段终审使用的全课术语与一致性指南。"
+        )
+        try:
+            guide, model = self._call_with_system(
+                prompt,
+                system=_FINAL_GUIDE_SYSTEM,
+                max_tokens=2400,
+                stage="global-guide",
+            )
+        except Exception as exc:
+            print(
+                f"[MathTranscript:global-guide] unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return "（全课指南不可用；仅进行保守逐段终审）", []
+        return _trim(guide, _FINAL_GUIDE_MAX, "全课术语指南"), [model]
+
+    def _final_prompt(
+        self,
+        batch: list[dict],
+        *,
+        course_title: str,
+        source: list[dict],
+        batch_start: int,
+        guide: str,
+    ) -> str:
+        blocks = [
+            f"【课程名称】{course_title or '（未知）'}",
+            f"【通读完整转写后形成的全课术语与一致性指南】\n{guide}",
+        ]
+        for i, seg in enumerate(batch, 1):
+            before, after = _adjacent_context(source, batch_start + i - 1)
+            blocks.append(
+                f"===== FINAL INPUT CHUNK {i} =====\n"
+                f"【视频时段】{_fmt(seg['start_ms'])}–{_fmt(seg['end_ms'])}\n"
+                f"【相邻上文（只用于判断术语）】\n{before or '（无）'}\n\n"
+                f"【第一轮增强完整正文】\n{seg['text']}\n\n"
+                f"【相邻下文（只用于判断术语）】\n{after or '（无）'}"
+            )
+        return "\n\n".join(blocks)
+
+    def _final_batch(
+        self,
+        batch: list[dict],
+        *,
+        course_title: str,
+        source: list[dict],
+        batch_start: int,
+        guide: str,
+    ) -> tuple[list[dict], list[str], int]:
+        prompt = self._final_prompt(
+            batch,
+            course_title=course_title,
+            source=source,
+            batch_start=batch_start,
+            guide=guide,
+        )
+        models: list[str] = []
+        try:
+            text, model = self._call_with_system(
+                prompt,
+                system=_FINAL_REVIEW_SYSTEM,
+                max_tokens=9000,
+                stage="final-review",
+            )
+            models.append(model)
+            parsed = _parse(text, len(batch))
+        except Exception as exc:
+            print(
+                f"[MathTranscript:final-review] batch unavailable; preserving first pass: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return [
+                {**seg, "final_review_status": "first_pass_api_fallback"}
+                for seg in batch
+            ], models, len(batch)
+
+        bad = {
+            i
+            for i, seg in enumerate(batch, 1)
+            if not _valid_final_candidate(
+                seg["text"], parsed.get(i, ""), course_title=course_title
+            )
+        }
+        if bad:
+            try:
+                retry, model = self._call_with_system(
+                    prompt + "\n\n" + _FINAL_RETRY,
+                    system=_FINAL_REVIEW_SYSTEM,
+                    max_tokens=9000,
+                    stage="final-review-retry",
+                )
+                models.append(model)
+                retry_parsed = _parse(retry, len(batch))
+                for i in list(bad):
+                    seg = batch[i - 1]
+                    if _valid_final_candidate(
+                        seg["text"], retry_parsed.get(i, ""), course_title=course_title
+                    ):
+                        parsed[i] = retry_parsed[i]
+                        bad.remove(i)
+            except Exception as exc:
+                print(
+                    f"[MathTranscript:final-review] retry unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        out = []
+        for i, seg in enumerate(batch, 1):
+            if i in bad or not parsed.get(i):
+                out.append({**seg, "final_review_status": "first_pass_safety_fallback"})
+            else:
+                out.append(
+                    {
+                        **seg,
+                        "text": parsed[i].strip(),
+                        "final_review_status": "ai_final_reviewed",
+                    }
+                )
+        return out, models, len(bad)
+
+    def _final_review(
+        self,
+        enhanced: list[dict],
+        *,
+        course_title: str,
+    ) -> tuple[list[dict], list[str], int]:
+        """Run a complete second pass after all first-pass chunks exist."""
+        guide, models = self._global_review_guide(
+            enhanced,
+            course_title=course_title,
+        )
+        reviewed: list[dict] = []
+        fallbacks = 0
+        batches = (len(enhanced) + _BATCH - 1) // _BATCH
+        for start in range(0, len(enhanced), _BATCH):
+            batch = enhanced[start:start + _BATCH]
+            print(
+                f"[MathTranscript:final-review] batch {start//_BATCH+1}/{batches}: "
+                f"{len(batch)} chunk(s)",
+                flush=True,
+            )
+            out, used, failed = self._final_batch(
+                batch,
+                course_title=course_title,
+                source=enhanced,
+                batch_start=start,
+                guide=guide,
+            )
+            reviewed.extend(out)
+            models.extend(used)
+            fallbacks += failed
+        return reviewed, models, fallbacks
 
     @staticmethod
     def _normalise(seg: dict) -> dict | None:
@@ -506,9 +774,15 @@ class MathTranscriptEnhancer:
             models.extend(used)
             fallbacks += failed
 
+        enhanced, final_models, final_fallbacks = self._final_review(
+            enhanced,
+            course_title=course_title,
+        )
+        models.extend(final_models)
+
         md = [
             "# 完整课堂语音转写（AI 校订与公式补全）", "",
-            "> 本附录完整保留老师的语音讲述。大模型依据课程上下文和视觉证据校正 ASR 错误；有直接证据恢复的公式以紫色“视觉补全”显示。忠实校订底稿另作为独立附件保留，便于回查。", "",
+            "> 本附录完整保留老师的语音讲述。第一轮由大模型依据课程上下文和视觉证据校正 ASR 错误并补全公式；全部内容生成后，第二轮大模型通读全课并按全局术语一致性逐段终审。有直接证据恢复的公式以紫色“视觉补全”显示，忠实校订底稿保存在系统中，便于回查。", "",
         ]
         for seg in enhanced:
             md += [
@@ -519,7 +793,9 @@ class MathTranscriptEnhancer:
         for model in models:
             if model and model not in unique:
                 unique.append(model)
-        label = "math-transcript-v5/" + ("+".join(unique) if unique else "no-llm")
+        label = "math-transcript-v6/" + ("+".join(unique) if unique else "no-llm")
         if fallbacks:
             label += f"|safe-base-fallback[{fallbacks}]"
+        if final_fallbacks:
+            label += f"|final-review-fallback[{final_fallbacks}]"
         return MathTranscriptResult("\n".join(md).strip() + "\n", enhanced, label)
