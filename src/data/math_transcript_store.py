@@ -13,8 +13,8 @@ import json
 from datetime import datetime
 
 
-MATH_TRANSCRIPT_VERSION = 6
-_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v6:"
+MATH_TRANSCRIPT_VERSION = 7
+_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v7:"
 
 
 def source_fingerprint(

@@ -50,8 +50,10 @@ class _FinalReviewEnhancer(MathTranscriptEnhancer):
         self.saw_complete_transcript = False
 
     def _call_with_system(self, prompt, *, system, max_tokens, stage):
-        if stage == "global-guide":
-            self.saw_complete_transcript = "赋饭空间" in prompt and "整堂课" in prompt
+        if stage.startswith("global-guide"):
+            self.saw_complete_transcript = (
+                "赋饭空间" in prompt and "全课术语审校分段" in prompt
+            )
             return "- 赋饭空间 → 赋范空间（全课重复语境确认）", "test/global-guide"
         if stage == "final-review":
             return (
@@ -97,7 +99,7 @@ def main() -> None:
     prior_board = "#### 00:00\n$x+y=0$"
     assert not _has_formula_evidence("下面继续讲。", [], prior_board, 1, 2)
     assert _has_formula_evidence("刚才这个式子很重要。", [], prior_board, 1, 2)
-    assert MATH_TRANSCRIPT_VERSION == 6
+    assert MATH_TRANSCRIPT_VERSION == 7
     fp_a = source_fingerprint("泛函分析", "稿", source, [], "")
     fp_b = source_fingerprint("高等数理统计", "稿", source, [], "")
     assert fp_a != fp_b
@@ -203,7 +205,7 @@ def main() -> None:
     assert "十遍函数" not in result.markdown
     assert "data-visual-restored" not in result.markdown
     assert "完整课堂语音转写" in result.markdown
-    assert result.model_label.startswith("math-transcript-v6/")
+    assert result.model_label.startswith("math-transcript-v7/")
     assert "final-review-fallback[1]" in result.model_label
     assert "全部内容生成后" in result.markdown
 
@@ -248,7 +250,7 @@ def main() -> None:
     assert _comparison_text("".join(x["text"] for x in rebuilt)) == _comparison_text(legacy)
     fallback = _raw_transcript_markdown(rebuilt)
     assert all(segment["text"] in fallback for segment in rebuilt)
-    print("math transcript v6 two-pass smoke checks passed")
+    print("math transcript v7 two-pass smoke checks passed")
 
 
 if __name__ == "__main__":

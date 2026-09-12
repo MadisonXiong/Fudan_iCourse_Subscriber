@@ -29,6 +29,9 @@ _BOARD_CONTEXT_MAX = int(os.environ.get("MATH_TRANSCRIPT_BOARD_CONTEXT_CHARS", "
 _PPT_MAX = int(os.environ.get("MATH_TRANSCRIPT_PPT_CHARS", "1400"))
 _CONTEXT_MAX = int(os.environ.get("MATH_TRANSCRIPT_CONTEXT_CHARS", "700"))
 _FINAL_GUIDE_MAX = int(os.environ.get("MATH_TRANSCRIPT_FINAL_GUIDE_CHARS", "6000"))
+_FINAL_GUIDE_INPUT_MAX = int(
+    os.environ.get("MATH_TRANSCRIPT_FINAL_GUIDE_INPUT_CHARS", "18000")
+)
 _BOARD_RE = re.compile(r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$", re.M)
 _OUT_RE = re.compile(
     r"<<<CHUNK\s+(\d+)>>>\s*(.*?)\s*<<<END\s+CHUNK\s+\1>>>", re.I | re.S
@@ -452,32 +455,85 @@ class MathTranscriptEnhancer:
         *,
         course_title: str,
     ) -> tuple[str, list[str]]:
-        """Have the model read the complete assembled transcript once."""
-        complete = "\n\n".join(
+        """Read every assembled chunk, then synthesize a compact global guide.
+
+        Sending a long lecture in one request can make the provider truncate
+        its response.  We therefore extract guides from contiguous, complete
+        groups of chunks and merge those guides once.  Every chunk is still
+        read after first-pass assembly; no transcript text is sampled away.
+        """
+        blocks = [
             f"## {_fmt(seg['start_ms'])}–{_fmt(seg['end_ms'])}\n{seg['text']}"
             for seg in enhanced
-        )
-        prompt = (
-            f"【课程名称】{course_title or '（未知）'}\n\n"
-            "【完整第一轮增强转写；覆盖整堂课】\n"
-            f"{complete}\n\n"
-            "请生成供逐段终审使用的全课术语与一致性指南。"
+        ]
+        groups: list[list[str]] = []
+        current: list[str] = []
+        current_len = 0
+        for block in blocks:
+            extra = len(block) + (2 if current else 0)
+            if current and current_len + extra > _FINAL_GUIDE_INPUT_MAX:
+                groups.append(current)
+                current, current_len = [], 0
+            current.append(block)
+            current_len += extra
+        if current:
+            groups.append(current)
+
+        partials: list[str] = []
+        models: list[str] = []
+        for index, group in enumerate(groups, 1):
+            prompt = (
+                f"【课程名称】{course_title or '（未知）'}\n"
+                f"【全课术语审校分段 {index}/{len(groups)}；连续完整 CHUNK】\n\n"
+                + "\n\n".join(group)
+                + "\n\n请提取本分段供全课终审使用的术语与一致性指南。"
+            )
+            try:
+                guide, model = self._call_with_system(
+                    prompt,
+                    system=_FINAL_GUIDE_SYSTEM,
+                    max_tokens=1800,
+                    stage=f"global-guide-{index}",
+                )
+                partials.append(guide)
+                models.append(model)
+            except Exception as exc:
+                print(
+                    f"[MathTranscript:global-guide] segment {index}/{len(groups)} "
+                    f"unavailable: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        if not partials:
+            return "（全课指南不可用；仅进行保守逐段终审）", models
+        if len(partials) == 1:
+            return _trim(partials[0], _FINAL_GUIDE_MAX, "全课术语指南"), models
+
+        merge_prompt = (
+            f"【课程名称】{course_title or '（未知）'}\n"
+            "【按全课顺序提取的分段术语指南】\n\n"
+            + "\n\n".join(
+                f"### 分段 {i}\n{guide}" for i, guide in enumerate(partials, 1)
+            )
+            + "\n\n请去重、合并为一份保守的全课术语与一致性指南。"
         )
         try:
-            guide, model = self._call_with_system(
-                prompt,
+            merged, model = self._call_with_system(
+                merge_prompt,
                 system=_FINAL_GUIDE_SYSTEM,
                 max_tokens=2400,
-                stage="global-guide",
+                stage="global-guide-merge",
             )
+            models.append(model)
+            guide = merged
         except Exception as exc:
             print(
-                f"[MathTranscript:global-guide] unavailable: "
-                f"{type(exc).__name__}: {exc}",
+                f"[MathTranscript:global-guide] merge unavailable; using all "
+                f"partial guides: {type(exc).__name__}: {exc}",
                 flush=True,
             )
-            return "（全课指南不可用；仅进行保守逐段终审）", []
-        return _trim(guide, _FINAL_GUIDE_MAX, "全课术语指南"), [model]
+            guide = "\n".join(partials)
+        return _trim(guide, _FINAL_GUIDE_MAX, "全课术语指南"), models
 
     def _final_prompt(
         self,
@@ -793,7 +849,7 @@ class MathTranscriptEnhancer:
         for model in models:
             if model and model not in unique:
                 unique.append(model)
-        label = "math-transcript-v6/" + ("+".join(unique) if unique else "no-llm")
+        label = "math-transcript-v7/" + ("+".join(unique) if unique else "no-llm")
         if fallbacks:
             label += f"|safe-base-fallback[{fallbacks}]"
         if final_fallbacks:

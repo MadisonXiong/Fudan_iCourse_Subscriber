@@ -137,6 +137,15 @@ bare: <span data-visual-restored="true">〔视觉补全〕\Rightarrow \forall n\
         == r"[$\|x\|=0 \iff x=0.$]{.visual-restored}"
     )
 
+    # Cached AI output may lose exactly one edge dollar.  Nested interval
+    # brackets must not stop the semantic-span matcher from repairing it.
+    missing_open = (
+        r"[\Rightarrow \forall x\in[a,b],\ \exists f(x)\in\mathbb{R},\ "
+        r"\text{ 记之为 } f(x)$]{.visual-restored}"
+    )
+    assert preprocess_markdown(missing_open).startswith(r"[$\Rightarrow")
+    assert preprocess_markdown(missing_open).endswith(r"f(x)$]{.visual-restored}")
+
     split_set = r'''① 记
 $$L^p(X,\mu) = \left\{ f$$
 

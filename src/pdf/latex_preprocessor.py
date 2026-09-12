@@ -38,7 +38,7 @@ _INLINE_MATH_RE = re.compile(
 )
 _DISPLAY_BLOCK_RE = re.compile(r'\$\$(.*?)\$\$', re.DOTALL)
 _BRACKETED_VISUAL_RE = re.compile(
-    r'\[([^\[\]\n]+)\]\{\.visual-restored\}'
+    r'\[(.*?)\]\{\.visual-restored\}', re.DOTALL
 )
 _SAFE_SPLIT_MATH_TEXT_RE = re.compile(
     r'^[\s\u3000\u4e00-\u9fffA-Za-z0-9，。；：、（）()“”‘’·,.!?+\-]+$'
@@ -164,6 +164,40 @@ def _looks_like_raw_math(text: str) -> bool:
     )
 
 
+def _single_dollar_positions(text: str) -> list[int]:
+    """Return unescaped single-dollar delimiters, excluding ``$$`` pairs."""
+    positions: list[int] = []
+    for i, char in enumerate(text):
+        if char != "$":
+            continue
+        if i and text[i - 1] == "\\":
+            continue
+        if (i and text[i - 1] == "$") or (i + 1 < len(text) and text[i + 1] == "$"):
+            continue
+        positions.append(i)
+    return positions
+
+
+def _repair_visual_math_delimiters(inner: str) -> str:
+    """Repair a lost edge delimiter in a visual formula without changing it.
+
+    A real cached transcript contained ``[\\Rightarrow ... f(x)$]{...}``:
+    the model had dropped only the opening dollar.  Pandoc interpreted the
+    remaining dollar as literal text and generated invalid LaTeX.  Visual
+    formulas are provenance-bounded, so adding the missing opposite edge is a
+    deterministic representation repair, not a mathematical edit.
+    """
+    stripped = inner.strip()
+    dollars = _single_dollar_positions(stripped)
+    if len(dollars) % 2 == 0 or not _looks_like_raw_math(stripped):
+        return inner
+    if dollars == [0]:
+        return stripped + "$"
+    if dollars == [len(stripped) - 1]:
+        return "$" + stripped
+    return inner
+
+
 def _normalize_bracketed_visual(match: re.Match) -> str:
     r"""Add math delimiters to an already-semantic bare visual formula.
 
@@ -171,10 +205,10 @@ def _normalize_bracketed_visual(match: re.Match) -> str:
     bypassing :func:`_visual_restore`.  A bare ``\iff`` or norm expression in
     such a span would otherwise place math-only commands in LaTeX text mode.
     """
-    inner = match.group(1)
+    inner = _repair_visual_math_delimiters(match.group(1))
     if "$" not in inner and _looks_like_raw_math(inner):
         return f"[${inner.strip()}$]{{.visual-restored}}"
-    return match.group(0)
+    return f"[{inner}]{{.visual-restored}}"
 
 
 def _visual_restore(match: re.Match) -> str:
@@ -202,6 +236,7 @@ def _visual_restore(match: re.Match) -> str:
         )
 
     inner = _normalize_inline_math(inner)
+    inner = _repair_visual_math_delimiters(inner)
 
     # A few model responses violate the contract by returning bare TeX such as
     # ``\Rightarrow ...``.  Treat it as math rather than allowing Pandoc to
