@@ -13,12 +13,13 @@ import json
 from datetime import datetime
 
 
-MATH_TRANSCRIPT_VERSION = 7
-_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v7:"
+MATH_TRANSCRIPT_VERSION = 8
+_KEY_PREFIX = "blackboard_cache_blob:math-transcript-v8:"
 
 
 def source_fingerprint(
     course_title: str,
+    summary_reference: str,
     proofread_markdown: str,
     proofread_segments: list[dict] | None,
     ppt_pages: list[dict] | None,
@@ -27,6 +28,8 @@ def source_fingerprint(
     """Fingerprint exactly the evidence used to produce an enhanced transcript."""
     digest = hashlib.sha256()
     digest.update(str(course_title or "").encode("utf-8"))
+    digest.update(b"\0summary-reference\0")
+    digest.update(str(summary_reference or "").encode("utf-8"))
     digest.update(b"\0proofread\0")
     digest.update(str(proofread_markdown or "").encode("utf-8"))
     digest.update(b"\0segments\0")

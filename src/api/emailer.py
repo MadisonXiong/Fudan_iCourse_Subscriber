@@ -75,8 +75,10 @@ class Emailer:
         board_cached = get_blackboard(db, sub_id)
         raw_blackboard = board_cached[0] if board_cached else ""
         ppt_pages = db.get_done_ppt_pages(sub_id)
+        summary_reference = str(item.get("summary") or "").strip()
         fingerprint = source_fingerprint(
             course_title,
+            summary_reference,
             proofread_markdown,
             proofread_segments,
             ppt_pages,
@@ -105,6 +107,7 @@ class Emailer:
                 ppt_pages,
                 course_title=course_title,
                 raw_blackboard=raw_blackboard,
+                summary_reference=summary_reference,
             )
             save_math_transcript(
                 db,

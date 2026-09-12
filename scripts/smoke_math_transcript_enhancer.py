@@ -48,8 +48,12 @@ class _FinalReviewEnhancer(MathTranscriptEnhancer):
 
     def __init__(self):
         self.saw_complete_transcript = False
+        self.saw_summary_reference = False
 
     def _call_with_system(self, prompt, *, system, max_tokens, stage):
+        if stage == "summary-reference-guide":
+            self.saw_summary_reference = "赋范空间是核心概念" in prompt
+            return "- 课程主线：赋范空间", "test/summary-reference"
         if stage.startswith("global-guide"):
             self.saw_complete_transcript = (
                 "赋饭空间" in prompt and "全课术语审校分段" in prompt
@@ -99,9 +103,9 @@ def main() -> None:
     prior_board = "#### 00:00\n$x+y=0$"
     assert not _has_formula_evidence("下面继续讲。", [], prior_board, 1, 2)
     assert _has_formula_evidence("刚才这个式子很重要。", [], prior_board, 1, 2)
-    assert MATH_TRANSCRIPT_VERSION == 7
-    fp_a = source_fingerprint("泛函分析", "稿", source, [], "")
-    fp_b = source_fingerprint("高等数理统计", "稿", source, [], "")
+    assert MATH_TRANSCRIPT_VERSION == 8
+    fp_a = source_fingerprint("泛函分析", "总结甲", "稿", source, [], "")
+    fp_b = source_fingerprint("泛函分析", "总结乙", "稿", source, [], "")
     assert fp_a != fp_b
     assert _valid_candidate(
         corrected,
@@ -136,6 +140,16 @@ def main() -> None:
         final_good.replace("d(x,y)", "d(x,z)"),
         course_title="泛函分析",
     )
+    # The post-assembly pass is editorial, not a second conservative ASR copy:
+    # filler and repeated starts may be removed while the mathematical point
+    # and accepted visual evidence remain intact.
+    editorial_source = "好，那么，呃，我们现在来看这个这个赋范空间的定义。" + visual
+    editorial_good = "下面讨论赋范空间的定义。" + visual
+    assert _valid_final_candidate(
+        editorial_source,
+        editorial_good,
+        course_title="泛函分析",
+    )
 
     second_pass = _FinalReviewEnhancer()
     reviewed, review_models, review_fallbacks = second_pass._final_review(
@@ -147,11 +161,17 @@ def main() -> None:
             }
         ],
         course_title="泛函分析",
+        summary_reference="赋范空间是核心概念。",
     )
     assert second_pass.saw_complete_transcript
+    assert second_pass.saw_summary_reference
     assert reviewed[0]["text"].startswith("这里继续完整讨论赋范空间")
     assert reviewed[0]["final_review_status"] == "ai_final_reviewed"
-    assert review_models == ["test/global-guide", "test/final-review"]
+    assert review_models == [
+        "test/summary-reference",
+        "test/global-guide",
+        "test/final-review",
+    ]
     assert review_fallbacks == 0
 
     full_speech = (
@@ -205,7 +225,7 @@ def main() -> None:
     assert "十遍函数" not in result.markdown
     assert "data-visual-restored" not in result.markdown
     assert "完整课堂语音转写" in result.markdown
-    assert result.model_label.startswith("math-transcript-v7/")
+    assert result.model_label.startswith("math-transcript-v8/")
     assert "final-review-fallback[1]" in result.model_label
     assert "全部内容生成后" in result.markdown
 
@@ -250,7 +270,7 @@ def main() -> None:
     assert _comparison_text("".join(x["text"] for x in rebuilt)) == _comparison_text(legacy)
     fallback = _raw_transcript_markdown(rebuilt)
     assert all(segment["text"] in fallback for segment in rebuilt)
-    print("math transcript v7 two-pass smoke checks passed")
+    print("math transcript v8 editorial-review smoke checks passed")
 
 
 if __name__ == "__main__":

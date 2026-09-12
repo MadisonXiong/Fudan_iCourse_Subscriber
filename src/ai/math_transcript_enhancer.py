@@ -21,6 +21,7 @@ from src.runtime import config
 
 _TIMEOUT = int(os.environ.get("MATH_TRANSCRIPT_TIMEOUT", "300"))
 _BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_BATCH_SIZE", "5")))
+_FINAL_BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_FINAL_BATCH_SIZE", "3")))
 _MIN_RATIO, _MAX_RATIO = 0.90, 2.20
 _MIN_SOURCE_COVERAGE = 0.88
 _MIN_CLAUSE_COVERAGE = 0.65
@@ -31,6 +32,9 @@ _CONTEXT_MAX = int(os.environ.get("MATH_TRANSCRIPT_CONTEXT_CHARS", "700"))
 _FINAL_GUIDE_MAX = int(os.environ.get("MATH_TRANSCRIPT_FINAL_GUIDE_CHARS", "6000"))
 _FINAL_GUIDE_INPUT_MAX = int(
     os.environ.get("MATH_TRANSCRIPT_FINAL_GUIDE_INPUT_CHARS", "18000")
+)
+_SUMMARY_REFERENCE_MAX = int(
+    os.environ.get("MATH_TRANSCRIPT_SUMMARY_REFERENCE_CHARS", "24000")
 )
 _BOARD_RE = re.compile(r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$", re.M)
 _OUT_RE = re.compile(
@@ -86,31 +90,33 @@ _RETRY = rf"""
 """.strip()
 
 _FINAL_GUIDE_SYSTEM = """
-你是数学课堂转写的全稿术语审校员。你会读到按时间排列的完整增强转写。
+你是数学课堂转写的全稿内容审校员。你会读到“AI 课程总结”参考以及按时间排列的完整增强转写。
 
 你的任务不是重写课程，而是提取供第二轮逐段终审使用的全局一致性指南：
-- 课程中反复出现的数学术语、人物名、教材名、英文词和符号记法；
+- 从 AI 课程总结中提取课程主线、数学术语、定义、公式记法、人物名、教材名和英文词；
+- 对照转写中反复出现的内容，判断明显的 ASR 错词、断裂病句和数学语言错误；
 - 根据全课重复语境可以高置信度确认的 ASR 同音/近音错误及“错误 → 正确”映射；
 - 前后不一致但能够依据重复出现内容确定的称呼或记号。
 
-不得补充课堂未出现的知识，不得依据常识猜测孤立疑难句，不得把视觉公式当成老师说过的话。
-只输出简短的项目列表；证据不足的项目不要写。不要输出改写后的转写。
+课程总结是校对参考而不是逐字稿：不得用总结取代课堂讲述，不得补充两份材料都未出现的知识。
+只输出简短但具体的项目列表；证据不足的项目不要写。不要输出改写后的转写。
 """.strip()
 
 _FINAL_REVIEW_SYSTEM = rf"""
-你是数学课堂“完整转写终审员”。第一轮增强已经完成；现在依据全课术语指南和相邻段落，对每个 CHUNK 再校对一遍。
+你是数学课堂“完整转写编辑与终审员”。第一轮增强已经完成；现在依据 AI 课程总结、全课内容指南和相邻段落，把 ASR 口语稿校订为句意通顺、数学语言准确的课堂文字稿。
 
 允许：
-1. 修正高置信度 ASR 同音/近音错误、数学术语、人物名、教材名和英文词；
-2. 修正明显错误的断句、标点及已有数学表达的 $...$ 记法；
-3. 统一全课已经反复确认的术语和符号称呼。
+1. 增、删、改文字：删除“呃、啊、这个”等无意义口头填充、重复起句和明显 ASR 噪声；合并重复句；拆分或重组病句；补足被 ASR 吞掉但能由上下文确定的主语、谓语和连接词；
+2. 修正同音/近音错词、数学术语、人物名、教材名、英文词、断句和标点，使每句话自然通顺；
+3. 依据全课内容指南修正已有数学表达与 `$...$` 记法，补回总结和上下文能够明确支持的必要符号，使定义、推导和结论在数学上准确；
+4. 保留老师讲授的实质信息、论证顺序、课程通知和例子，但可将口语整理为清晰书面语。输出应当能让学生直接阅读，而不是保留错误的 ASR 原貌。
 
 禁止：
-1. 不得删除、摘要、润色、扩写或改变老师的意思、顺序和信息量；不确定处保留原文或标 `[语音存疑]`；
-2. 不得新增公式或知识。第二轮没有视觉证据输入，不能进行新的视觉补全；
-3. 输入中所有从 `{_VIS_OPEN}` 开始到 `{_VIS_CLOSE}` 结束的紫色视觉补全必须逐字、逐符号、原位置保留，不能修改、删除、复制或新增；
-4. 相邻段落和全课指南只用于判断当前 CHUNK 的词语，不能复制到当前段；
-5. 一个输入 CHUNK 对应一个输出 CHUNK，编号一致，不得遗漏。
+1. 不得改变老师的核心观点、数学结论和讲授顺序，不得删除任何实质知识点、课程要求或例子；
+2. 不得把课程总结整段复制到转写中，不得凭学科常识编造课堂未讲的证明或知识；确实无法判断的内容标 `[语音存疑]`；
+3. 输入中所有从 `{_VIS_OPEN}` 开始到 `{_VIS_CLOSE}` 结束的紫色视觉补全必须逐字、逐符号保留，不能删除、复制或无依据改写；
+4. 相邻段落只用于理解当前 CHUNK，不得把别的时间段内容复制进来；
+5. 一个输入 CHUNK 对应一个输出 CHUNK，编号一致，不得遗漏。必须对每段做实际编辑，不要原样照抄仍然明显错误的 ASR 句子。
 
 严格输出：
 <<<CHUNK 1>>>
@@ -120,7 +126,7 @@ _FINAL_REVIEW_SYSTEM = rf"""
 """.strip()
 
 _FINAL_RETRY = """
-上一轮终审存在漏句、改动过大或视觉补全被改写。请重新逐句核对：只做高置信度局部纠错；完整保留全部口语信息；所有紫色视觉补全必须与输入逐字相同并保持原位置；不得新增公式；输出全部编号。
+上一轮输出缺块、过短或破坏了视觉公式。请重新编辑全部编号：保留每段的实质知识点、通知、例子和论证顺序，但主动删除口头赘词与重复、修复 ASR 病句、纠正数学术语和公式，使文字明显比原稿通顺准确。所有紫色视觉补全必须逐字保留；不得用课程总结替换老师讲述；输出全部编号。
 """.strip()
 
 
@@ -343,20 +349,23 @@ def _visual_fragments(text: str) -> list[str]:
 
 
 def _valid_final_candidate(source: str, candidate: str, *, course_title: str) -> bool:
-    """Accept only a complete, conservative second-pass textual correction."""
-    if not _safe(source, candidate):
+    """Accept a substantive edit while guarding against loss of whole chunks."""
+    source_spoken = _spoken_text(source).strip()
+    candidate_spoken = _spoken_text(candidate).strip()
+    if not source_spoken or not candidate_spoken:
+        return False
+    # Editing may legitimately remove fillers/repetitions or repair swallowed
+    # words, so character-level similarity is intentionally not required here.
+    # The broad ratio still rejects summaries and runaway textbook expansion.
+    ratio = len(candidate_spoken) / max(1, len(source_spoken))
+    if not 0.45 <= ratio <= 2.50:
         return False
     # The final pass has no visual evidence and therefore may neither add nor
     # alter formula restorations accepted by the evidence-aware first pass.
     if _visual_fragments(candidate) != _visual_fragments(source):
         return False
-    source_spoken = _spoken_text(source)
     corrected_source = _correct_high_confidence_asr(source_spoken, course_title)
-    if _source_coverage(corrected_source, candidate) < _MIN_SOURCE_COVERAGE:
-        return False
-    if not _clauses_preserved(corrected_source, _spoken_text(candidate)):
-        return False
-    corrected_candidate = _spoken_text(candidate)
+    corrected_candidate = candidate_spoken
     title = str(course_title or "")
     for keyword, replacements in _HIGH_CONFIDENCE_ASR.items():
         if keyword not in title:
@@ -454,6 +463,7 @@ class MathTranscriptEnhancer:
         enhanced: list[dict],
         *,
         course_title: str,
+        summary_reference: str,
     ) -> tuple[str, list[str]]:
         """Read every assembled chunk, then synthesize a compact global guide.
 
@@ -462,6 +472,31 @@ class MathTranscriptEnhancer:
         groups of chunks and merge those guides once.  Every chunk is still
         read after first-pass assembly; no transcript text is sampled away.
         """
+        models: list[str] = []
+        summary = _trim(
+            str(summary_reference or "").strip(),
+            _SUMMARY_REFERENCE_MAX,
+            "AI课程总结参考",
+        )
+        summary_guide = "（AI课程总结不可用）"
+        if summary:
+            try:
+                summary_guide, model = self._call_with_system(
+                    f"【课程名称】{course_title or '（未知）'}\n"
+                    f"【AI 课程总结参考】\n{summary}\n\n"
+                    "请提取用于校订课堂逐字稿的课程主线、数学术语、定义和公式记法。",
+                    system=_FINAL_GUIDE_SYSTEM,
+                    max_tokens=2200,
+                    stage="summary-reference-guide",
+                )
+                models.append(model)
+            except Exception as exc:
+                print(
+                    f"[MathTranscript:summary-reference-guide] unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
         blocks = [
             f"## {_fmt(seg['start_ms'])}–{_fmt(seg['end_ms'])}\n{seg['text']}"
             for seg in enhanced
@@ -480,10 +515,10 @@ class MathTranscriptEnhancer:
             groups.append(current)
 
         partials: list[str] = []
-        models: list[str] = []
         for index, group in enumerate(groups, 1):
             prompt = (
                 f"【课程名称】{course_title or '（未知）'}\n"
+                f"【由 AI 课程总结提取的校对参考】\n{summary_guide}\n\n"
                 f"【全课术语审校分段 {index}/{len(groups)}；连续完整 CHUNK】\n\n"
                 + "\n\n".join(group)
                 + "\n\n请提取本分段供全课终审使用的术语与一致性指南。"
@@ -546,7 +581,7 @@ class MathTranscriptEnhancer:
     ) -> str:
         blocks = [
             f"【课程名称】{course_title or '（未知）'}",
-            f"【通读完整转写后形成的全课术语与一致性指南】\n{guide}",
+            f"【参考 AI 课程总结并通读完整转写后形成的全课内容与校对指南】\n{guide}",
         ]
         for i, seg in enumerate(batch, 1):
             before, after = _adjacent_context(source, batch_start + i - 1)
@@ -646,19 +681,21 @@ class MathTranscriptEnhancer:
         enhanced: list[dict],
         *,
         course_title: str,
+        summary_reference: str,
     ) -> tuple[list[dict], list[str], int]:
         """Run a complete second pass after all first-pass chunks exist."""
         guide, models = self._global_review_guide(
             enhanced,
             course_title=course_title,
+            summary_reference=summary_reference,
         )
         reviewed: list[dict] = []
         fallbacks = 0
-        batches = (len(enhanced) + _BATCH - 1) // _BATCH
-        for start in range(0, len(enhanced), _BATCH):
-            batch = enhanced[start:start + _BATCH]
+        batches = (len(enhanced) + _FINAL_BATCH - 1) // _FINAL_BATCH
+        for start in range(0, len(enhanced), _FINAL_BATCH):
+            batch = enhanced[start:start + _FINAL_BATCH]
             print(
-                f"[MathTranscript:final-review] batch {start//_BATCH+1}/{batches}: "
+                f"[MathTranscript:final-review] batch {start//_FINAL_BATCH+1}/{batches}: "
                 f"{len(batch)} chunk(s)",
                 flush=True,
             )
@@ -799,6 +836,7 @@ class MathTranscriptEnhancer:
         *,
         course_title: str = "",
         raw_blackboard: str = "",
+        summary_reference: str = "",
     ):
         source = [
             x for x in (self._normalise(s) for s in proofread_segments or []) if x is not None
@@ -833,12 +871,13 @@ class MathTranscriptEnhancer:
         enhanced, final_models, final_fallbacks = self._final_review(
             enhanced,
             course_title=course_title,
+            summary_reference=summary_reference,
         )
         models.extend(final_models)
 
         md = [
             "# 完整课堂语音转写（AI 校订与公式补全）", "",
-            "> 本附录完整保留老师的语音讲述。第一轮由大模型依据课程上下文和视觉证据校正 ASR 错误并补全公式；全部内容生成后，第二轮大模型通读全课并按全局术语一致性逐段终审。有直接证据恢复的公式以紫色“视觉补全”显示，忠实校订底稿保存在系统中，便于回查。", "",
+            "> 本附录以老师的完整讲授内容为基础。第一轮依据课程上下文和视觉证据校正 ASR、补全公式；全部内容生成后，第二轮大模型参考前文“AI 课程总结”通读全课，删除口头赘词与重复、重组病句，并校正数学术语和公式。实质知识点、通知、例子与讲授顺序保持不变；有直接视觉证据恢复的公式以紫色“视觉补全”显示，忠实校订底稿仍保存在系统中，便于回查。", "",
         ]
         for seg in enhanced:
             md += [
@@ -849,7 +888,7 @@ class MathTranscriptEnhancer:
         for model in models:
             if model and model not in unique:
                 unique.append(model)
-        label = "math-transcript-v7/" + ("+".join(unique) if unique else "no-llm")
+        label = "math-transcript-v8/" + ("+".join(unique) if unique else "no-llm")
         if fallbacks:
             label += f"|safe-base-fallback[{fallbacks}]"
         if final_fallbacks:
