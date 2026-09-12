@@ -265,8 +265,8 @@ def main() -> int:
     attachment_count = 0
     proofreader: TranscriptProofreader | None = None
 
-    # One lecture per message keeps each PDF/transcript pair independently
-    # deliverable and avoids recreating the oversized historical MIME messages.
+    # One lecture per message keeps each complete PDF independently deliverable
+    # and avoids recreating the oversized historical MIME messages.
     for index, row in enumerate(rows, start=1):
         item, proofreader = _email_item(db, row, proofreader)
         if item.get("transcript_attachment"):
