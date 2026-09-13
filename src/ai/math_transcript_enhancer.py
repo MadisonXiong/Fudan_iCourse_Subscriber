@@ -406,11 +406,8 @@ class MathTranscriptEnhancer:
         ]
         self.providers = []
         providers = config.resolve_model_providers()
-        # The editorial pass is long and ModelScope's free balance may be
-        # exhausted independently of a newly configured Gemini key. Prefer a
-        # working Gemini provider here instead of paying two doomed retries on
-        # every batch before reaching it.
-        providers.sort(key=lambda p: 0 if p["name"] == "gemini" else 1)
+        # Preserve MODEL_PROVIDERS order.  ModelScope/Qwen is the established
+        # primary service for this repository; Gemini is a fallback only.
         for p in providers:
             models = list(p["models"])
             if p["name"] == "modelscope":
@@ -438,58 +435,79 @@ class MathTranscriptEnhancer:
         stage: str,
     ) -> tuple[str, str]:
         errors = []
-        for provider, client, models in self.providers:
-            for model in models:
+        pending = [
+            (provider, client, model)
+            for provider, client, models in self.providers
+            for model in models
+        ]
+        for retry_round in range(_RATE_LIMIT_RETRIES + 1):
+            rate_limited_candidates = []
+            retry_delays = []
+            for provider, client, model in pending:
                 model_id = f"{provider}/{model}"
-                for attempt in range(_RATE_LIMIT_RETRIES + 1):
-                    t0 = time.time()
-                    try:
-                        request = dict(
-                            model=model,
-                            messages=[
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": prompt},
-                            ],
-                            temperature=.03,
-                            max_tokens=max_tokens,
-                            timeout=_TIMEOUT,
-                        )
-                        # Gemini 3 thinking defaults to medium.  Guide
-                        # extraction and transcript editing need a long visible
-                        # response more than deep hidden reasoning.
-                        if provider == "gemini":
-                            request["reasoning_effort"] = "low"
-                        resp = client.chat.completions.create(**request)
-                        choice = resp.choices[0]
-                        text = (choice.message.content or "").strip()
-                        if not text:
-                            raise RuntimeError("empty response")
-                        if str(getattr(choice, "finish_reason", "") or "").lower() == "length":
-                            raise RuntimeError("truncated response")
-                        print(
-                            f"[MathTranscript:{stage}] {model_id}: "
-                            f"{len(prompt)} -> {len(text)} chars "
-                            f"in {time.time()-t0:.0f}s", flush=True
-                        )
-                        return text, model_id
-                    except Exception as exc:
-                        detail = f"{type(exc).__name__}: {exc}"
-                        delay_match = _RETRY_DELAY_RE.search(str(exc))
-                        rate_limited = "429" in str(exc) or "ratelimit" in detail.lower()
-                        if rate_limited and delay_match and attempt < _RATE_LIMIT_RETRIES:
-                            delay = min(60.0, max(1.0, float(delay_match.group(1)) + 1.0))
+                t0 = time.time()
+                try:
+                    request = dict(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=.03,
+                        max_tokens=max_tokens,
+                        timeout=_TIMEOUT,
+                    )
+                    # Gemini 3 thinking defaults to medium.  Guide extraction
+                    # and transcript editing need a long visible response more
+                    # than deep hidden reasoning.
+                    if provider == "gemini":
+                        request["reasoning_effort"] = "low"
+                    resp = client.chat.completions.create(**request)
+                    choice = resp.choices[0]
+                    text = (choice.message.content or "").strip()
+                    if not text:
+                        raise RuntimeError("empty response")
+                    if str(getattr(choice, "finish_reason", "") or "").lower() == "length":
+                        raise RuntimeError("truncated response")
+                    print(
+                        f"[MathTranscript:{stage}] {model_id}: "
+                        f"{len(prompt)} -> {len(text)} chars "
+                        f"in {time.time()-t0:.0f}s", flush=True
+                    )
+                    return text, model_id
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}: {exc}"
+                    delay_match = _RETRY_DELAY_RE.search(str(exc))
+                    rate_limited = "429" in str(exc) or "ratelimit" in detail.lower()
+                    if rate_limited and delay_match:
+                        if retry_round < _RATE_LIMIT_RETRIES:
+                            rate_limited_candidates.append((provider, client, model))
+                            retry_delays.append(float(delay_match.group(1)))
                             print(
                                 f"[MathTranscript:{stage}] {model_id}: rate limited; "
-                                f"waiting {delay:.0f}s before retry "
-                                f"{attempt + 1}/{_RATE_LIMIT_RETRIES}",
+                                "trying the next configured model immediately",
                                 flush=True,
                             )
-                            time.sleep(delay)
-                            continue
-                        msg = f"{model_id}: {detail}"
-                        errors.append(msg)
-                        print(f"[MathTranscript] {msg}", flush=True)
-                        break
+                        else:
+                            msg = f"{model_id}: {detail}"
+                            errors.append(msg)
+                            print(f"[MathTranscript] {msg}", flush=True)
+                        continue
+                    msg = f"{model_id}: {detail}"
+                    errors.append(msg)
+                    print(f"[MathTranscript] {msg}", flush=True)
+
+            if not rate_limited_candidates or retry_round >= _RATE_LIMIT_RETRIES:
+                break
+            delay = min(60.0, max(1.0, min(retry_delays) + 1.0))
+            print(
+                f"[MathTranscript:{stage}] all available candidates failed; "
+                f"waiting {delay:.0f}s before rate-limit retry "
+                f"{retry_round + 1}/{_RATE_LIMIT_RETRIES}",
+                flush=True,
+            )
+            time.sleep(delay)
+            pending = rate_limited_candidates
         raise RuntimeError("All math transcript models failed: " + " | ".join(errors))
 
     def _global_review_guide(

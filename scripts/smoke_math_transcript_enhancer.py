@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from src.ai.math_transcript_enhancer import (
     _valid_candidate,
 )
 from src.api.emailer import Emailer
+from src.runtime.config import MODEL_PROVIDERS
 from src.data.math_transcript_store import (
     MATH_TRANSCRIPT_VERSION,
     source_fingerprint,
@@ -74,7 +76,61 @@ class _FakeDb:
         return []
 
 
+class _FakeCompletions:
+    def __init__(self, *, text="", error=None):
+        self.text = text
+        self.error = error
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        if self.error:
+            raise self.error
+        choice = SimpleNamespace(
+            message=SimpleNamespace(content=self.text),
+            finish_reason="stop",
+        )
+        return SimpleNamespace(choices=[choice])
+
+
+def _fake_client(*, text="", error=None):
+    return SimpleNamespace(chat=SimpleNamespace(
+        completions=_FakeCompletions(text=text, error=error)
+    ))
+
+
 def main() -> None:
+    assert MODEL_PROVIDERS[0]["name"] == "modelscope"
+    assert MODEL_PROVIDERS[0]["models"][0].startswith("Qwen/")
+
+    preferred = _fake_client(text="ModelScope result")
+    unused_gemini = _fake_client(text="Gemini result")
+    provider_test = object.__new__(MathTranscriptEnhancer)
+    provider_test.providers = [
+        ("modelscope", preferred, ("Qwen/test",)),
+        ("gemini", unused_gemini, ("gemini-test",)),
+    ]
+    text, model = provider_test._call_with_system(
+        "prompt", system="system", max_tokens=100, stage="provider-order-test"
+    )
+    assert (text, model) == ("ModelScope result", "modelscope/Qwen/test")
+    assert unused_gemini.chat.completions.calls == 0
+
+    limited_modelscope = _fake_client(
+        error=RuntimeError("429 rate limit; please retry in 57s")
+    )
+    fallback_gemini = _fake_client(text="Gemini fallback")
+    provider_test.providers = [
+        ("modelscope", limited_modelscope, ("Qwen/test",)),
+        ("gemini", fallback_gemini, ("gemini-test",)),
+    ]
+    with patch("src.ai.math_transcript_enhancer.time.sleep") as sleep:
+        text, model = provider_test._call_with_system(
+            "prompt", system="system", max_tokens=100, stage="fast-fallback-test"
+        )
+    assert (text, model) == ("Gemini fallback", "gemini/gemini-test")
+    sleep.assert_not_called()
+
     original = "我们办案分析会用到十遍函数的文物课程。"
     corrected = _correct_high_confidence_asr(original, "泛函分析")
     assert corrected == "我们泛函分析会用到实变函数的文物课程。"
