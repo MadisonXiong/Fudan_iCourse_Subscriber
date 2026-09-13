@@ -87,6 +87,7 @@ jobs:
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MATH_TRANSCRIPT_PROVIDER: modelscope
           RESEND_COURSE_IDS: ${{ inputs.course_ids }}
         run: PYTHONPATH=. python -u scripts/resend_processed.py
 

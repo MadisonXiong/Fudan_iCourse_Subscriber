@@ -436,9 +436,18 @@ class MathTranscriptEnhancer:
             if x.strip()
         ]
         self.providers = []
-        providers = config.resolve_model_providers()
-        # Preserve MODEL_PROVIDERS order.  ModelScope/Qwen is the established
-        # primary service for this repository; Gemini is a fallback only.
+        provider_name = (
+            os.environ.get("MATH_TRANSCRIPT_PROVIDER", "modelscope").strip().lower()
+            or "modelscope"
+        )
+        providers = [
+            p for p in config.resolve_model_providers()
+            if str(p.get("name", "")).strip().lower() == provider_name
+        ]
+        # The complete transcript is expensive and may run for over an hour.
+        # Pin every stage (evidence pass, guides, editorial pass and retries) to
+        # one explicitly selected provider so a transient ModelScope failure
+        # cannot silently consume an unrelated Gemini/DeepSeek quota.
         for p in providers:
             models = list(p["models"])
             if p["name"] == "modelscope":
@@ -447,7 +456,16 @@ class MathTranscriptEnhancer:
                 (p["name"], OpenAI(api_key=p["api_key"], base_url=p["base_url"]), tuple(models))
             )
         if not self.providers:
-            raise ValueError("No model provider available for math transcript enhancement")
+            raise ValueError(
+                "Math transcript provider is unavailable: "
+                f"{provider_name!r}. Configure its API key or set "
+                "MATH_TRANSCRIPT_PROVIDER explicitly."
+            )
+        print(
+            f"[MathTranscript] provider pinned to {provider_name}; "
+            "cross-provider fallback is disabled",
+            flush=True,
+        )
 
     def _call(self, prompt: str) -> tuple[str, str]:
         return self._call_with_system(

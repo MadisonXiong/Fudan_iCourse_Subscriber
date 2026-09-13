@@ -105,6 +105,23 @@ def main() -> None:
     assert MODEL_PROVIDERS[0]["name"] == "modelscope"
     assert MODEL_PROVIDERS[0]["models"][0].startswith("Qwen/")
 
+    configured = [
+        {
+            "name": "modelscope", "api_key": "ms-key",
+            "base_url": "https://modelscope.invalid/v1", "models": ["Qwen/test"],
+        },
+        {
+            "name": "gemini", "api_key": "gemini-key",
+            "base_url": "https://gemini.invalid/v1", "models": ["gemini-test"],
+        },
+    ]
+    with patch(
+        "src.ai.math_transcript_enhancer.config.resolve_model_providers",
+        return_value=configured,
+    ), patch("src.ai.math_transcript_enhancer.OpenAI"):
+        pinned = MathTranscriptEnhancer()
+    assert [name for name, _client, _models in pinned.providers] == ["modelscope"]
+
     preferred = _fake_client(text="ModelScope result")
     unused_gemini = _fake_client(text="Gemini result")
     provider_test = object.__new__(MathTranscriptEnhancer)
