@@ -21,7 +21,7 @@ from src.runtime import config
 
 _TIMEOUT = int(os.environ.get("MATH_TRANSCRIPT_TIMEOUT", "300"))
 _BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_BATCH_SIZE", "5")))
-_FINAL_BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_FINAL_BATCH_SIZE", "3")))
+_FINAL_BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_FINAL_BATCH_SIZE", "1")))
 _MIN_RATIO, _MAX_RATIO = 0.90, 2.20
 _MIN_SOURCE_COVERAGE = 0.88
 _MIN_CLAUSE_COVERAGE = 0.65
@@ -46,6 +46,7 @@ _PREVIOUS_VISUAL_REF_RE = re.compile(
 )
 _VIS_OPEN = '<span data-visual-restored="true" style="color:#7c3aed;">〔视觉补全〕'
 _VIS_CLOSE = "</span>"
+_VIS_TOKEN = "[[VISUAL_FORMULA_{index}]]"
 _RETRY_DELAY_RE = re.compile(
     r"(?:retry\s+in\s+|retryDelay['\"\s:]+['\"]?)([0-9]+(?:\.[0-9]+)?)s",
     re.I,
@@ -121,7 +122,7 @@ _FINAL_REVIEW_SYSTEM = rf"""
 禁止：
 1. 不得改变老师的核心观点、数学结论和讲授顺序，不得删除任何实质知识点、课程要求或例子；
 2. 不得把课程总结整段复制到转写中，不得凭学科常识编造课堂未讲的证明或知识；确实无法判断的内容标 `[语音存疑]`；
-3. 输入中所有从 `{_VIS_OPEN}` 开始到 `{_VIS_CLOSE}` 结束的紫色视觉补全必须逐字、逐符号保留，不能删除、复制或无依据改写；
+3. 输入中的紫色视觉补全会被替换成 `[[VISUAL_FORMULA_1]]` 这类不可编辑占位符。必须在原位置逐字保留每个占位符，不能删除、复制、改名或移动；系统会在输出验收后恢复原公式；
 4. 相邻段落只用于理解当前 CHUNK，不得把别的时间段内容复制进来；
 5. 一个输入 CHUNK 对应一个输出 CHUNK，编号一致，不得遗漏。必须对每段做实际编辑，不要原样照抄仍然明显错误的 ASR 句子。
 
@@ -133,7 +134,7 @@ _FINAL_REVIEW_SYSTEM = rf"""
 """.strip()
 
 _FINAL_RETRY = """
-上一轮输出缺块、过短或破坏了视觉公式。请重新编辑全部编号：保留每段的实质知识点、通知、例子和论证顺序，但主动删除口头赘词与重复、修复 ASR 病句、纠正数学术语和公式，使文字明显比原稿通顺准确。所有紫色视觉补全必须逐字保留；不得用课程总结替换老师讲述；输出全部编号。
+上一轮输出缺块、过短或破坏了视觉公式占位符。请重新编辑全部编号：保留每段的实质知识点、通知、例子和论证顺序，但主动删除口头赘词与重复、修复 ASR 病句、纠正数学术语和公式，使文字明显比原稿通顺准确。所有 `[[VISUAL_FORMULA_n]]` 占位符必须在原位置逐字保留；不得用课程总结替换老师讲述；输出全部编号。
 """.strip()
 
 
@@ -353,6 +354,36 @@ def _visual_fragments(text: str) -> list[str]:
         str(text or ""),
         flags=re.S,
     )
+
+
+def _protect_visual_fragments(text: str) -> tuple[str, list[str]]:
+    """Replace accepted visual additions with immutable plain-text tokens."""
+    fragments: list[str] = []
+
+    def replace(match: re.Match) -> str:
+        fragments.append(match.group(0))
+        return _VIS_TOKEN.format(index=len(fragments))
+
+    protected = re.sub(
+        re.escape(_VIS_OPEN) + r".*?" + re.escape(_VIS_CLOSE),
+        replace,
+        str(text or ""),
+        flags=re.S,
+    )
+    return protected, fragments
+
+
+def _restore_visual_fragments(text: str, fragments: list[str]) -> str:
+    """Restore visual additions only when every immutable token survived once."""
+    restored = str(text or "")
+    for index, fragment in enumerate(fragments, 1):
+        token = _VIS_TOKEN.format(index=index)
+        if restored.count(token) != 1:
+            return ""
+        restored = restored.replace(token, fragment)
+    if re.search(r"\[\[VISUAL_FORMULA_\d+\]\]", restored):
+        return ""
+    return restored
 
 
 def _valid_final_candidate(source: str, candidate: str, *, course_title: str) -> bool:
@@ -642,9 +673,10 @@ class MathTranscriptEnhancer:
             blocks.append(
                 f"===== FINAL INPUT CHUNK {i} =====\n"
                 f"【视频时段】{_fmt(seg['start_ms'])}–{_fmt(seg['end_ms'])}\n"
-                f"【相邻上文（只用于判断术语）】\n{before or '（无）'}\n\n"
-                f"【第一轮增强完整正文】\n{seg['text']}\n\n"
-                f"【相邻下文（只用于判断术语）】\n{after or '（无）'}"
+                f"【相邻上文（只用于判断术语）】\n{_spoken_text(before) or '（无）'}\n\n"
+                f"【第一轮增强完整正文；视觉公式占位符必须原位保留】\n"
+                f"{seg['text']}\n\n"
+                f"【相邻下文（只用于判断术语）】\n{_spoken_text(after) or '（无）'}"
             )
         return "\n\n".join(blocks)
 
@@ -657,8 +689,15 @@ class MathTranscriptEnhancer:
         batch_start: int,
         guide: str,
     ) -> tuple[list[dict], list[str], int]:
+        protected_batch = []
+        visual_fragments = []
+        for seg in batch:
+            protected, fragments = _protect_visual_fragments(seg["text"])
+            protected_batch.append({**seg, "text": protected})
+            visual_fragments.append(fragments)
+
         prompt = self._final_prompt(
-            batch,
+            protected_batch,
             course_title=course_title,
             source=source,
             batch_start=batch_start,
@@ -674,6 +713,10 @@ class MathTranscriptEnhancer:
             )
             models.append(model)
             parsed = _parse(text, len(batch))
+            parsed = {
+                i: _restore_visual_fragments(value, visual_fragments[i - 1])
+                for i, value in parsed.items()
+            }
         except Exception as exc:
             print(
                 f"[MathTranscript:final-review] batch unavailable; preserving first pass: "
@@ -693,6 +736,16 @@ class MathTranscriptEnhancer:
             )
         }
         if bad:
+            for i in sorted(bad):
+                candidate = parsed.get(i, "")
+                print(
+                    f"[MathTranscript:final-review] chunk {i} rejected: "
+                    f"source_chars={len(_spoken_text(batch[i - 1]['text']))}, "
+                    f"candidate_chars={len(_spoken_text(candidate))}, "
+                    f"visuals_preserved="
+                    f"{_visual_fragments(candidate) == _visual_fragments(batch[i - 1]['text'])}",
+                    flush=True,
+                )
             try:
                 retry, model = self._call_with_system(
                     prompt + "\n\n" + _FINAL_RETRY,
@@ -702,6 +755,10 @@ class MathTranscriptEnhancer:
                 )
                 models.append(model)
                 retry_parsed = _parse(retry, len(batch))
+                retry_parsed = {
+                    i: _restore_visual_fragments(value, visual_fragments[i - 1])
+                    for i, value in retry_parsed.items()
+                }
                 for i in list(bad):
                     seg = batch[i - 1]
                     if _valid_final_candidate(

@@ -15,6 +15,8 @@ from src.ai.math_transcript_enhancer import (
     _comparison_text,
     _correct_high_confidence_asr,
     _has_formula_evidence,
+    _protect_visual_fragments,
+    _restore_visual_fragments,
     _source_coverage,
     _valid_final_candidate,
     _valid_candidate,
@@ -184,6 +186,14 @@ def main() -> None:
         '<span data-visual-restored="true" style="color:#7c3aed;">'
         '〔视觉补全〕$d(x,y)=d(y,x)$</span>'
     )
+    protected_visual, fragments = _protect_visual_fragments(
+        "公式如下：" + visual + "，请继续。"
+    )
+    assert protected_visual == "公式如下：[[VISUAL_FORMULA_1]]，请继续。"
+    assert _restore_visual_fragments(protected_visual, fragments) == (
+        "公式如下：" + visual + "，请继续。"
+    )
+    assert _restore_visual_fragments("占位符已被删除", fragments) == ""
     final_source = "这里办案分析继续讨论度量。" + visual
     final_good = "这里泛函分析继续讨论度量。" + visual
     assert _valid_final_candidate(
