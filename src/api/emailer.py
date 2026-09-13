@@ -23,7 +23,7 @@ from email.utils import formataddr
 from html import escape
 
 from src.ai.blackboard_vision import course_requires_blackboard
-from src.ai.math_transcript_enhancer import MathTranscriptEnhancer
+from src.ai.editorial_math_transcript import EditorialMathTranscriptEnhancer as MathTranscriptEnhancer
 from src.data.blackboard_store import get_blackboard
 from src.data.database import Database
 from src.data.math_transcript_store import (
