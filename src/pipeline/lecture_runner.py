@@ -1,31 +1,9 @@
-"""Per-lecture state machine: prefetch → ASR → OCR drain → summarize → release.
+"""Per-lecture state machine: prefetch → timed ASR → OCR → proofread → summary.
 
-One ``LectureRunner`` instance drives one lecture from "started" to either
-"summary saved" or "deliberately skipped".  The class is single-use — make a
-new instance per lecture so error state can't leak across runs.
-
-Phases (named like the original ``main.process_lecture`` for diff-friendly
-log greps):
-
-  A  short-circuit ``summary already exists`` → mark processed, return.
-  B  ``PPTPipeline.submit``: stages 1-3 inline, OCR jobs submitted to the
-     scheduler pool.  Returns a ``PPTAsyncHandle``.
-  C  schedule **next** lecture's prefetch (image + audio) so its
-     download overlaps with the current lecture's ASR — the audio slot
-     for the next lecture starts filling while we still hold ours.
-  D  if no cached transcript: ``Scheduler.audio_downloader.get`` (blocks
-     for the ffmpeg spawn that AudioDownloader scheduled earlier), then
-     ``Transcriber.transcribe_tail`` reads PCM from the disk file with
-     tail-f semantics while ffmpeg keeps writing.
-  E  ``handle.drain()`` blocks for any remaining OCR jobs.
-  F  ``bucketer.assemble`` builds the prompt; ``Summarizer.summarize``
-     calls the LLM round-robin until one succeeds.
-  G  persist ``update_summary``, ``mark_processed``, ``clear_error``.
-  H  ``audio_downloader.release`` kills ffmpeg + deletes scratch file.
-
-The runner never owns the WebVPN session check; the orchestrator
-(LectureRunner's caller) calls ``_check_session`` between lectures so all
-threads pick up refreshed cookies through the shared ``ICourseClient``.
+Every normal course summary is now traceable to validated video windows.  The
+ASR timestamp segments are persisted, AI-proofread against nearby PPT evidence,
+and reused on later runs.  The corrected timed transcript is also persisted so
+the emailer can attach it as a Markdown transcript.
 """
 
 from __future__ import annotations
@@ -34,6 +12,14 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from src.ai import bucketer
+from src.ai.transcript_proofreader import TranscriptProofreader
+from src.data.transcript_store import (
+    load_proofread,
+    load_transcript_segments,
+    proofread_is_current,
+    save_proofread,
+    save_transcript_segments,
+)
 from src.pipeline.ppt_pipeline import PPTPipeline
 from src.ai.transcriber import IncompleteAudioError, NoAudioStreamError
 
@@ -46,9 +32,11 @@ if TYPE_CHECKING:
     from src.ai.transcriber import Transcriber
 
 
+TRACEABLE_SUMMARY_PREFIX = "traceable-summary-v1/"
+
+
 class LectureRunner:
-    """Run one lecture end-to-end.  Construct once per orchestration session,
-    call ``run`` for each lecture in order."""
+    """Run lectures sequentially using cached expensive intermediate data."""
 
     def __init__(self, client: "ICourseClient", db: "Database",
                  scheduler: "Scheduler", transcriber: "Transcriber",
@@ -60,17 +48,10 @@ class LectureRunner:
         self._summarizer = summarizer
         self._reporter = reporter
         self._ppt = PPTPipeline(db, scheduler, reporter)
-
-    # ── Public entry point ──────────────────────────────────────────────
+        self._proofreader: TranscriptProofreader | None = None
 
     def run(self, course_id: str, course_title: str, lecture: dict,
             next_info: Optional[tuple[str, str]] = None) -> Optional[str]:
-        """Process one lecture.  Returns the summary text or None.
-
-        ``next_info``: ``(course_id, sub_id)`` of the next lecture, used to
-        kick off its prefetch concurrently.  Pass ``None`` for the last
-        lecture in the batch.
-        """
         sub_id = str(lecture["sub_id"])
         sub_title = lecture.get("sub_title", sub_id)
         date = lecture.get("date", "")
@@ -78,7 +59,6 @@ class LectureRunner:
         self._reporter.lecture_start(course_title, sub_title, date)
 
         existing = self._db.get_lecture(sub_id)
-        # ── Phase A — short-circuit if a v2 summary already exists ──────
         if self._has_summary(existing):
             self._reporter.lecture_skip_v2_done(
                 sub_title, len(existing["summary"])
@@ -88,35 +68,21 @@ class LectureRunner:
             self._db.clear_error(sub_id)
             return existing["summary"]
 
-        # ── Phase B — submit PPT pipeline (fetch + dedup, no OCR yet) ──
-        # OCR is deferred (defer_ocr=True) so ASR in Phase D gets exclusive
-        # CPU.  OCR will be submitted in Phase E (handle.drain()).
+        # PPT fetch/dedup now; OCR itself is deferred until after ASR.
         ppt_handle = self._ppt.submit(
             self._client, course_id, sub_id, defer_ocr=True,
         )
-
-        # ── Phase C — schedule next lecture's prefetch ─────────────────
-        # Done BEFORE ASR so the next audio download can start filling its
-        # AudioDownloader slot while we transcribe.  Both audio + image
-        # prefetches are idempotent so this is safe to call any time.
         self._schedule_next(next_info)
 
-        # ── Phase D — ASR transcription ────────────────────────────────
         transcript, transcript_segments = self._get_transcript(
             existing, course_id, sub_id,
         )
         if transcript is None:
-            # _get_transcript already logged + persisted the skip reason.
             return None
 
-        # ── Phase E — drain remaining OCR work ─────────────────────────
         ppt_stats = ppt_handle.drain()
-        _ = ppt_stats  # stats are emitted by PPTAsyncHandle.drain via reporter
+        _ = ppt_stats
 
-        # ── Phase E2 — kick off next lecture's OCR (runs during LLM) ───
-        # Images were prefetched in Phase C; switch to OCR phase by
-        # submitting pending pages to the OCR pool so they run in the
-        # background while this lecture's LLM call waits for the API.
         if next_info:
             next_course, next_sub = next_info
             try:
@@ -129,7 +95,6 @@ class LectureRunner:
                     f"{type(e).__name__}: {e}"
                 )
 
-        # ── Phase F — bucketed-prompt LLM summary ──────────────────────
         if not transcript.strip():
             self._reporter.info("    Empty transcript, skipping summary.")
             self._release_audio(sub_id)
@@ -144,56 +109,52 @@ class LectureRunner:
             self._release_audio(sub_id)
             return None
 
-        # ── Phase G — persist + clear errors ───────────────────────────
         self._db.mark_processed(sub_id)
         self._db.clear_error(sub_id)
-
-        # ── Phase H — release audio resources (ffmpeg + file) ──────────
         self._release_audio(sub_id)
 
         elapsed = time.time() - t_start
         self._reporter.lecture_done(course_title, sub_title, elapsed)
         return summary
 
-    # ── Internal helpers ────────────────────────────────────────────────
-
-    @staticmethod
-    def _has_summary(existing: dict | None) -> bool:
+    def _has_summary(self, existing: dict | None) -> bool:
+        """Only the current traceable-summary format counts as complete."""
         return bool(
             existing
             and existing.get("summary")
+            and str(existing.get("summary_model") or "").startswith(
+                TRACEABLE_SUMMARY_PREFIX
+            )
         )
 
     def _schedule_next(self, next_info: Optional[tuple[str, str]]):
         if next_info is None:
             return
         next_course, next_sub = next_info
-        # Image + audio prefetch in one call. Both are idempotent so
-        # repeated invocations are no-ops; the audio side will block on its
-        # semaphore until a download slot frees.
         self._scheduler.prefetch_lecture(self._client, next_course, next_sub)
 
     def _get_transcript(self, existing: dict | None, course_id: str,
                         sub_id: str) -> tuple[Optional[str], Optional[list]]:
-        """Return (transcript, segments) or (None, None) on skip.
+        """Return flattened ASR plus persisted timestamp segments.
 
-        Reuses an existing transcript if present (segments==None — bucketer
-        falls back to flat mode).  Otherwise pulls the prefetched audio
-        handle, runs ``transcribe_tail``, and writes the transcript.  On
-        ``NoAudioStreamError`` returns (None, None) after marking the
-        lecture as a deliberate skip.
+        Legacy cached transcripts that lack segments are intentionally
+        re-transcribed once.  Without source timestamps there is no honest way
+        to attach a video range to a summary point.
         """
         if existing and existing.get("transcript"):
+            cached_segments = load_transcript_segments(self._db, sub_id)
+            if cached_segments:
+                self._reporter.info(
+                    f"    Transcript + timing exists "
+                    f"({len(existing['transcript'])} chars, "
+                    f"{len(cached_segments)} segments), skipping transcription."
+                )
+                return existing["transcript"], cached_segments
             self._reporter.info(
-                f"    Transcript exists "
-                f"({len(existing['transcript'])} chars), "
-                f"skipping transcription."
+                "    Legacy transcript has no timestamp segments; "
+                "re-transcribing once to enable video provenance."
             )
-            return existing["transcript"], None
 
-        # Pull the audio handle.  ``schedule`` is idempotent — usually the
-        # previous lecture already kicked it off (Phase C), but for the
-        # first lecture in the batch we still need to fire it ourselves.
         downloader = self._scheduler.audio_downloader
         downloader.schedule(self._client, course_id, sub_id)
         try:
@@ -203,8 +164,6 @@ class LectureRunner:
             self._db.update_error(sub_id, "transcribe", str(e))
             return None, None
         if handle is None:
-            # AudioDownloader returns None when get_video_url() returned
-            # None — i.e. the lecture has no playable video.
             self._reporter.lecture_skip_no_video(
                 existing.get("sub_title", sub_id) if existing else sub_id
             )
@@ -221,9 +180,6 @@ class LectureRunner:
             self._release_audio(sub_id)
             return None, None
         except IncompleteAudioError as e:
-            # tail mode doesn't enforce a 90% check, but if the transcriber
-            # ever raises this we save whatever we got so the next run can
-            # decide whether to retry.
             self._reporter.info(f"    [WARN] Incomplete audio: {e}")
             transcript = self._transcriber._last_transcript
             segments = self._transcriber._last_segments
@@ -236,27 +192,105 @@ class LectureRunner:
             raise
 
         self._db.update_transcript(sub_id, transcript)
+        save_transcript_segments(self._db, sub_id, segments)
+        self._reporter.info(
+            f"    [OK] Persisted {len(segments or [])} ASR timing segments "
+            "for future traceable summaries."
+        )
         return transcript, segments
+
+    def _get_proofread_transcript(
+        self,
+        sub_id: str,
+        transcript_segments: list[dict] | None,
+        ppt_pages: list[dict],
+        *,
+        raw_blackboard: str = "",
+    ) -> tuple[str, list[dict], str]:
+        """Return durable AI-proofread transcript and timed chunks."""
+        uses_blackboard = bool(raw_blackboard.strip())
+        cached = load_proofread(self._db, sub_id)
+        if cached:
+            markdown, segments, model = cached
+            if segments and proofread_is_current(model, uses_blackboard=uses_blackboard):
+                self._reporter.info(
+                    f"    AI-proofread transcript exists ({len(markdown)} chars, "
+                    f"{len(segments)} timed chunks), reusing."
+                )
+                return markdown, segments, model
+
+        if not transcript_segments:
+            raise RuntimeError(
+                "timestamped ASR segments missing; cannot proofread or cite video safely"
+            )
+
+        if self._proofreader is None:
+            self._proofreader = TranscriptProofreader()
+        self._reporter.info(
+            "    [Time] AI-proofreading ASR against timed PPT"
+            + (" + blackboard evidence..." if uses_blackboard else " evidence...")
+        )
+        result = self._proofreader.proofread(
+            transcript_segments,
+            ppt_pages,
+            raw_blackboard=raw_blackboard,
+        )
+        save_proofread(
+            self._db,
+            sub_id,
+            result.markdown,
+            result.segments,
+            result.model_label,
+        )
+        self._reporter.info(
+            f"    [OK] AI-proofread transcript: {len(result.segments)} timed chunks, "
+            f"{len(result.markdown)} chars"
+        )
+        return result.markdown, result.segments, result.model_label
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
         try:
             kept_pages = self._db.get_done_ppt_pages(sub_id)
-            prompt_text, mode = bucketer.assemble(
-                transcript, transcript_segments, kept_pages,
+            _, corrected_segments, proofread_model = self._get_proofread_transcript(
+                sub_id,
+                transcript_segments,
+                kept_pages,
             )
+            corrected_flat = " ".join(
+                str(seg.get("text") or "").strip()
+                for seg in corrected_segments
+                if str(seg.get("text") or "").strip()
+            )
+            prompt_text, mode, video_windows = bucketer.assemble_traceable(
+                corrected_flat,
+                corrected_segments,
+                kept_pages,
+            )
+            if not video_windows:
+                raise RuntimeError(
+                    "traceable prompt has no validated video windows"
+                )
             self._reporter.info(
-                f"    [Time] Generating summary at "
+                f"    [Time] Generating traceable summary at "
                 f"{time.strftime('%H:%M:%S')}"
-                f" — mode={mode}, prompt={len(prompt_text)} chars"
+                f" — mode={mode}, prompt={len(prompt_text)} chars, "
+                f"windows={len(video_windows)}"
             )
             summary, model_used = self._summarizer.summarize(
-                course_title, prompt_text,
+                course_title,
+                prompt_text,
+                video_windows=video_windows,
+            )
+            stored_model = (
+                f"{TRACEABLE_SUMMARY_PREFIX}{model_used}"
+                f"|proofread={proofread_model}"
             )
             self._reporter.info(
-                f"    [OK] Summary by {model_used}: {len(summary)} chars"
+                f"    [OK] Traceable summary by {model_used}: "
+                f"{len(summary)} chars"
             )
-            self._db.update_summary(sub_id, summary, model_used)
+            self._db.update_summary(sub_id, summary, stored_model)
             return summary
         except Exception as e:
             self._reporter.info(
@@ -272,5 +306,3 @@ class LectureRunner:
             self._reporter.info(
                 f"    [WARN] audio release failed: {type(e).__name__}: {e}"
             )
-
-

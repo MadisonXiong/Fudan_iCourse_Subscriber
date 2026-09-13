@@ -1,0 +1,107 @@
+name: Blackboard Feature CI
+
+on:
+  push:
+    branches: [feature/blackboard-latex]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Tectonic bundle
+        uses: actions/cache@v4
+        with:
+          path: .cache/Tectonic
+          key: tectonic-bundle-0.16.9-v1-${{ runner.os }}
+
+      - name: Install native LaTeX PDF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc fonts-noto-cjk
+          curl -L --fail --retry 3 -o /tmp/tectonic.tar.gz 'https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.16.9/tectonic-0.16.9-x86_64-unknown-linux-gnu.tar.gz'
+          echo 'f3c825128095dc3399ea11c08c18035b33050a216930c295c79e8eb11bd21de4  /tmp/tectonic.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/tectonic.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/tectonic /usr/local/bin/tectonic
+          tectonic --version
+          pandoc --version | head -n 1
+
+      - name: Compile and import Python sources
+        run: |
+          python -m compileall -q main.py src scripts
+          python -c "import main"
+
+      - name: Smoke-test native LaTeX PDF pipeline
+        env:
+          XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+        run: python scripts/smoke_latex_pdf.py
+
+      - name: Smoke-test complete transcript appendix and historical fallback
+        run: python scripts/smoke_math_transcript_enhancer.py
+
+      - name: Smoke-test blackboard parser, schema, and DB merge
+        run: |
+          python - <<'PY'
+          import os
+          import tempfile
+
+          from src.ai.blackboard_vision import BlackboardVision, VisionFrame, course_requires_blackboard
+          from src.data.blackboard_store import save_blackboard
+          from src.data.database import Database
+          from scripts.merge_db import merge
+
+          assert course_requires_blackboard("泛函分析")
+          assert course_requires_blackboard("泛函分析（荣誉）")
+          assert not course_requires_blackboard("高等数理统计")
+
+          frames = [VisionFrame(frame_id=1, timestamp_sec=30, path="unused.jpg")]
+          parsed = BlackboardVision._parse_response(
+              "<<<FRAME id=1 ts=30 status=board>>>\n$$x_n \\rightharpoonup x$$\n<<<END_FRAME>>>",
+              frames,
+              "test-model",
+          )
+          assert parsed[0].is_blackboard
+          assert "\\rightharpoonup" in parsed[0].markdown
+
+          with tempfile.TemporaryDirectory() as td:
+              local_path = os.path.join(td, "local.db")
+              remote_path = os.path.join(td, "remote.db")
+              local = Database(local_path)
+              local.upsert_course("1", "泛函分析", "Teacher")
+              local.insert_lecture("10", "1", "lecture", "2026-09-09")
+              save_blackboard(local, "10", "### 黑板板书 LaTeX 转写\n\n$$x_n \\rightharpoonup x$$", "test-model")
+              local.conn.close()
+              remote = Database(remote_path)
+              remote.conn.close()
+              merge(local_path, remote_path)
+              check = Database(remote_path)
+              row = check.get_lecture("10")
+              assert row["blackboard_latex"]
+              assert row["blackboard_model"] == "test-model"
+              check.conn.close()
+          PY
+
+      - name: Upload LaTeX debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latex-debug-${{ github.run_id }}
+          path: artifacts/latex-debug/
+          if-no-files-found: ignore
+          retention-days: 7

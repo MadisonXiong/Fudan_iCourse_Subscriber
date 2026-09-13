@@ -1,279 +1,44 @@
-import re
-import smtplib
-import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-from io import BytesIO
-from PIL import Image
-from collections import OrderedDict
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
-from html import escape
-from email.utils import formataddr
-from urllib.parse import quote
+"""Compact PDF-first course email delivery.
 
-import markdown
-from pygments.formatters import HtmlFormatter
+Email bodies stay intentionally small.  Complete notes are compiled by Pandoc +
+Tectonic into native vector PDFs, so mathematical expressions remain real LaTeX
+until the final document is typeset; no formula PNG/CID pipeline is involved.
 
-from src.runtime import config
-
-_MD_EXTENSIONS= ["tables", "fenced_code", "nl2br", "sane_lists", "codehilite"]
-
-_MD_EXTENSION_CONFIGS = {
-    "codehilite": {
-        "guess_lang": False,
-        "linenums": False,
-        "css_class": "highlight",
-    }
-}
-
-_PYGMENTS_CSS = HtmlFormatter(style="friendly").get_style_defs(".highlight")
-
-_EMAIL_CSS = """\
-body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-                 "Helvetica Neue", Arial, sans-serif;
-    font-size: 15px;
-    line-height: 1.7;
-    color: #1a1a1a;
-    max-width: 800px;
-    margin: 0 auto;
-    padding: 20px;
-}
-h2 {
-    color: #2c3e50;
-    border-bottom: 2px solid #3498db;
-    padding-bottom: 8px;
-    margin-top: 32px;
-}
-h3 {
-    color: #34495e;
-    margin-top: 24px;
-}
-h3 small {
-    color: #7f8c8d;
-    font-weight: normal;
-}
-h4 { color: #555; margin-top: 18px; }
-hr {
-    border: none;
-    border-top: 1px solid #e0e0e0;
-    margin: 28px 0;
-}
-strong { color: #c0392b; }
-table {
-    border-collapse: collapse;
-    width: 100%;
-    margin: 12px 0;
-}
-th, td {
-    border: 1px solid #ddd;
-    padding: 8px 12px;
-    text-align: left;
-}
-th {
-    background: #f5f6fa;
-    font-weight: 600;
-}
-tr:nth-child(even) { background: #fafafa; }
-pre {
-    background: #f8f8f8;
-    border: 1px solid #e0e0e0;
-    border-radius: 4px;
-    padding: 12px 16px;
-    overflow-x: auto;
-    font-size: 13px;
-    line-height: 1.5;
-}
-code {
-    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-    font-size: 13px;
-}
-p code {
-    background: #f0f0f0;
-    padding: 2px 5px;
-    border-radius: 3px;
-}
-blockquote {
-    border-left: 4px solid #3498db;
-    margin: 12px 0;
-    padding: 8px 16px;
-    background: #f8f9fa;
-    color: #555;
-}
-ul, ol { padding-left: 24px; }
-li { margin-bottom: 4px; }
+Every PDF appends the complete AI-proofread classroom transcript after the
+existing notes. Functional Analysis additionally receives contextual ASR
+correction and evidence-constrained formula restoration. The conservative
+proofread transcript remains persisted in the database for audit, but email
+delivery exposes one final PDF rather than implementation-format Markdown.
 """
 
-_MIN_INLINE_HEIGHT = 13  # minimum logical height for inline formulas (px)
+from __future__ import annotations
 
-_IMAGE_CACHE: dict[str, tuple] = {}
+import smtplib
+import time
+from collections import OrderedDict
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr
+from html import escape
 
-
-def _fetch_latex_image(url: str, dpi: int = 300) -> tuple:
-    """Fetch rendered LaTeX image, return (width, height, png_bytes).
-
-    Width/height are logical display pixels (DPI-adjusted).
-    Returns (None, None, None) on failure.
-    """
-    if url in _IMAGE_CACHE:
-        return _IMAGE_CACHE[url]
-
-    try:
-        scale_factor = dpi / 96.0
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-
-        img = Image.open(BytesIO(response.content))
-        logical_width = max(1, int(img.width / scale_factor))
-        logical_height = max(1, int(img.height / scale_factor))
-
-        result = (logical_width, logical_height, response.content)
-        _IMAGE_CACHE[url] = result
-        return result
-    except Exception as e:
-        print(f"[LaTeX Render] Image fetch failed: {e}")
-        return None, None, None
-
-
-def _prefetch_latex_images(urls: list[str], dpi: int = 300) -> None:
-    """Pre-fetch multiple LaTeX images concurrently.
-
-    Results are stored in ``_IMAGE_CACHE`` so that subsequent calls to
-    ``_fetch_latex_image`` become instant cache hits.
-    """
-    uncached = [u for u in urls if u not in _IMAGE_CACHE]
-    if not uncached:
-        return
-    with ThreadPoolExecutor(max_workers=min(len(uncached), 8)) as pool:
-        futures = {pool.submit(_fetch_latex_image, u, dpi): u for u in uncached}
-        for future in as_completed(futures):
-            future.result()  # trigger any exception logging inside _fetch_latex_image
-
-
-def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
-    """Convert Markdown to styled HTML, rendering LaTeX math as images.
-
-    Processing order: extract LaTeX → markdown convert → restore as <img>.
-    This prevents the markdown engine from corrupting backslash escapes.
-
-    Args:
-        md_text: Markdown source text.
-        cid_images: When provided (dict), download images and embed via CID
-                    references instead of external URLs.  The dict is populated
-                    with {cid_name: png_bytes} entries for the caller to attach
-                    to the MIME message.
-    """
-    latex_map: dict[str, str] = {}
-    counter = 0
-
-    def _stash(match):
-        nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
-        counter += 1
-        latex_map[key] = match.group(0)
-        return key
-
-    def _stash_block(match):
-        """Stash \\[...\\] as $$...$$ for uniform downstream handling."""
-        nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
-        counter += 1
-        latex_map[key] = "$$" + match.group(1) + "$$"
-        return key
-
-    def _stash_inline(match):
-        """Stash \\(...\\) as $...$ for uniform downstream handling."""
-        nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
-        counter += 1
-        latex_map[key] = "$" + match.group(1) + "$"
-        return key
-
-    # Extract LaTeX in order: block first, then inline
-    # 1) $$...$$ block formulas
-    text = re.sub(r"\$\$(.+?)\$\$", _stash, md_text, flags=re.DOTALL)
-    # 2) \[...\] block formulas (normalize to $$...$$)
-    text = re.sub(r"\\\[(.+?)\\\]", _stash_block, text, flags=re.DOTALL)
-    # 3) $...$ inline formulas (not $$)
-    text = re.sub(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", _stash, text)
-    # 4) \(...\) inline formulas (normalize to $...$)
-    text = re.sub(r"\\\((.+?)\\\)", _stash_inline, text)
-
-    html = markdown.markdown(
-        text,
-        extensions=_MD_EXTENSIONS,
-        extension_configs=_MD_EXTENSION_CONFIGS,
-    )
-
-    # Build URL list and pre-fetch all LaTeX images concurrently
-    # Each entry: (url, latex_content, is_block)
-    latex_info: dict[str, tuple[str, str, bool]] = {}
-    for key, original in latex_map.items():
-        is_block = original.startswith("$$")
-        latex_content = original[2:-2] if is_block else original[1:-1]
-        prefix = r"\dpi{300}\bg{white}" if is_block else r"\dpi{300}\bg{white}\inline"
-        url = f"https://latex.codecogs.com/png.latex?{prefix}%20{quote(latex_content)}"
-        latex_info[key] = (url, latex_content, is_block)
-
-    _prefetch_latex_images([info[0] for info in latex_info.values()])
-
-    for key, (url, latex_content, is_block) in latex_info.items():
-        w, h, img_data = _fetch_latex_image(url)
-
-        if is_block:
-            if w and h:
-                src = _resolve_src(url, img_data, cid_images)
-                img_tag = (
-                    f'<div style="text-align:center;margin:16px 0">'
-                    f'<img src="{src}" alt="{escape(latex_content)}" '
-                    f'width="{w}" height="{h}" '
-                    f'style="width:{w}px;height:{h}px;max-width:none;'
-                    f'vertical-align:middle;border:none;display:inline-block;">'
-                    f'</div>'
-                )
-            else:
-                img_tag = (
-                    f'<div style="text-align:center;margin:16px 0">'
-                    f'<code>{escape(latex_content)}</code></div>'
-                )
-        else:
-            if w and h:
-                # Enforce minimum height so formulas aren't smaller than text
-                if h < _MIN_INLINE_HEIGHT:
-                    scale = _MIN_INLINE_HEIGHT / h
-                    w = max(1, int(w * scale))
-                    h = _MIN_INLINE_HEIGHT
-
-                src = _resolve_src(url, img_data, cid_images)
-                img_tag = (
-                    f'<img src="{src}" alt="{escape(latex_content)}" '
-                    f'width="{w}" height="{h}" '
-                    f'style="width:{w}px;height:{h}px;max-width:none;'
-                    f'vertical-align:-3px;border:none;margin:0 2px;">'
-                )
-            else:
-                img_tag = f'<code>{escape(latex_content)}</code>'
-
-        html = html.replace(key, img_tag)
-
-    return html
-
-
-def _resolve_src(url: str, img_data: bytes | None,
-                 cid_images: dict | None) -> str:
-    """Return a CID reference if embedding, otherwise the original URL."""
-    if cid_images is not None and img_data:
-        cid = f"latex-{uuid.uuid4().hex[:12]}"
-        cid_images[cid] = img_data
-        return f"cid:{cid}"
-    return url
-
+from src.ai.blackboard_vision import course_requires_blackboard
+from src.ai.editorial_math_transcript import EditorialMathTranscriptEnhancer as MathTranscriptEnhancer
+from src.data.blackboard_store import get_blackboard
+from src.data.database import Database
+from src.data.math_transcript_store import (
+    cache_matches,
+    load_first_pass_seed,
+    load_math_transcript,
+    save_math_transcript,
+    source_fingerprint,
+)
+from src.data.transcript_store import load_proofread
+from src.pdf.latex_renderer import LatexPdfError, build_course_pdf, pdf_filename
+from src.runtime import config
 
 class Emailer:
-    """Send course summary emails via QQ SMTP SSL."""
+    """Send small notification bodies plus complete PDF attachments."""
 
     def __init__(self):
         self.host = config.SMTP_HOST
@@ -281,133 +46,199 @@ class Emailer:
         self.sender = config.SMTP_EMAIL
         self.password = config.SMTP_PASSWORD
         self.receiver = config.RECEIVER_EMAIL
+        self._db: Database | None = None
+        self._math_enhancer: MathTranscriptEnhancer | None = None
+
+    def _database(self) -> Database:
+        if self._db is None:
+            self._db = Database()
+        return self._db
+
+    def _complete_transcript(self, item: dict) -> str:
+        """Return the mandatory complete transcript appendix for this PDF."""
+        course_title = str(item.get("course_title") or "")
+        sub_id = str(item.get("sub_id") or "")
+        stored_markdown = str(item.get("transcript_attachment") or "").strip()
+        if not sub_id:
+            return stored_markdown
+
+        db = self._database()
+        proofread = load_proofread(db, sub_id)
+        if not proofread:
+            return stored_markdown
+        proofread_markdown, proofread_segments, _ = proofread
+        proofread_markdown = str(proofread_markdown or stored_markdown).strip()
+        if not course_requires_blackboard(course_title):
+            return proofread_markdown
+        if not proofread_segments:
+            return proofread_markdown
+
+        board_cached = get_blackboard(db, sub_id)
+        raw_blackboard = board_cached[0] if board_cached else ""
+        ppt_pages = db.get_done_ppt_pages(sub_id)
+        summary_reference = str(item.get("summary") or "").strip()
+        fingerprint = source_fingerprint(
+            course_title,
+            summary_reference,
+            proofread_markdown,
+            proofread_segments,
+            ppt_pages,
+            raw_blackboard,
+        )
+
+        cached = load_math_transcript(db, sub_id)
+        if cache_matches(cached, fingerprint):
+            markdown = str(cached.get("markdown") or "")
+            print(
+                f"[Emailer] Reusing math-enhanced transcript for {sub_id} "
+                f"({len(markdown)} chars).",
+                flush=True,
+            )
+            return markdown
+
+        try:
+            if self._math_enhancer is None:
+                self._math_enhancer = MathTranscriptEnhancer()
+            print(
+                f"[Emailer] Building evidence-constrained math transcript for {sub_id}...",
+                flush=True,
+            )
+            prior = load_first_pass_seed(db, sub_id)
+            result = self._math_enhancer.enhance(
+                proofread_segments,
+                ppt_pages,
+                course_title=course_title,
+                raw_blackboard=raw_blackboard,
+                summary_reference=summary_reference,
+                first_pass_segments=(prior or {}).get("segments"),
+            )
+            save_math_transcript(
+                db,
+                sub_id,
+                markdown=result.markdown,
+                segments=result.segments,
+                model=result.model_label,
+                source_sha256=fingerprint,
+            )
+            print(
+                f"[Emailer] Math-enhanced transcript ready: "
+                f"{len(result.segments)} chunks, {len(result.markdown)} chars.",
+                flush=True,
+            )
+            return result.markdown
+        except Exception as exc:
+            print(
+                f"[Emailer] Required editorial transcript review failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "refusing to send an unreviewed transcript appendix"
+            ) from exc
+
+    def _build_pdf(self, item: dict) -> tuple[bytes, str]:
+        complete_transcript = self._complete_transcript(item)
+        try:
+            data = build_course_pdf(item, math_transcript=complete_transcript)
+            return data, pdf_filename(item)
+        except Exception as exc:
+            print(
+                f"[Emailer] LaTeX PDF generation failed for {item.get('sub_id')}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise LatexPdfError(
+                "refusing to send Markdown fallback: the required complete PDF "
+                f"could not be built for {item.get('sub_id')}"
+            ) from exc
 
     def send(self, items: list[dict]) -> bool:
-        """Send a single email containing all lecture summaries.
-
-        LaTeX formulas are rendered as PNG images and embedded directly into
-        the email via CID attachments, so they display on all clients
-        (including mobile) without loading external images.
-
-        Args:
-            items: List of dicts, each with keys:
-                   course_title, sub_title, date, summary
-                   Optional key:
-                   is_update — bool, True for re-summarized lectures (v2
-                               PPT-aware format replacing an older v1 summary).
-                               Adds an "（含 PPT 识别·更新）" subject suffix and
-                               an inline 更新 badge per affected lecture.
-
-        Returns:
-            True if email was sent successfully, False otherwise.
-        """
         if not items:
             return True
 
         any_update = any(item.get("is_update") for item in items)
-
-        # Group by course (preserve insertion order)
         courses: OrderedDict[str, list[dict]] = OrderedDict()
         for item in items:
-            courses.setdefault(item["course_title"], []).append(item)
+            courses.setdefault(str(item["course_title"]), []).append(item)
 
-        # Subject
         parts = [f"{ct} ({len(lecs)})" for ct, lecs in courses.items()]
         subject = f"[FiCS] {', '.join(parts)}"
         if any_update:
             subject += "（含 PPT 识别·更新）"
 
-        # Plain text (Markdown as-is, readable without rendering)
-        plain_sections = []
-        for course_title, lectures in courses.items():
-            plain_sections.append(f"{'=' * 40}")
-            plain_sections.append(f"课程：{course_title}")
-            plain_sections.append(f"{'=' * 40}")
-            for lec in lectures:
-                tag = "[更新] " if lec.get("is_update") else ""
-                plain_sections.append(
-                    f"\n--- {tag}{lec['sub_title']} ({lec['date']}) ---\n"
-                )
-                plain_sections.append(lec["summary"])
-        plain = "\n".join(plain_sections)
-
-        # HTML (Markdown → styled HTML with CID-embedded LaTeX images)
-        cid_images: dict[str, bytes] = {}
-
-        # Pre-compute one anchor ID per course so TOC and headings stay in sync
-        course_anchors = {
-            course_title: f"course-{i}"
-            for i, course_title in enumerate(courses)
-        }
-
-        # Build table of contents
-        toc_items = [
-            f'<li><a href="#{anchor}" style="color:#3498db;text-decoration:none;">'
-            f"{escape(course_title)}</a></li>"
-            for course_title, anchor in course_anchors.items()
+        plain_lines = [
+            "完整课程内容见 LaTeX PDF 附件。",
+            "PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。",
+            "PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式。",
+            "忠实 AI 校订底稿保存在系统中，邮件仅发送最终 PDF。",
+            "",
         ]
-        toc_html = (
-            '<nav style="background:#f8f9fa;border:1px solid #e0e0e0;'
-            'border-radius:6px;padding:16px 20px;margin-bottom:28px;">'
-            '<strong style="color:#2c3e50;font-size:16px;">目录</strong>'
-            '<ol style="margin:8px 0 0;padding-left:20px;">'
-            + "\n".join(toc_items)
-            + "</ol></nav>"
-        )
+        html_parts = [
+            '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;'
+            'font-size:15px;line-height:1.7;color:#1f2937;max-width:720px;margin:auto;padding:20px;">',
+            '<p>完整课程内容见 <strong>LaTeX PDF 附件</strong>。</p>',
+            '<p>PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。'
+            'PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式；'
+            '忠实 AI 校订底稿保存在系统中，邮件仅发送最终 PDF。</p>',
+        ]
 
-        update_badge = (
-            '<span style="background:#ff9800;color:white;padding:2px 8px;'
-            'border-radius:3px;font-size:12px;margin-right:8px;'
-            'vertical-align:middle;">更新</span>'
-        )
-
-        body_parts = [toc_html]
         for course_title, lectures in courses.items():
-            anchor = course_anchors[course_title]
-            body_parts.append(f'<h2 id="{anchor}">{escape(course_title)}</h2>')
-            for lec in lectures:
-                badge = update_badge if lec.get("is_update") else ""
-                body_parts.append(
-                    f"<h3>{badge}{escape(lec['sub_title'])} "
-                    f"<small>({escape(lec['date'])})</small></h3>"
+            plain_lines.append(f"课程：{course_title}")
+            html_parts.append(
+                f'<h2 style="font-size:18px;color:#1e3a8a;margin:22px 0 8px;">'
+                f"{escape(course_title)}</h2>"
+            )
+            for item in lectures:
+                tag = "[更新] " if item.get("is_update") else ""
+                plain_lines.append(
+                    f"- {tag}{item.get('sub_title','')} ({item.get('date','')})：完整笔记见 PDF"
                 )
-                body_parts.append(
-                    _md_to_html(lec["summary"], cid_images=cid_images)
+                html_parts.append(
+                    '<div style="margin:8px 0 14px;padding:10px 12px;background:#f8fafc;'
+                    'border:1px solid #e2e8f0;border-radius:6px;">'
+                    f"<strong>{escape(tag + str(item.get('sub_title') or '课堂'))}</strong> "
+                    f"<span style=\"color:#64748b\">({escape(str(item.get('date') or ''))})</span><br>"
+                    '<span style="color:#475569">完整笔记与文末增强语音转写见 PDF 附件。</span>'
+                    "</div>"
                 )
-                body_parts.append("<hr>")
+        html_parts.append("</div>")
+        plain = "\n".join(plain_lines)
+        html = "".join(html_parts)
 
-        html = (
-            "<!DOCTYPE html>"
-            "<html><head><meta charset='utf-8'>"
-            f"<style>{_EMAIL_CSS}\n{_PYGMENTS_CSS}</style>"
-            "</head><body>"
-            + "\n".join(body_parts)
-            + "</body></html>"
-        )
-
-        # Build MIME: related > alternative > (plain, html) + image attachments
-        msg = MIMEMultipart("related")
+        # Outer multipart/mixed is intentional: normal attachments must not live
+        # inside multipart/related, which some webmail clients hide.
+        msg = MIMEMultipart("mixed")
         msg["Subject"] = subject
         msg["From"] = formataddr(("iCourse Subscriber", self.sender))
         msg["To"] = self.receiver
 
-        msg_alt = MIMEMultipart("alternative")
-        msg_alt.attach(MIMEText(plain, "plain", "utf-8"))
-        msg_alt.attach(MIMEText(html, "html", "utf-8"))
-        msg.attach(msg_alt)
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(plain, "plain", "utf-8"))
+        alt.attach(MIMEText(html, "html", "utf-8"))
+        msg.attach(alt)
 
-        # Attach CID images
-        for cid, png_data in cid_images.items():
-            img_part = MIMEImage(png_data, "png")
-            img_part.add_header("Content-ID", f"<{cid}>")
-            img_part.add_header("Content-Disposition", "inline",
-                                filename=f"{cid}.png")
-            msg.attach(img_part)
+        # Build every PDF before opening SMTP. A compiler failure is a failed
+        # delivery, never a green run that silently substitutes .md files.
+        try:
+            rendered = [self._build_pdf(item) for item in items]
+        except LatexPdfError as exc:
+            print(f"[Emailer] Delivery aborted: {exc}", flush=True)
+            return False
 
-        if cid_images:
-            print(f"[Emailer] Embedded {len(cid_images)} LaTeX images as CID")
+        for pdf_data, filename in rendered:
+            part = MIMEApplication(pdf_data, _subtype="pdf")
+            part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=("utf-8", "", filename),
+            )
+            msg.attach(part)
 
-        # Retry with exponential backoff
+        print(
+            f"[Emailer] Attachments: latex_pdf={len(rendered)}, markdown=0; CID images=0",
+            flush=True,
+        )
+
         for attempt in range(3):
             try:
                 with smtplib.SMTP_SSL(self.host, self.port) as server:
@@ -415,10 +246,19 @@ class Emailer:
                     server.sendmail(self.sender, self.receiver, msg.as_string())
                 print(f"[Emailer] Sent: {subject}")
                 return True
-            except Exception as e:
-                print(f"[Emailer] Attempt {attempt + 1}/3 failed: {e}")
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-
-        print("[Emailer] All send attempts failed.")
+            except Exception as exc:
+                if attempt >= 2:
+                    print(
+                        f"[Emailer] Failed after 3 attempts: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    return False
+                wait = 2 ** attempt
+                print(
+                    f"[Emailer] Send failed ({type(exc).__name__}: {exc}); "
+                    f"retrying in {wait}s...",
+                    flush=True,
+                )
+                time.sleep(wait)
         return False
