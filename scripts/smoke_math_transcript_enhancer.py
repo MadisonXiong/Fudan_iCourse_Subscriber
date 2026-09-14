@@ -30,6 +30,8 @@ from src.api.emailer import Emailer
 from src.runtime.config import MODEL_PROVIDERS
 from src.data.math_transcript_store import (
     MATH_TRANSCRIPT_VERSION,
+    clear_editorial_checkpoint,
+    load_editorial_checkpoint,
     source_fingerprint,
 )
 from scripts.resend_processed import (
@@ -79,8 +81,46 @@ class _FinalReviewEnhancer(MathTranscriptEnhancer):
 
 
 class _FakeDb:
+    def __init__(self):
+        self.meta = {}
+
     def get_done_ppt_pages(self, sub_id: str):
         return []
+
+    def read_meta(self, key: str):
+        return self.meta.get(key)
+
+    def write_meta(self, key: str, value: str):
+        self.meta[key] = value
+
+
+class _CheckpointFinalReviewEnhancer(MathTranscriptEnhancer):
+    """Deterministic double that can simulate quota exhaustion mid-review."""
+
+    def __init__(self, *, fail_from: int | None = None):
+        self.fail_from = fail_from
+        self.guide_calls = 0
+        self.batch_starts = []
+
+    def _global_review_guide(self, enhanced, *, course_title, summary_reference):
+        self.guide_calls += 1
+        return "- 赋范空间术语指南", ["test/checkpoint-guide"]
+
+    def _final_batch(self, batch, *, course_title, source, batch_start, guide):
+        self.batch_starts.append(batch_start)
+        if self.fail_from is not None and batch_start >= self.fail_from:
+            return [
+                {**seg, "final_review_status": "first_pass_api_fallback"}
+                for seg in batch
+            ], [], len(batch)
+        return [
+            {
+                **seg,
+                "text": str(seg["text"]) + "（已终审）",
+                "final_review_status": "ai_final_reviewed",
+            }
+            for seg in batch
+        ], ["test/checkpoint-editor"], 0
 
 
 class _FakeCompletions:
@@ -282,6 +322,44 @@ def main() -> None:
         "test/final-review",
     ]
     assert review_fallbacks == 0
+
+    # A quota failure after chunk 1 must leave a durable guide + accepted chunk.
+    # The next process skips both and calls the model only for chunks 2 and 3.
+    checkpoint_db = _FakeDb()
+    checkpoint_source = [
+        {"start_ms": i * 1000, "end_ms": (i + 1) * 1000, "text": f"段落{i + 1}"}
+        for i in range(3)
+    ]
+    interrupted = _CheckpointFinalReviewEnhancer(fail_from=1)
+    with patch("src.ai.math_transcript_enhancer._FINAL_BATCH", 1):
+        _partial, _models, partial_fallbacks = interrupted._final_review(
+            checkpoint_source,
+            course_title="泛函分析",
+            summary_reference="赋范空间是核心概念。",
+            checkpoint_db=checkpoint_db,
+            checkpoint_sub_id="lecture-checkpoint",
+        )
+    assert partial_fallbacks == 2
+    assert interrupted.guide_calls == 1
+    assert interrupted.batch_starts == [0, 1, 2]
+    saved = load_editorial_checkpoint(checkpoint_db, "lecture-checkpoint")
+    assert saved and sorted(saved["completed"]) == ["0"]
+
+    resumed = _CheckpointFinalReviewEnhancer()
+    with patch("src.ai.math_transcript_enhancer._FINAL_BATCH", 1):
+        completed, _models, resumed_fallbacks = resumed._final_review(
+            checkpoint_source,
+            course_title="泛函分析",
+            summary_reference="赋范空间是核心概念。",
+            checkpoint_db=checkpoint_db,
+            checkpoint_sub_id="lecture-checkpoint",
+        )
+    assert resumed_fallbacks == 0
+    assert resumed.guide_calls == 0
+    assert resumed.batch_starts == [1, 2]
+    assert all(seg["final_review_status"] == "ai_final_reviewed" for seg in completed)
+    clear_editorial_checkpoint(checkpoint_db, "lecture-checkpoint")
+    assert load_editorial_checkpoint(checkpoint_db, "lecture-checkpoint") is None
 
     full_speech = (
         "首先欢迎大家选修泛函分析课程。作业每周一收发，平时成绩占百分之三十，"

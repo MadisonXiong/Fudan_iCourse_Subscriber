@@ -15,6 +15,10 @@ from datetime import datetime
 
 MATH_TRANSCRIPT_VERSION = 9
 _KEY_PREFIX = "blackboard_cache_blob:math-transcript-v9:"
+EDITORIAL_CHECKPOINT_VERSION = 1
+_EDITORIAL_CHECKPOINT_KEY_PREFIX = (
+    "blackboard_cache_blob:math-transcript-editorial-checkpoint-v1:"
+)
 
 
 def source_fingerprint(
@@ -61,6 +65,44 @@ def source_fingerprint(
 
 def _key(sub_id: str) -> str:
     return f"{_KEY_PREFIX}{sub_id}"
+
+
+def _editorial_checkpoint_key(sub_id: str) -> str:
+    return f"{_EDITORIAL_CHECKPOINT_KEY_PREFIX}{sub_id}"
+
+
+def load_editorial_checkpoint(db, sub_id: str) -> dict | None:
+    """Load resumable final-review progress for one lecture."""
+    raw = db.read_meta(_editorial_checkpoint_key(str(sub_id)))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("version") or 0) != EDITORIAL_CHECKPOINT_VERSION:
+        return None
+    return payload
+
+
+def save_editorial_checkpoint(db, sub_id: str, payload: dict) -> None:
+    """Atomically persist accepted final-review chunks in SQLite meta."""
+    value = dict(payload)
+    value["version"] = EDITORIAL_CHECKPOINT_VERSION
+    value["updated_at"] = datetime.now().isoformat()
+    db.write_meta(
+        _editorial_checkpoint_key(str(sub_id)),
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def clear_editorial_checkpoint(db, sub_id: str) -> None:
+    """Remove progress only after the complete transcript has succeeded."""
+    # Writing an empty value works with Database as well as lightweight test
+    # doubles and makes the next load behave exactly like a missing key.
+    db.write_meta(_editorial_checkpoint_key(str(sub_id)), "")
 
 
 def _load_version(db, sub_id: str, version: int) -> dict | None:

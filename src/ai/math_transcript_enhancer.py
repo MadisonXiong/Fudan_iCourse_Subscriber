@@ -11,12 +11,20 @@ from __future__ import annotations
 import os
 import re
 import time
+import hashlib
+import json
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from openai import OpenAI
 
 from src.ai.ppt_dedup import clean_ppt_text
+from src.data.math_transcript_store import (
+    EDITORIAL_CHECKPOINT_VERSION,
+    clear_editorial_checkpoint,
+    load_editorial_checkpoint,
+    save_editorial_checkpoint,
+)
 from src.runtime import config
 
 _TIMEOUT = int(os.environ.get("MATH_TRANSCRIPT_TIMEOUT", "300"))
@@ -811,33 +819,159 @@ class MathTranscriptEnhancer:
         *,
         course_title: str,
         summary_reference: str,
+        checkpoint_db=None,
+        checkpoint_sub_id: str = "",
     ) -> tuple[list[dict], list[str], int]:
-        """Run a complete second pass after all first-pass chunks exist."""
-        guide, models = self._global_review_guide(
-            enhanced,
-            course_title=course_title,
-            summary_reference=summary_reference,
-        )
-        reviewed: list[dict] = []
-        fallbacks = 0
+        """Run a durable, resumable second pass after the first pass exists."""
+        checkpoint_enabled = checkpoint_db is not None and bool(checkpoint_sub_id)
+        identity_source = {
+            "course_title": str(course_title or ""),
+            "summary_reference": str(summary_reference or ""),
+            "enhanced": enhanced,
+            "final_batch_size": _FINAL_BATCH,
+            "reviewer": f"{type(self).__module__}.{type(self).__qualname__}",
+        }
+        identity = {
+            "version": EDITORIAL_CHECKPOINT_VERSION,
+            "source_sha256": hashlib.sha256(
+                json.dumps(
+                    identity_source,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "chunk_count": len(enhanced),
+        }
+        payload = None
+        if checkpoint_enabled:
+            payload = load_editorial_checkpoint(checkpoint_db, checkpoint_sub_id)
+            if payload and any(payload.get(key) != value for key, value in identity.items()):
+                print(
+                    "[MathTranscript:final-review] stored checkpoint does not match "
+                    "the current source/reviewer; discarding stale progress",
+                    flush=True,
+                )
+                clear_editorial_checkpoint(checkpoint_db, checkpoint_sub_id)
+                payload = None
+
+        completed: dict[int, dict] = {}
+        models: list[str] = []
+        guide = ""
+        if payload:
+            guide = str(payload.get("guide") or "").strip()
+            models = [str(model) for model in payload.get("models", []) if model]
+            raw_completed = payload.get("completed")
+            if isinstance(raw_completed, dict):
+                for raw_index, segment in raw_completed.items():
+                    try:
+                        index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if not 0 <= index < len(enhanced) or not isinstance(segment, dict):
+                        continue
+                    if (
+                        int(segment.get("start_ms", -1)) != enhanced[index]["start_ms"]
+                        or int(segment.get("end_ms", -1)) != enhanced[index]["end_ms"]
+                        or not str(segment.get("text") or "").strip()
+                        or segment.get("final_review_status")
+                        not in {"ai_final_reviewed", "ai_reviewed_source_preserved"}
+                    ):
+                        continue
+                    completed[index] = segment
+            if guide or completed:
+                print(
+                    f"[MathTranscript:final-review] resumed checkpoint: "
+                    f"guide={'yes' if guide else 'no'}, "
+                    f"chunks={len(completed)}/{len(enhanced)}",
+                    flush=True,
+                )
+
+        def save_progress() -> None:
+            if not checkpoint_enabled:
+                return
+            saved = dict(identity)
+            saved.update(
+                {
+                    "stage": "final-editorial-review",
+                    "guide": guide,
+                    "models": list(dict.fromkeys(models)),
+                    "completed": {
+                        str(index): completed[index] for index in sorted(completed)
+                    },
+                }
+            )
+            save_editorial_checkpoint(checkpoint_db, checkpoint_sub_id, saved)
+
+        if not guide:
+            guide, guide_models = self._global_review_guide(
+                enhanced,
+                course_title=course_title,
+                summary_reference=summary_reference,
+            )
+            models.extend(guide_models)
+            save_progress()
+            if checkpoint_enabled:
+                print(
+                    "[MathTranscript:final-review] checkpoint saved: global guide",
+                    flush=True,
+                )
+
+        attempted_fallbacks: dict[int, dict] = {}
         batches = (len(enhanced) + _FINAL_BATCH - 1) // _FINAL_BATCH
         for start in range(0, len(enhanced), _FINAL_BATCH):
             batch = enhanced[start:start + _FINAL_BATCH]
+            missing = [index for index in range(start, start + len(batch)) if index not in completed]
+            if not missing:
+                print(
+                    f"[MathTranscript:final-review] batch {start//_FINAL_BATCH+1}/{batches}: "
+                    f"resumed {len(batch)} completed chunk(s)",
+                    flush=True,
+                )
+                continue
             print(
                 f"[MathTranscript:final-review] batch {start//_FINAL_BATCH+1}/{batches}: "
-                f"{len(batch)} chunk(s)",
+                f"{len(missing)}/{len(batch)} chunk(s) remaining",
                 flush=True,
             )
-            out, used, failed = self._final_batch(
-                batch,
-                course_title=course_title,
-                source=enhanced,
-                batch_start=start,
-                guide=guide,
-            )
-            reviewed.extend(out)
-            models.extend(used)
-            fallbacks += failed
+            work_items = [(start, batch)] if len(missing) == len(batch) else [
+                (index, [enhanced[index]]) for index in missing
+            ]
+            for work_start, work_batch in work_items:
+                out, used, _failed = self._final_batch(
+                    work_batch,
+                    course_title=course_title,
+                    source=enhanced,
+                    batch_start=work_start,
+                    guide=guide,
+                )
+                models.extend(used)
+                for offset, segment in enumerate(out):
+                    index = work_start + offset
+                    status = segment.get("final_review_status")
+                    if status in {"ai_final_reviewed", "ai_reviewed_source_preserved"}:
+                        completed[index] = segment
+                        attempted_fallbacks.pop(index, None)
+                        # Persist after every accepted chunk, not merely after a
+                        # whole provider batch, so an abrupt runner/API failure
+                        # loses at most the currently in-flight chunk.
+                        save_progress()
+                        if checkpoint_enabled:
+                            print(
+                                f"[MathTranscript:final-review] checkpoint saved: "
+                                f"{len(completed)}/{len(enhanced)} chunks",
+                                flush=True,
+                            )
+                    else:
+                        attempted_fallbacks[index] = segment
+
+        reviewed = [
+            completed.get(index)
+            or attempted_fallbacks.get(index)
+            or {**segment, "final_review_status": "first_pass_api_fallback"}
+            for index, segment in enumerate(enhanced)
+        ]
+        fallbacks = len(enhanced) - len(completed)
         return reviewed, models, fallbacks
 
     @staticmethod
@@ -967,6 +1101,8 @@ class MathTranscriptEnhancer:
         raw_blackboard: str = "",
         summary_reference: str = "",
         first_pass_segments=None,
+        checkpoint_db=None,
+        checkpoint_sub_id: str = "",
     ):
         source = [
             x for x in (self._normalise(s) for s in proofread_segments or []) if x is not None
@@ -1020,6 +1156,8 @@ class MathTranscriptEnhancer:
             enhanced,
             course_title=course_title,
             summary_reference=summary_reference,
+            checkpoint_db=checkpoint_db,
+            checkpoint_sub_id=checkpoint_sub_id,
         )
         models.extend(final_models)
         if final_fallbacks:
