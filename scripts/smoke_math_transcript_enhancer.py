@@ -18,8 +18,13 @@ from src.ai.math_transcript_enhancer import (
     _protect_visual_fragments,
     _restore_visual_fragments,
     _source_coverage,
+    _visual_fragments,
     _valid_final_candidate,
     _valid_candidate,
+)
+from src.ai.editorial_math_transcript import (
+    EditorialMathTranscriptEnhancer,
+    _restore_authoritative_visuals,
 )
 from src.api.emailer import Emailer
 from src.runtime.config import MODEL_PROVIDERS
@@ -211,6 +216,13 @@ def main() -> None:
         "公式如下：" + visual + "，请继续。"
     )
     assert _restore_visual_fragments("占位符已被删除", fragments) == ""
+    recovered_visual = _restore_authoritative_visuals(
+        "公式如下，请继续讨论。",
+        protected_visual,
+        fragments,
+    )
+    assert _visual_fragments(recovered_visual) == [visual]
+    assert "公式如下" in recovered_visual and "请继续讨论" in recovered_visual
     final_source = "这里办案分析继续讨论度量。" + visual
     final_good = "这里泛函分析继续讨论度量。" + visual
     assert _valid_final_candidate(
@@ -231,6 +243,20 @@ def main() -> None:
     assert _valid_final_candidate(
         editorial_source,
         editorial_good,
+        course_title="泛函分析",
+    )
+    # A genuine prose rewrite need not retain 72% of the original characters.
+    # It is accepted by the editorial gate as long as it remains substantive,
+    # bounded in length, and preserves authoritative visual evidence exactly.
+    paraphrased = "本节考察赋范线性空间如何定义。" + visual
+    assert EditorialMathTranscriptEnhancer._valid_editorial_candidate(
+        editorial_source,
+        paraphrased,
+        course_title="泛函分析",
+    )
+    assert not EditorialMathTranscriptEnhancer._valid_editorial_candidate(
+        editorial_source,
+        "定义。" + visual,
         course_title="泛函分析",
     )
 
