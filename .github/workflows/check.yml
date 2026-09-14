@@ -17,6 +17,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The complete PDF/blackboard/transcript implementation currently
+          # lives on this tested feature branch. Scheduled workflows are
+          # loaded from main, so pin the working tree explicitly.
+          ref: feature/blackboard-latex
 
       - name: Set up Python
         uses: actions/setup-python@v5
