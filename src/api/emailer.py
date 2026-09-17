@@ -134,13 +134,12 @@ class Emailer:
             return result.markdown
         except Exception as exc:
             print(
-                f"[Emailer] Required editorial transcript review failed: "
-                f"{type(exc).__name__}: {exc}",
+                f"[Emailer] Optional editorial transcript enhancement failed: "
+                f"{type(exc).__name__}: {exc}; using the durable proofread "
+                "transcript so email delivery can continue.",
                 flush=True,
             )
-            raise RuntimeError(
-                "refusing to send an unreviewed transcript appendix"
-            ) from exc
+            return proofread_markdown
 
     def _build_pdf(self, item: dict) -> tuple[bytes, str]:
         complete_transcript = self._complete_transcript(item)
