@@ -35,7 +35,7 @@ from src.runtime import config
 
 _CHUNK_SEC = int(os.environ.get("TRANSCRIPT_PROOFREAD_CHUNK_SEC", "180"))
 _CONTEXT_SEC = 45
-_TIMEOUT = int(os.environ.get("TRANSCRIPT_PROOFREAD_TIMEOUT", "300"))
+_TIMEOUT = int(os.environ.get("TRANSCRIPT_PROOFREAD_TIMEOUT", "90"))
 _MIN_RATIO = 0.55
 _MAX_RATIO = 1.55
 
@@ -323,54 +323,80 @@ class TranscriptProofreader:
                 f"【同时段黑板视觉校对证据】\n{board}"
             )
 
-            corrected, model = self._call(prompt)
-            safe, ratio = _safe_ratio(current, corrected)
             fallback = False
-
-            if not safe:
+            try:
+                corrected, model = self._call(prompt)
+            except Exception as exc:
+                fallback = True
+                fallback_windows += 1
+                corrected = current
+                model = "raw-asr/provider-unavailable"
+                models.append(model)
                 print(
-                    "[TranscriptProofreader] unsafe first pass for "
-                    f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
-                    f"{len(corrected)} ({ratio:.1%}); retrying conservatively.",
+                    "[TranscriptProofreader] all providers unavailable for "
+                    f"{_fmt(start)}–{_fmt(end)} ({type(exc).__name__}: {exc}); "
+                    "preserving raw ASR instead of aborting lecture.",
                     flush=True,
                 )
-                retry_prompt = (
-                    prompt
-                    + "\n\n【安全重试要求】\n"
-                    + f"原始 ASR 长度为 {len(current)} 个字符。"
-                    + "上一轮输出因改动过大被拒绝。请只做最小必要校正，"
-                    + "不要补充任何板书/PPT 中但原 ASR 没有说出的内容。"
-                )
-                retried, retry_model = self._call(
-                    retry_prompt,
-                    system_prompt=STRICT_RETRY_SYSTEM_PROMPT,
-                )
-                retry_safe, retry_ratio = _safe_ratio(current, retried)
-                models.extend([model, retry_model])
-
-                if retry_safe:
-                    corrected = retried
-                    model = retry_model
-                    ratio = retry_ratio
-                    print(
-                        "[TranscriptProofreader] conservative retry accepted for "
-                        f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
-                        f"{len(corrected)} ({ratio:.1%})",
-                        flush=True,
-                    )
-                else:
-                    fallback = True
-                    fallback_windows += 1
-                    corrected = current
-                    print(
-                        "[TranscriptProofreader] conservative retry still unsafe for "
-                        f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
-                        f"{len(retried)} ({retry_ratio:.1%}); preserving raw ASR "
-                        "and marking this window as unverified instead of aborting lecture.",
-                        flush=True,
-                    )
             else:
-                models.append(model)
+                safe, ratio = _safe_ratio(current, corrected)
+                if not safe:
+                    print(
+                        "[TranscriptProofreader] unsafe first pass for "
+                        f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
+                        f"{len(corrected)} ({ratio:.1%}); retrying conservatively.",
+                        flush=True,
+                    )
+                    retry_prompt = (
+                        prompt
+                        + "\n\n【安全重试要求】\n"
+                        + f"原始 ASR 长度为 {len(current)} 个字符。"
+                        + "上一轮输出因改动过大被拒绝。请只做最小必要校正，"
+                        + "不要补充任何板书/PPT 中但原 ASR 没有说出的内容。"
+                    )
+                    try:
+                        retried, retry_model = self._call(
+                            retry_prompt,
+                            system_prompt=STRICT_RETRY_SYSTEM_PROMPT,
+                        )
+                    except Exception as exc:
+                        fallback = True
+                        fallback_windows += 1
+                        corrected = current
+                        models.append(model)
+                        print(
+                            "[TranscriptProofreader] conservative retry providers "
+                            f"unavailable for {_fmt(start)}–{_fmt(end)} "
+                            f"({type(exc).__name__}: {exc}); preserving raw ASR.",
+                            flush=True,
+                        )
+                    else:
+                        retry_safe, retry_ratio = _safe_ratio(current, retried)
+                        models.extend([model, retry_model])
+
+                        if retry_safe:
+                            corrected = retried
+                            model = retry_model
+                            ratio = retry_ratio
+                            print(
+                                "[TranscriptProofreader] conservative retry accepted for "
+                                f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
+                                f"{len(corrected)} ({ratio:.1%})",
+                                flush=True,
+                            )
+                        else:
+                            fallback = True
+                            fallback_windows += 1
+                            corrected = current
+                            print(
+                                "[TranscriptProofreader] conservative retry still unsafe for "
+                                f"{_fmt(start)}–{_fmt(end)}: {len(current)} -> "
+                                f"{len(retried)} ({retry_ratio:.1%}); preserving raw ASR "
+                                "and marking this window as unverified instead of aborting lecture.",
+                                flush=True,
+                            )
+                else:
+                    models.append(model)
 
             chunks.append(
                 {
@@ -388,7 +414,7 @@ class TranscriptProofreader:
         markdown_parts = [
             "# AI 校订语音转写",
             "",
-            "> 本附件以原始 ASR 为底稿，由 AI 结合同时段课件/板书证据校订。AI 只用于纠正明显识别错误；无法可靠判断处尽量保留原文。若某个时段的 AI 校订未通过安全检查，该时段会明确标为“原始 ASR 回退”，不会把可疑扩写伪装成已校订内容。",
+            "> 本附件以原始 ASR 为底稿，由 AI 结合同时段课件/板书证据校订。AI 只用于纠正明显识别错误；无法可靠判断处尽量保留原文。若某个时段的 AI 校订不可用或未通过安全检查，该时段会明确标为“原始 ASR 回退”，不会把可疑扩写伪装成已校订内容。",
             "",
         ]
         for chunk in chunks:
@@ -398,7 +424,7 @@ class TranscriptProofreader:
             if chunk.get("proofread_status") == "raw_fallback":
                 markdown_parts.extend(
                     [
-                        "> ⚠️ 本时段 AI 校订未通过安全检查，以下保留原始 ASR；内容可能存在识别错误。",
+                        "> ⚠️ 本时段 AI 校订不可用或未通过安全检查，以下保留原始 ASR；内容可能存在识别错误。",
                         "",
                     ]
                 )
