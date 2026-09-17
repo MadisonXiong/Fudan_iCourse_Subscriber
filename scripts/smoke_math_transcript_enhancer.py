@@ -426,14 +426,10 @@ def main() -> None:
         patch("src.api.emailer.load_math_transcript", return_value=None),
         patch("src.api.emailer.load_first_pass_seed", return_value=None),
     ):
-        try:
-            emailer._complete_transcript(
-                {"sub_id": "lecture-1", "course_title": "泛函分析"}
-            )
-        except RuntimeError as exc:
-            assert "unreviewed transcript" in str(exc)
-        else:
-            raise AssertionError("emailer accepted an unreviewed transcript")
+        completed = emailer._complete_transcript(
+            {"sub_id": "lecture-1", "course_title": "泛函分析"}
+        )
+        assert completed == faithful_markdown
 
     legacy = (
         "首先介绍课程要求。作业每周提交一次。"
@@ -458,7 +454,7 @@ def main() -> None:
     assert _comparison_text("".join(x["text"] for x in rebuilt)) == _comparison_text(legacy)
     fallback = _raw_transcript_markdown(rebuilt)
     assert all(segment["text"] in fallback for segment in rebuilt)
-    print("math transcript v9 required-editorial-review smoke checks passed")
+    print("math transcript v9 graceful-editorial-fallback smoke checks passed")
 
 
 if __name__ == "__main__":
