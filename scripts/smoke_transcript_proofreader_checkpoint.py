@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic smoke test for resumable transcript proofreading."""
+"""Deterministic smoke test for resumable, failure-tolerant proofreading."""
 
 from __future__ import annotations
 
@@ -50,33 +50,38 @@ def main() -> None:
         {"start_ms": 190_000, "end_ms": 200_000, "text": "第二段课堂语音。"},
     ]
 
-    interrupted = ScriptedProofreader(fail_on_call=2)
-    try:
-        interrupted.proofread(
-            segments,
-            [],
-            checkpoint_db=db,
-            checkpoint_sub_id="lecture-1",
-        )
-    except RuntimeError as exc:
-        assert "simulated provider interruption" in str(exc)
-    else:
-        raise AssertionError("the simulated provider failure was not raised")
-
-    checkpoint = load_proofread_checkpoint(db, "lecture-1")
-    assert checkpoint is not None
-    assert len(checkpoint["chunks"]) == 1
-
-    resumed = ScriptedProofreader()
-    result = resumed.proofread(
+    degraded = ScriptedProofreader(fail_on_call=2)
+    result = degraded.proofread(
         segments,
         [],
         checkpoint_db=db,
         checkpoint_sub_id="lecture-1",
     )
-    assert resumed.calls == 1, "completed first window should not call the API again"
+    assert degraded.calls == 2
     assert len(result.segments) == 2
-    assert result.model_label.endswith("fake/current-model")
+    assert [item["proofread_status"] for item in result.segments] == [
+        "ai_proofread",
+        "raw_fallback",
+    ]
+    assert "raw-asr/provider-unavailable" in result.model_label
+    assert result.model_label.endswith("+raw-fallback[1]")
+
+    checkpoint = load_proofread_checkpoint(db, "lecture-1")
+    assert checkpoint is not None
+    assert len(checkpoint["chunks"]) == 2
+
+    resumed = ScriptedProofreader()
+    resumed_result = resumed.proofread(
+        segments,
+        [],
+        checkpoint_db=db,
+        checkpoint_sub_id="lecture-1",
+    )
+    assert resumed.calls == 0, "checkpointed windows should not call the API again"
+    assert [item["proofread_status"] for item in resumed_result.segments] == [
+        "ai_proofread",
+        "raw_fallback",
+    ]
 
     clear_proofread_checkpoint(db, "lecture-1")
     assert load_proofread_checkpoint(db, "lecture-1") is None
