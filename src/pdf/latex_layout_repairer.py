@@ -329,11 +329,6 @@ def _provider_models() -> list[tuple[str, OpenAI, tuple[str, ...]]]:
     for provider in config.resolve_model_providers():
         if override:
             models = list(override)
-        elif provider["name"] == "modelscope":
-            models = [
-                "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "deepseek-ai/DeepSeek-V4-Pro",
-            ]
         else:
             models = list(provider["models"])
         if not models:

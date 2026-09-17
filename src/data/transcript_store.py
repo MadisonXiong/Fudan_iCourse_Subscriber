@@ -10,6 +10,7 @@ Database wrapper does not need a second set of near-duplicate accessors.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 
@@ -18,6 +19,74 @@ from datetime import datetime
 # provenance. Bumping the prefix prevents reuse of any earlier 4-minute cache.
 PROOFREAD_MODEL_PREFIX = "proofread-transcript-v2/"
 PROOFREAD_BOARD_MODEL_PREFIX = "proofread-transcript-v2-board/"
+PROOFREAD_CHECKPOINT_VERSION = 1
+_PROOFREAD_CHECKPOINT_KEY_PREFIX = (
+    "blackboard_cache_blob:proofread-transcript-checkpoint-v1:"
+)
+
+
+def proofread_source_fingerprint(
+    segments: list[dict],
+    ppt_pages: list[dict] | None,
+    raw_blackboard: str,
+    *,
+    chunk_sec: int,
+) -> str:
+    """Fingerprint the exact evidence and windowing used by proofreading."""
+    compact_pages = [
+        {"created_sec": page.get("created_sec"), "text": page.get("text")}
+        for page in (ppt_pages or [])
+    ]
+    payload = {
+        "segments": segments or [],
+        "ppt_pages": compact_pages,
+        "raw_blackboard": str(raw_blackboard or ""),
+        "chunk_sec": int(chunk_sec),
+        "checkpoint_version": PROOFREAD_CHECKPOINT_VERSION,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _proofread_checkpoint_key(sub_id: str) -> str:
+    return f"{_PROOFREAD_CHECKPOINT_KEY_PREFIX}{sub_id}"
+
+
+def load_proofread_checkpoint(db, sub_id: str) -> dict | None:
+    raw = db.read_meta(_proofread_checkpoint_key(str(sub_id)))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("version") or 0) != PROOFREAD_CHECKPOINT_VERSION:
+        return None
+    if not isinstance(payload.get("chunks"), list):
+        return None
+    return payload
+
+
+def save_proofread_checkpoint(db, sub_id: str, payload: dict) -> None:
+    value = dict(payload)
+    value["version"] = PROOFREAD_CHECKPOINT_VERSION
+    value["updated_at"] = datetime.now().isoformat()
+    db.write_meta(
+        _proofread_checkpoint_key(str(sub_id)),
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def clear_proofread_checkpoint(db, sub_id: str) -> None:
+    """Clear progress only after the complete proofread result is durable."""
+    db.write_meta(_proofread_checkpoint_key(str(sub_id)), "")
 
 
 def _loads_segments(value: str | None) -> list[dict] | None:

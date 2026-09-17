@@ -26,6 +26,9 @@ from src.ai.ppt_dedup import clean_ppt_text
 from src.data.transcript_store import (
     PROOFREAD_BOARD_MODEL_PREFIX,
     PROOFREAD_MODEL_PREFIX,
+    load_proofread_checkpoint,
+    proofread_source_fingerprint,
+    save_proofread_checkpoint,
 )
 from src.runtime import config
 
@@ -35,11 +38,6 @@ _CONTEXT_SEC = 45
 _TIMEOUT = int(os.environ.get("TRANSCRIPT_PROOFREAD_TIMEOUT", "300"))
 _MIN_RATIO = 0.55
 _MAX_RATIO = 1.55
-
-_MODELSCOPE_MODELS = [
-    "Qwen/Qwen3-30B-A3B-Instruct-2507",
-    "Qwen/Qwen3-VL-8B-Instruct",
-]
 
 _BOARD_HEADING_RE = re.compile(
     r"^####\s+(\d{1,2}):(\d{2})(?::(\d{2}))?.*$",
@@ -167,8 +165,11 @@ class TranscriptProofreader:
             if provider["name"] == "modelscope":
                 override = os.environ.get("TRANSCRIPT_PROOFREAD_MODELS", "").strip()
                 models = (
-                    [m.strip() for m in override.split(",") if m.strip()]
-                    if override else _MODELSCOPE_MODELS
+                    config.filter_modelscope_models(
+                        [m.strip() for m in override.split(",") if m.strip()],
+                        provider["base_url"],
+                    )
+                    if override else models
                 )
             self.providers.append(
                 (
@@ -225,6 +226,8 @@ class TranscriptProofreader:
         ppt_pages: list[dict] | None,
         *,
         raw_blackboard: str = "",
+        checkpoint_db=None,
+        checkpoint_sub_id: str = "",
     ) -> ProofreadResult:
         if not segments:
             raise ValueError("Timestamped ASR segments are required for proofreading")
@@ -233,11 +236,66 @@ class TranscriptProofreader:
         chunks: list[dict] = []
         models: list[str] = []
         fallback_windows = 0
+        source_sha256 = proofread_source_fingerprint(
+            segments,
+            ppt_pages,
+            raw_blackboard,
+            chunk_sec=_CHUNK_SEC,
+        )
+        resumed: dict[tuple[int, int], dict] = {}
+        if checkpoint_db is not None and checkpoint_sub_id:
+            checkpoint = load_proofread_checkpoint(
+                checkpoint_db, checkpoint_sub_id
+            )
+            if (
+                checkpoint
+                and checkpoint.get("source_sha256") == source_sha256
+            ):
+                for item in checkpoint.get("chunks", []):
+                    if (
+                        not isinstance(item, dict)
+                        or not str(item.get("text") or "").strip()
+                    ):
+                        continue
+                    key = (
+                        int(item.get("start_ms", -1)),
+                        int(item.get("end_ms", -1)),
+                    )
+                    resumed[key] = dict(item)
+                models.extend(
+                    str(model) for model in checkpoint.get("models", []) if model
+                )
+                if resumed:
+                    print(
+                        f"[TranscriptProofreader] resuming {len(resumed)} completed "
+                        f"window(s) for {checkpoint_sub_id}.",
+                        flush=True,
+                    )
+
+        def persist_checkpoint() -> None:
+            if checkpoint_db is None or not checkpoint_sub_id:
+                return
+            save_proofread_checkpoint(
+                checkpoint_db,
+                checkpoint_sub_id,
+                {
+                    "source_sha256": source_sha256,
+                    "chunks": chunks,
+                    "models": list(dict.fromkeys(models)),
+                },
+            )
 
         for start in range(0, max_end + 1, _CHUNK_SEC):
             end = min(max_end, start + _CHUNK_SEC)
             current = _text_in_window(segments, start, end)
             if not current:
+                continue
+            checkpoint_key = (start * 1000, end * 1000)
+            if checkpoint_key in resumed:
+                restored = resumed[checkpoint_key]
+                chunks.append(restored)
+                if restored.get("proofread_status") == "raw_fallback":
+                    fallback_windows += 1
                 continue
             before = _text_in_window(
                 segments,
@@ -322,6 +380,7 @@ class TranscriptProofreader:
                     "proofread_status": "raw_fallback" if fallback else "ai_proofread",
                 }
             )
+            persist_checkpoint()
 
         if not chunks:
             raise RuntimeError("Transcript proofreader produced no timed chunks")

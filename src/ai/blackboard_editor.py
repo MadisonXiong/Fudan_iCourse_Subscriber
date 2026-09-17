@@ -36,11 +36,6 @@ _DEFAULT_TIMEOUT = 600
 _MIN_RECURSIVE_CHUNK_CHARS = 6500
 _MAX_SPLIT_DEPTH = 2
 
-_MODELSCOPE_EDITOR_MODELS = [
-    "Qwen/Qwen3-30B-A3B-Instruct-2507",
-    "Qwen/Qwen3-VL-8B-Instruct",
-]
-
 _FRAME_HEADING_RE = re.compile(r"^####\s+[^\n]+$", re.MULTILINE)
 _DISPLAY_RE = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 _INLINE_RE = re.compile(r"(?<!\$)\$(?!\$).*?(?<!\$)\$(?!\$)", re.DOTALL)
@@ -311,9 +306,11 @@ class BlackboardEditor:
         if modelscope:
             override = os.environ.get("BLACKBOARD_EDITOR_MODELS", "").strip()
             models = (
-                [m.strip() for m in override.split(",") if m.strip()]
-                if override
-                else _MODELSCOPE_EDITOR_MODELS
+                config.filter_modelscope_models(
+                    [m.strip() for m in override.split(",") if m.strip()],
+                    modelscope["base_url"],
+                )
+                if override else list(modelscope["models"])
             )
             providers.append(
                 _Provider(

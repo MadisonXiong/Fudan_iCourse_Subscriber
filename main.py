@@ -239,9 +239,10 @@ def _drive_lectures(
     reporter: Reporter,
     all_lectures: list[tuple[str, str, dict]],
     email_items: list,
-) -> None:
+) -> list[str]:
+    """Process all lectures and return IDs that did not complete."""
     if not all_lectures:
-        return
+        return []
 
     first_course, _, first_lec = all_lectures[0]
     scheduler.prefetch_lecture(
@@ -251,6 +252,7 @@ def _drive_lectures(
     runner = LectureRunner(
         client, db, scheduler, transcriber, summarizer, reporter,
     )
+    failed_sub_ids: list[str] = []
 
     for index, (course_id, course_title, lecture) in enumerate(all_lectures):
         sub_id = str(lecture["sub_id"])
@@ -276,11 +278,14 @@ def _drive_lectures(
                     )
                 )
         except Exception:
+            failed_sub_ids.append(sub_id)
             reporter.lecture_error(sub_id)
             traceback.print_exc()
         finally:
             scheduler.image_cache.discard(sub_id)
             scheduler.audio_downloader.release(sub_id)
+
+    return failed_sub_ids
 
 
 def _send_email(
@@ -288,7 +293,7 @@ def _send_email(
     db: Database,
     reporter: Reporter,
     email_items: list,
-) -> None:
+) -> bool:
     """Append unsent processed lectures, including durable transcript attachments."""
     unsent = db.get_unsent_lectures()
     if unsent:
@@ -307,18 +312,24 @@ def _send_email(
                 )
         reporter.email_recovered_unsent(len(unsent))
 
-    if not (emailer and email_items):
-        return
+    if not email_items:
+        return True
+    if emailer is None:
+        reporter.info("[Email] SMTP is not configured; email was not sent.")
+        return False
 
     try:
         reporter.email_summary(len(email_items))
         if emailer.send(email_items):
             db.mark_emailed_batch([item["sub_id"] for item in email_items])
+            return True
         else:
             reporter.email_failed()
+            return False
     except Exception:
         reporter.info("[Email] Failed to send:")
         traceback.print_exc()
+        return False
 
 
 def _crawl_semester_catalog(
@@ -411,7 +422,7 @@ def run():
     scheduler = Scheduler(reporter=reporter)
     try:
         all_lectures = _enumerate_lectures(client, db, reporter)
-        _drive_lectures(
+        failed_sub_ids = _drive_lectures(
             client,
             db,
             scheduler,
@@ -424,8 +435,18 @@ def run():
     finally:
         scheduler.shutdown()
 
-    _send_email(emailer, db, reporter, email_items)
+    email_ok = _send_email(emailer, db, reporter, email_items)
     reporter.run_footer()
+    failures: list[str] = []
+    if failed_sub_ids:
+        failures.append(
+            f"{len(failed_sub_ids)} lecture(s) failed: "
+            + ", ".join(failed_sub_ids)
+        )
+    if not email_ok:
+        failures.append("email delivery failed")
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
 
 if __name__ == "__main__":

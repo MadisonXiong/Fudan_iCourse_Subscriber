@@ -107,10 +107,17 @@ class BlackboardVision:
         ).strip()
         self.models = _csv_env(
             "BLACKBOARD_VISION_MODELS",
-            "Qwen/Qwen3-VL-8B-Instruct",
+            ",".join(config.MODELSCOPE_VISION_MODELS),
+        )
+        self.models = config.filter_modelscope_models(
+            self.models,
+            self.base_url,
         )
         if not self.models:
-            raise ValueError("BLACKBOARD_VISION_MODELS is empty")
+            raise ValueError(
+                "No configured blackboard vision model currently has a "
+                "ModelScope API-Inference Provider"
+            )
         self.max_edge = int(os.environ.get("BLACKBOARD_VISION_MAX_EDGE", "1600"))
         self.max_tokens = int(os.environ.get("BLACKBOARD_VISION_MAX_TOKENS", "4096"))
         self.timeout = int(os.environ.get("BLACKBOARD_VISION_TIMEOUT", "180"))

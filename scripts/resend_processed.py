@@ -25,6 +25,7 @@ from src.ai.transcript_proofreader import TranscriptProofreader
 from src.data.blackboard_store import get_blackboard
 from src.data.database import Database
 from src.data.transcript_store import (
+    clear_proofread_checkpoint,
     load_proofread,
     load_transcript_segments,
     save_proofread,
@@ -200,6 +201,8 @@ def _ensure_proofread(
             segments,
             pages,
             raw_blackboard=raw_blackboard,
+            checkpoint_db=db,
+            checkpoint_sub_id=sub_id,
         )
         save_proofread(
             db,
@@ -208,6 +211,7 @@ def _ensure_proofread(
             result.segments,
             result.model_label,
         )
+        clear_proofread_checkpoint(db, sub_id)
         print(
             f"[Resend] Rebuilt AI-proofread transcript for {sub_id}: "
             f"{len(result.segments)} timed chunk(s).",

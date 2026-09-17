@@ -1,4 +1,6 @@
+import json
 import os
+import urllib.request
 
 STUDENT_ID = os.environ.get("StuId", "")
 PASSWORD = os.environ.get("UISPsw", "")
@@ -19,6 +21,91 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+# ModelScope 的模型仓库与 API-Inference 在线模型不是同一张表。下面只放
+# ``GET /v1/models`` 当前公布的文本模型候选；运行时还会再次读取该接口，
+# 自动剔除已撤下 Provider 的模型。
+MODELSCOPE_TEXT_MODELS = [
+    "Qwen/Qwen3.8-Flash-Next",
+    "Qwen/Qwen3.8-27B",
+    "Qwen/Qwen3.5-27B",
+    "Qwen/Qwen3.5-35B-A3B",
+    "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "ZhipuAI/GLM-5.3-Flash",
+]
+
+MODELSCOPE_VISION_MODELS = [
+    "OpenGVLab/InternVL3_5-241B-A28B",
+]
+
+_MODELSCOPE_DISCOVERY_CACHE: dict[str, set[str] | None] = {}
+
+
+def modelscope_available_models(base_url: str) -> set[str] | None:
+    """Return the live API-Inference model IDs, or ``None`` on lookup failure.
+
+    ModelScope exposes an OpenAI-compatible ``GET /v1/models`` endpoint.  A
+    successful response is authoritative for Provider availability; a failed
+    discovery must not make an otherwise healthy run unusable, so callers fall
+    back to the configured candidates in that case.
+    """
+    normalized = str(base_url or "").rstrip("/")
+    if normalized in _MODELSCOPE_DISCOVERY_CACHE:
+        return _MODELSCOPE_DISCOVERY_CACHE[normalized]
+    if os.environ.get("MODELSCOPE_MODEL_DISCOVERY", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        _MODELSCOPE_DISCOVERY_CACHE[normalized] = None
+        return None
+
+    url = normalized + "/models"
+    timeout = max(1, int(os.environ.get("MODELSCOPE_DISCOVERY_TIMEOUT", "15")))
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": "FiCS/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        ids = {
+            str(item.get("id") or "").strip()
+            for item in payload.get("data", [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        if not ids:
+            raise ValueError("ModelScope /models returned no model IDs")
+        _MODELSCOPE_DISCOVERY_CACHE[normalized] = ids
+        print(
+            f"[ModelScope] discovered {len(ids)} live API-Inference model(s).",
+            flush=True,
+        )
+        return ids
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            f"[ModelScope] live model discovery unavailable: "
+            f"{type(exc).__name__}: {exc}; using configured candidates.",
+            flush=True,
+        )
+        _MODELSCOPE_DISCOVERY_CACHE[normalized] = None
+        return None
+
+
+def filter_modelscope_models(models: list[str], base_url: str) -> list[str]:
+    """Drop models that currently have no ModelScope inference Provider."""
+    candidates = list(dict.fromkeys(str(m).strip() for m in models if str(m).strip()))
+    available = modelscope_available_models(base_url)
+    if available is None:
+        return candidates
+    selected = [model for model in candidates if model in available]
+    unavailable = [model for model in candidates if model not in available]
+    if unavailable:
+        print(
+            "[ModelScope] skipping model(s) without a live Provider: "
+            + ", ".join(unavailable),
+            flush=True,
+        )
+    return selected
+
+
 # 模型服务商配置（按列表顺序作为优先级，从前往后尝试）。
 # 用户可以在这里随意添加/删除/重排服务商和模型。
 # 兼容性：只设置 DASHSCOPE_API_KEY 也能跑（modelscope 项的 api_key 直接读取它）。
@@ -30,10 +117,7 @@ MODEL_PROVIDERS: list[dict] = [
         "api_key_env": "DASHSCOPE_API_KEY",
         "base_url_env": "DASHSCOPE_BASE_URL",
         "default_base_url": "https://api-inference.modelscope.cn/v1/",
-        "models": [
-            "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "deepseek-ai/DeepSeek-V4-Pro",
-        ],
+        "models": MODELSCOPE_TEXT_MODELS,
     },
     {
         "name": "deepseek",
@@ -91,6 +175,17 @@ def resolve_model_providers() -> list[dict]:
             "base_url": base_url,
             "models": list(p["models"]),
         }
+        if p["name"] == "modelscope":
+            entry["models"] = filter_modelscope_models(
+                entry["models"], entry["base_url"]
+            )
+            if not entry["models"]:
+                print(
+                    "[ModelScope] none of the configured text models currently "
+                    "has an API-Inference Provider; disabling this provider.",
+                    flush=True,
+                )
+                continue
         resolved.append(entry)
         by_name[p["name"]] = entry
     return resolved

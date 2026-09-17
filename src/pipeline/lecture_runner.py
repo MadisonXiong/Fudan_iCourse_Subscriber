@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
 from src.ai import bucketer
 from src.ai.transcript_proofreader import TranscriptProofreader
 from src.data.transcript_store import (
+    clear_proofread_checkpoint,
     load_proofread,
     load_transcript_segments,
     proofread_is_current,
@@ -234,6 +235,8 @@ class LectureRunner:
             transcript_segments,
             ppt_pages,
             raw_blackboard=raw_blackboard,
+            checkpoint_db=self._db,
+            checkpoint_sub_id=sub_id,
         )
         save_proofread(
             self._db,
@@ -242,6 +245,7 @@ class LectureRunner:
             result.segments,
             result.model_label,
         )
+        clear_proofread_checkpoint(self._db, sub_id)
         self._reporter.info(
             f"    [OK] AI-proofread transcript: {len(result.segments)} timed chunks, "
             f"{len(result.markdown)} chars"

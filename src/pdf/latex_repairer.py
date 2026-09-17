@@ -156,7 +156,7 @@ def _apply_window(tex: str, start: int, end: int, replacement: str) -> str:
 
 
 def _provider_models() -> list[tuple[str, OpenAI, tuple[str, ...]]]:
-    """Use known-working short-repair models; never try unsupported Flash IDs."""
+    """Use the same live-filtered models as the main AI pipeline."""
     override = [
         item.strip()
         for item in os.environ.get("FICS_LATEX_REPAIR_MODELS", "").split(",")
@@ -166,14 +166,6 @@ def _provider_models() -> list[tuple[str, OpenAI, tuple[str, ...]]]:
     for provider in config.resolve_model_providers():
         if override:
             models = list(override)
-        elif provider["name"] == "modelscope":
-            # Qwen3-30B is already proven usable by the math-transcript pipeline.
-            # DeepSeek-V4-Flash is deliberately excluded because ModelScope has
-            # returned "has no provider supported" for that model ID.
-            models = [
-                "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                "deepseek-ai/DeepSeek-V4-Pro",
-            ]
         else:
             models = list(provider["models"])
         if not models:
