@@ -55,6 +55,9 @@ jobs:
       - name: Smoke-test complete transcript appendix and historical fallback
         run: python scripts/smoke_math_transcript_enhancer.py
 
+      - name: Smoke-test transcript provider outage fallback
+        run: python scripts/smoke_transcript_proofreader_checkpoint.py
+
       - name: Smoke-test blackboard parser, schema, and DB merge
         run: |
           python - <<'PY'
