@@ -27,9 +27,9 @@ from src.data.math_transcript_store import (
 )
 from src.runtime import config
 
-_TIMEOUT = int(os.environ.get("MATH_TRANSCRIPT_TIMEOUT", "300"))
+_TIMEOUT = int(os.environ.get("MATH_TRANSCRIPT_TIMEOUT", "90"))
 _BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_BATCH_SIZE", "5")))
-_FINAL_BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_FINAL_BATCH_SIZE", "1")))
+_FINAL_BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_FINAL_BATCH_SIZE", "5")))
 _MIN_RATIO, _MAX_RATIO = 0.90, 2.20
 _MIN_SOURCE_COVERAGE = 0.88
 _MIN_CLAUSE_COVERAGE = 0.65
@@ -60,7 +60,7 @@ _RETRY_DELAY_RE = re.compile(
     re.I,
 )
 _RATE_LIMIT_RETRIES = max(
-    0, int(os.environ.get("MATH_TRANSCRIPT_RATE_LIMIT_RETRIES", "2"))
+    0, int(os.environ.get("MATH_TRANSCRIPT_RATE_LIMIT_RETRIES", "1"))
 )
 
 # Course-scoped replacements whose meaning is unambiguous even if the model is
