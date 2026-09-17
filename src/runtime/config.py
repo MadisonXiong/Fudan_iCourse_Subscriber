@@ -24,13 +24,12 @@ USER_AGENT = (
 # ModelScope 的模型仓库与 API-Inference 在线模型不是同一张表。下面只放
 # ``GET /v1/models`` 当前公布的文本模型候选；运行时还会再次读取该接口，
 # 自动剔除已撤下 Provider 的模型。
+# Keep this list deliberately short.  Proofreading touches every three-minute
+# window, so cycling through many large models can turn one provider outage into
+# hours of retries.  Both IDs are also checked against GET /v1/models at startup.
 MODELSCOPE_TEXT_MODELS = [
     "Qwen/Qwen3.8-Flash-Next",
-    "Qwen/Qwen3.8-27B",
-    "Qwen/Qwen3.5-27B",
     "Qwen/Qwen3.5-35B-A3B",
-    "deepseek-ai/DeepSeek-V4-Flash-0731",
-    "ZhipuAI/GLM-5.3-Flash",
 ]
 
 MODELSCOPE_VISION_MODELS = [
