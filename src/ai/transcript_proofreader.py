@@ -36,6 +36,9 @@ from src.runtime import config
 _CHUNK_SEC = int(os.environ.get("TRANSCRIPT_PROOFREAD_CHUNK_SEC", "180"))
 _CONTEXT_SEC = 45
 _TIMEOUT = int(os.environ.get("TRANSCRIPT_PROOFREAD_TIMEOUT", "90"))
+_CIRCUIT_FAILURES = max(
+    1, int(os.environ.get("TRANSCRIPT_PROOFREAD_CIRCUIT_FAILURES", "2"))
+)
 _MIN_RATIO = 0.55
 _MAX_RATIO = 1.55
 
@@ -156,6 +159,31 @@ def _safe_ratio(source: str, candidate: str) -> tuple[bool, float]:
     return _MIN_RATIO <= ratio <= _MAX_RATIO, ratio
 
 
+def _provider_failure_kind(exc: Exception) -> str:
+    """Classify failures that should open a per-model circuit breaker."""
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    status_code = getattr(exc, "status_code", None)
+
+    if (
+        status_code == 429
+        or "ratelimit" in name
+        or "rate limit" in message
+        or "quota" in message
+        or "resource_exhausted" in message
+    ):
+        return "rate-limit"
+    if (
+        "timeout" in name
+        or "timed out" in message
+        or "request timeout" in message
+    ):
+        return "timeout"
+    if status_code == 400 or "badrequest" in name:
+        return "permanent"
+    return "other"
+
+
 class TranscriptProofreader:
     def __init__(self):
         resolved = config.resolve_model_providers()
@@ -183,12 +211,46 @@ class TranscriptProofreader:
             )
         if not self.providers:
             raise ValueError("No model provider available for transcript proofreading")
+        self._model_failure_counts: dict[str, int] = {}
+        self._disabled_models: dict[str, str] = {}
+        self._circuit_failures = _CIRCUIT_FAILURES
+
+    def _disable_model(self, model_id: str, reason: str) -> None:
+        if model_id in self._disabled_models:
+            return
+        self._disabled_models[model_id] = reason
+        print(
+            f"[TranscriptProofreader] circuit opened for {model_id}: {reason}; "
+            "skipping it for the rest of this run.",
+            flush=True,
+        )
+
+    def _record_model_failure(self, model_id: str, exc: Exception) -> None:
+        kind = _provider_failure_kind(exc)
+        if kind == "rate-limit":
+            self._disable_model(model_id, "rate limit/quota exhausted")
+            return
+        if kind == "permanent":
+            self._disable_model(model_id, "non-retryable bad request")
+            return
+        if kind != "timeout":
+            return
+
+        failures = self._model_failure_counts.get(model_id, 0) + 1
+        self._model_failure_counts[model_id] = failures
+        if failures >= self._circuit_failures:
+            self._disable_model(
+                model_id,
+                f"{failures} consecutive request timeouts",
+            )
 
     def _call(self, prompt: str, *, system_prompt: str = SYSTEM_PROMPT) -> tuple[str, str]:
         errors: list[str] = []
         for provider_name, client, models in self.providers:
             for model in models:
                 model_id = f"{provider_name}/{model}"
+                if model_id in self._disabled_models:
+                    continue
                 t0 = time.time()
                 try:
                     response = client.chat.completions.create(
@@ -207,6 +269,7 @@ class TranscriptProofreader:
                         raise RuntimeError("empty response")
                     if str(getattr(choice, "finish_reason", "") or "").lower() == "length":
                         raise RuntimeError("truncated response")
+                    self._model_failure_counts[model_id] = 0
                     print(
                         f"[TranscriptProofreader] {model_id}: "
                         f"{len(prompt)} -> {len(text)} chars in {time.time()-t0:.0f}s",
@@ -216,8 +279,16 @@ class TranscriptProofreader:
                 except Exception as exc:
                     errors.append(f"{model_id}: {type(exc).__name__}: {exc}")
                     print(f"[TranscriptProofreader] {errors[-1]}", flush=True)
+                    self._record_model_failure(model_id, exc)
+
+        disabled = " | ".join(
+            f"{model_id}: circuit open ({reason})"
+            for model_id, reason in self._disabled_models.items()
+        )
+        details = " | ".join(errors) or disabled or "no enabled models"
         raise RuntimeError(
-            "All transcript proofreading models failed: " + " | ".join(errors)
+            "All transcript proofreading models failed or are disabled: "
+            + details
         )
 
     def proofread(
