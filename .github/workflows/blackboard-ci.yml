@@ -58,6 +58,9 @@ jobs:
       - name: Smoke-test transcript provider outage fallback
         run: python scripts/smoke_transcript_proofreader_checkpoint.py
 
+      - name: Smoke-test blackboard editor raw fallback
+        run: python scripts/smoke_blackboard_runner_fallback.py
+
       - name: Smoke-test summary provenance repair and fallback
         run: python scripts/smoke_summarizer_provenance.py
 

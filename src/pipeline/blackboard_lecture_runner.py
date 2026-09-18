@@ -73,6 +73,38 @@ class BlackboardLectureRunner(BaseLectureRunner):
             summary = summary[:match.start()].strip()
         return summary if len(summary) >= 5000 else ""
 
+    def _edit_blackboard_or_fallback(
+        self,
+        sub_id: str,
+        blackboard_latex: str,
+    ) -> tuple[str, str]:
+        """Keep a lecture deliverable when the optional editor is unsafe."""
+        try:
+            editor = BlackboardEditor(db=self._db, sub_id=sub_id)
+            board_notes, editor_model = editor.edit(blackboard_latex)
+            if not board_notes.strip():
+                raise RuntimeError("blackboard editor produced empty output")
+            self._reporter.info(
+                f"    [OK] Blackboard edited transcript: "
+                f"{len(blackboard_latex)} raw chars -> {len(board_notes)} final chars"
+            )
+            return board_notes, editor_model
+        except Exception as exc:
+            self._reporter.info(
+                f"    [WARN] Blackboard editor unavailable or unsafe "
+                f"({type(exc).__name__}: {exc}); preserving the raw timestamped "
+                "blackboard transcript so summary and email delivery can continue."
+            )
+            fallback = blackboard_latex.strip()
+            if not fallback.startswith(_BOARD_NOTES_MARKER):
+                fallback = (
+                    _BOARD_NOTES_MARKER
+                    + "\n\n"
+                    + "> ⚠️ AI 板书整理不可用；以下保留带时间定位的原始板书转写。\n\n"
+                    + fallback
+                )
+            return fallback, f"raw-blackboard-fallback/{type(exc).__name__}"
+
     def _has_summary(self, existing: dict | None) -> bool:
         if not course_requires_blackboard(self._active_course_title):
             return super()._has_summary(existing)
@@ -159,13 +191,8 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 self._reporter.info(
                     f"    [Blackboard] current cache exists ({len(blackboard_latex)} chars), reusing."
                 )
-                editor = BlackboardEditor(db=self._db, sub_id=sub_id)
-                board_notes, editor_model = editor.edit(blackboard_latex)
-                if not board_notes.strip():
-                    raise RuntimeError("blackboard editor produced empty output")
-                self._reporter.info(
-                    f"    [OK] Blackboard edited transcript: "
-                    f"{len(blackboard_latex)} raw chars -> {len(board_notes)} final chars"
+                board_notes, editor_model = self._edit_blackboard_or_fallback(
+                    sub_id, blackboard_latex
                 )
                 proofread_board_evidence = blackboard_latex
             elif prior_board_notes:
@@ -185,10 +212,9 @@ class BlackboardLectureRunner(BaseLectureRunner):
                 )
                 if not blackboard_latex.strip():
                     raise RuntimeError("blackboard transcription empty")
-                editor = BlackboardEditor(db=self._db, sub_id=sub_id)
-                board_notes, editor_model = editor.edit(blackboard_latex)
-                if not board_notes.strip():
-                    raise RuntimeError("blackboard editor produced empty output")
+                board_notes, editor_model = self._edit_blackboard_or_fallback(
+                    sub_id, blackboard_latex
+                )
                 proofread_board_evidence = blackboard_latex
 
             kept_pages = self._db.get_done_ppt_pages(sub_id)
