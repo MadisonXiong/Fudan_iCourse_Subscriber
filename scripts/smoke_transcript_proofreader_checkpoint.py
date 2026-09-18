@@ -117,11 +117,13 @@ def main() -> None:
         checkpoint_db=db,
         checkpoint_sub_id="lecture-1",
     )
-    assert resumed.calls == 0, "checkpointed windows should not call the API again"
+    assert resumed.calls == 1, "raw fallback windows must be retried"
     assert [item["proofread_status"] for item in resumed_result.segments] == [
         "ai_proofread",
-        "raw_fallback",
+        "ai_proofread",
     ]
+    assert "raw-asr/provider-unavailable" not in resumed_result.model_label
+    assert "raw-fallback" not in resumed_result.model_label
 
     clear_proofread_checkpoint(db, "lecture-1")
     assert load_proofread_checkpoint(db, "lecture-1") is None

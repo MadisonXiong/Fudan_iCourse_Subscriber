@@ -314,6 +314,7 @@ class TranscriptProofreader:
             chunk_sec=_CHUNK_SEC,
         )
         resumed: dict[tuple[int, int], dict] = {}
+        retryable_fallbacks = 0
         if checkpoint_db is not None and checkpoint_sub_id:
             checkpoint = load_proofread_checkpoint(
                 checkpoint_db, checkpoint_sub_id
@@ -328,18 +329,30 @@ class TranscriptProofreader:
                         or not str(item.get("text") or "").strip()
                     ):
                         continue
+                    if item.get("proofread_status") == "raw_fallback":
+                        retryable_fallbacks += 1
+                        continue
                     key = (
                         int(item.get("start_ms", -1)),
                         int(item.get("end_ms", -1)),
                     )
                     resumed[key] = dict(item)
                 models.extend(
-                    str(model) for model in checkpoint.get("models", []) if model
+                    str(model)
+                    for model in checkpoint.get("models", [])
+                    if model and str(model) != "raw-asr/provider-unavailable"
                 )
                 if resumed:
                     print(
                         f"[TranscriptProofreader] resuming {len(resumed)} completed "
                         f"window(s) for {checkpoint_sub_id}.",
+                        flush=True,
+                    )
+                if retryable_fallbacks:
+                    print(
+                        f"[TranscriptProofreader] retrying {retryable_fallbacks} raw-ASR "
+                        f"fallback window(s) for {checkpoint_sub_id}; fallback windows "
+                        "are not treated as completed proofreading.",
                         flush=True,
                     )
 
@@ -365,8 +378,6 @@ class TranscriptProofreader:
             if checkpoint_key in resumed:
                 restored = resumed[checkpoint_key]
                 chunks.append(restored)
-                if restored.get("proofread_status") == "raw_fallback":
-                    fallback_windows += 1
                 continue
             before = _text_in_window(
                 segments,
