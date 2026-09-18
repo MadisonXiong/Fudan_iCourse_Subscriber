@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,45 @@ from src.data.transcript_store import (
     clear_proofread_checkpoint,
     load_proofread_checkpoint,
 )
+
+
+class APITimeoutError(Exception):
+    pass
+
+
+class RateLimitError(Exception):
+    status_code = 429
+
+
+class FakeCompletions:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        choice = SimpleNamespace(
+            message=SimpleNamespace(content=outcome),
+            finish_reason="stop",
+        )
+        return SimpleNamespace(choices=[choice])
+
+
+class FakeClient:
+    def __init__(self, outcomes):
+        self.chat = SimpleNamespace(completions=FakeCompletions(outcomes))
+
+
+def circuit_breaker_proofreader(providers) -> TranscriptProofreader:
+    proofreader = object.__new__(TranscriptProofreader)
+    proofreader.providers = providers
+    proofreader._model_failure_counts = {}
+    proofreader._disabled_models = {}
+    proofreader._circuit_failures = 2
+    return proofreader
 
 
 class MemoryDB:
@@ -85,7 +125,37 @@ def main() -> None:
 
     clear_proofread_checkpoint(db, "lecture-1")
     assert load_proofread_checkpoint(db, "lecture-1") is None
-    print("Transcript proofreading checkpoint smoke test passed.")
+
+    slow = FakeClient([
+        APITimeoutError("Request timed out."),
+        APITimeoutError("Request timed out."),
+    ])
+    healthy = FakeClient(["校订一", "校订二", "校订三"])
+    breaker = circuit_breaker_proofreader([
+        ("modelscope", slow, ("slow-model",)),
+        ("fallback", healthy, ("healthy-model",)),
+    ])
+    for _ in range(3):
+        text, model = breaker._call("测试提示")
+        assert text.startswith("校订")
+        assert model == "fallback/healthy-model"
+    assert slow.chat.completions.calls == 2
+    assert healthy.chat.completions.calls == 3
+    assert "modelscope/slow-model" in breaker._disabled_models
+
+    limited = FakeClient([RateLimitError("429 quota exhausted")])
+    backup = FakeClient(["回退一", "回退二"])
+    quota_breaker = circuit_breaker_proofreader([
+        ("gemini", limited, ("limited-model",)),
+        ("fallback", backup, ("healthy-model",)),
+    ])
+    quota_breaker._call("第一次")
+    quota_breaker._call("第二次")
+    assert limited.chat.completions.calls == 1
+    assert backup.chat.completions.calls == 2
+    assert "gemini/limited-model" in quota_breaker._disabled_models
+
+    print("Transcript proofreading checkpoint and circuit-breaker smoke tests passed.")
 
 
 if __name__ == "__main__":
