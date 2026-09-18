@@ -74,8 +74,23 @@ TRACEABILITY_PROMPT = r"""
 """
 
 
+TRACEABILITY_REPAIR_SYSTEM_PROMPT = r"""
+你是课程总结的视频来源标记格式修复器。你会收到原始来源块和一份已经写好的课程总结。
+
+只修复来源标记，不得重新总结：
+1. 保留原总结的标题、正文、公式、列表和顺序；不得删改或扩写知识内容。
+2. 每个 `###`、`####`、`#####` 标题的下一行必须单独放置一个合法的
+   `〔VIDEO:Txx〕` 或连续范围 `〔VIDEO:Txx-Tyy〕`。
+3. 只能使用原始来源块中确实存在的 Txx，禁止猜测时间或虚构 ID。
+4. 删除或替换不合法的来源标记。
+5. 直接输出修复后的完整 Markdown，不要解释修改过程。
+""".strip()
+
 _TRACE_RE = re.compile(r"〔VIDEO:(T\d{2,3})(?:-(T\d{2,3}))?〕")
+_ANY_TRACE_RE = re.compile(r"〔VIDEO:[^〕\n]*〕")
 _HEADING_RE = re.compile(r"^(#{3,5})\s+(.+?)\s*$", re.MULTILINE)
+_MISSING_TRACE_NOTICE = "> ⚠️ 本部分缺少可靠的视频定位。"
+_PARTIAL_TRACE_NOTICE = "> ⚠️ 部分标题缺少可靠的视频定位；正文内容仍予保留。"
 
 
 def _fmt(sec: int) -> str:
@@ -139,6 +154,50 @@ def render_traceable_summary(
     return rendered
 
 
+def render_traceable_summary_lenient(
+    text: str,
+    windows: dict[str, tuple[int, int]],
+) -> str:
+    """Keep useful summary text while suppressing unreliable provenance.
+
+    Valid source IDs are rendered normally. Unknown, reversed, non-contiguous,
+    or malformed markers are removed. Each heading without a verified location
+    receives an explicit warning instead of causing the whole lecture to fail.
+    """
+    invalid_markers = 0
+
+    def render_or_remove(match: re.Match) -> str:
+        nonlocal invalid_markers
+        try:
+            return _render_one_trace(match, windows)
+        except ValueError:
+            invalid_markers += 1
+            return ""
+
+    rendered = _TRACE_RE.sub(render_or_remove, text)
+    malformed = len(_ANY_TRACE_RE.findall(rendered))
+    if malformed:
+        invalid_markers += malformed
+        rendered = _ANY_TRACE_RE.sub("", rendered)
+
+    lines = rendered.splitlines()
+    output: list[str] = []
+    missing_headings = 0
+    for index, line in enumerate(lines):
+        output.append(line)
+        if not re.match(r"^#{3,5}\s+\S", line.strip()):
+            continue
+        lookahead = "\n".join(lines[index + 1:index + 4])
+        if "**视频定位：" not in lookahead:
+            output.extend(["", _MISSING_TRACE_NOTICE])
+            missing_headings += 1
+
+    body = "\n".join(output).strip()
+    if missing_headings or invalid_markers:
+        body = _PARTIAL_TRACE_NOTICE + "\n\n" + body
+    return body
+
+
 class Summarizer:
     """Course lecture summarizer with multi-provider fallback."""
 
@@ -198,6 +257,47 @@ class Summarizer:
             )
         return result
 
+    def _repair_traceability(
+        self,
+        client: OpenAI,
+        model: str,
+        title: str,
+        source_content: str,
+        summary: str,
+        validation_error: Exception,
+    ) -> str:
+        """Ask the same model to repair markers without rewriting the summary."""
+        t0 = time.time()
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": TRACEABILITY_REPAIR_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"课程：《{title}》\n"
+                        f"上一轮校验错误：{validation_error}\n\n"
+                        "【原始视频来源块】\n"
+                        f"{source_content}\n\n"
+                        "【待修复总结】\n"
+                        f"{summary}"
+                    ),
+                },
+            ],
+            timeout=180,
+        )
+        repaired = response.choices[0].message.content or ""
+        if not repaired.strip():
+            raise ValueError("traceability repair returned empty output")
+        print(
+            f"[Summarizer] Traceability repair done ({model}): "
+            f"{len(summary)} -> {len(repaired)} chars in {time.time() - t0:.0f}s"
+        )
+        return repaired
+
     def summarize(
         self,
         title: str,
@@ -228,17 +328,58 @@ class Summarizer:
                         content,
                         traceable=traceable,
                     )
-                    if video_windows:
-                        result = render_traceable_summary(result, video_windows)
-                    return (result, model_id)
-                except Exception as e:
+                    if not result.strip():
+                        raise ValueError("summary model returned empty output")
+                except Exception as exc:
                     print(
-                        f"[Summarizer] {model_id} failed/invalid: "
-                        f"{type(e).__name__}: {e}"
+                        f"[Summarizer] {model_id} failed: "
+                        f"{type(exc).__name__}: {exc}"
                     )
-                    errors.append(f"{model_id}: {e}")
+                    errors.append(f"{model_id}: {exc}")
+                    continue
+
+                if not video_windows:
+                    return (result, model_id)
+
+                try:
+                    rendered = render_traceable_summary(result, video_windows)
+                    return (rendered, model_id)
+                except ValueError as validation_error:
+                    print(
+                        f"[Summarizer] {model_id} provenance invalid: "
+                        f"{validation_error}; repairing once with the same model."
+                    )
+
+                try:
+                    repaired = self._repair_traceability(
+                        client,
+                        model,
+                        title,
+                        content,
+                        result,
+                        validation_error,
+                    )
+                    rendered = render_traceable_summary(
+                        repaired,
+                        video_windows,
+                    )
+                    print(
+                        f"[Summarizer] {model_id} provenance repair accepted."
+                    )
+                    return (rendered, model_id + "+provenance-repair")
+                except Exception as repair_error:
+                    print(
+                        f"[Summarizer] {model_id} provenance repair failed: "
+                        f"{type(repair_error).__name__}: {repair_error}; "
+                        "keeping the summary with explicit missing-location warnings."
+                    )
+                    rendered = render_traceable_summary_lenient(
+                        result,
+                        video_windows,
+                    )
+                    return (rendered, model_id + "+provenance-fallback")
 
         raise RuntimeError(
-            "All LLM models failed or produced invalid provenance:\n"
+            "All LLM models failed before producing a usable summary:\n"
             + "\n".join(errors)
         )
