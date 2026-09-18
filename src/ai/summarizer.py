@@ -345,6 +345,7 @@ class Summarizer:
                     rendered = render_traceable_summary(result, video_windows)
                     return (rendered, model_id)
                 except ValueError as validation_error:
+                    provenance_error = validation_error
                     print(
                         f"[Summarizer] {model_id} provenance invalid: "
                         f"{validation_error}; repairing once with the same model."
@@ -357,7 +358,7 @@ class Summarizer:
                         title,
                         content,
                         result,
-                        validation_error,
+                        provenance_error,
                     )
                     rendered = render_traceable_summary(
                         repaired,
