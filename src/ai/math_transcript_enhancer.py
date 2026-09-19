@@ -21,13 +21,23 @@ from openai import OpenAI
 from src.ai.ppt_dedup import clean_ppt_text
 from src.data.math_transcript_store import (
     EDITORIAL_CHECKPOINT_VERSION,
+    FIRST_PASS_CHECKPOINT_VERSION,
     clear_editorial_checkpoint,
+    clear_first_pass_checkpoint,
     load_editorial_checkpoint,
+    load_first_pass_checkpoint,
     save_editorial_checkpoint,
+    save_first_pass_checkpoint,
 )
 from src.runtime import config
 
 _TIMEOUT = int(os.environ.get("MATH_TRANSCRIPT_TIMEOUT", "90"))
+_TOTAL_BUDGET = max(
+    1, int(os.environ.get("MATH_TRANSCRIPT_TOTAL_BUDGET", "1200"))
+)
+_CIRCUIT_FAILURES = max(
+    1, int(os.environ.get("MATH_TRANSCRIPT_CIRCUIT_FAILURES", "2"))
+)
 _BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_BATCH_SIZE", "5")))
 _FINAL_BATCH = max(1, int(os.environ.get("MATH_TRANSCRIPT_FINAL_BATCH_SIZE", "5")))
 _MIN_RATIO, _MAX_RATIO = 0.90, 2.20
@@ -62,6 +72,29 @@ _RETRY_DELAY_RE = re.compile(
 _RATE_LIMIT_RETRIES = max(
     0, int(os.environ.get("MATH_TRANSCRIPT_RATE_LIMIT_RETRIES", "1"))
 )
+
+
+class MathTranscriptBudgetExceeded(RuntimeError):
+    """Raised when optional math enhancement has consumed its time budget."""
+
+
+def _failure_kind(exc: Exception) -> str:
+    """Classify provider failures that should open a model circuit."""
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    status_code = getattr(exc, "status_code", None)
+    if (
+        status_code == 429
+        or "ratelimit" in name
+        or "rate limit" in message
+        or "quota" in message
+    ):
+        return "rate-limit"
+    if "timeout" in name or "timed out" in message:
+        return "timeout"
+    if status_code == 400 or "badrequest" in name:
+        return "permanent"
+    return "other"
 
 # Course-scoped replacements whose meaning is unambiguous even if the model is
 # unavailable.  They are applied only to the readable enhanced copy, never to
@@ -461,7 +494,17 @@ class MathTranscriptEnhancer:
             if p["name"] == "modelscope":
                 models = override or models
             self.providers.append(
-                (p["name"], OpenAI(api_key=p["api_key"], base_url=p["base_url"]), tuple(models))
+                (
+                    p["name"],
+                    OpenAI(
+                        api_key=p["api_key"],
+                        base_url=p["base_url"],
+                        # The SDK otherwise retries a 90-second timeout twice,
+                        # turning one failed request into roughly 4.5 minutes.
+                        max_retries=0,
+                    ),
+                    tuple(models),
+                )
             )
         if not self.providers:
             raise ValueError(
@@ -474,6 +517,61 @@ class MathTranscriptEnhancer:
             "cross-provider fallback is disabled",
             flush=True,
         )
+        self._model_failure_counts: dict[str, int] = {}
+        self._disabled_models: dict[str, str] = {}
+        self._circuit_failures = _CIRCUIT_FAILURES
+        self._deadline_monotonic: float | None = None
+
+    def _ensure_runtime_state(self) -> None:
+        """Keep lightweight test doubles and old callers backwards compatible."""
+        if not hasattr(self, "_model_failure_counts"):
+            self._model_failure_counts = {}
+        if not hasattr(self, "_disabled_models"):
+            self._disabled_models = {}
+        if not hasattr(self, "_circuit_failures"):
+            self._circuit_failures = _CIRCUIT_FAILURES
+        if not hasattr(self, "_deadline_monotonic"):
+            self._deadline_monotonic = None
+
+    def _remaining_budget(self) -> float | None:
+        self._ensure_runtime_state()
+        if self._deadline_monotonic is None:
+            return None
+        remaining = self._deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise MathTranscriptBudgetExceeded(
+                f"optional math transcript exceeded {_TOTAL_BUDGET}s total budget"
+            )
+        return remaining
+
+    def _disable_model(self, model_id: str, reason: str) -> None:
+        self._ensure_runtime_state()
+        if model_id in self._disabled_models:
+            return
+        self._disabled_models[model_id] = reason
+        print(
+            f"[MathTranscript] circuit opened for {model_id}: {reason}; "
+            "skipping it for the rest of this process.",
+            flush=True,
+        )
+
+    def _record_model_failure(self, model_id: str, exc: Exception) -> None:
+        kind = _failure_kind(exc)
+        if kind == "rate-limit":
+            self._disable_model(model_id, "rate limit/quota exhausted")
+            return
+        if kind == "permanent":
+            self._disable_model(model_id, "non-retryable bad request")
+            return
+        if kind != "timeout":
+            return
+        failures = self._model_failure_counts.get(model_id, 0) + 1
+        self._model_failure_counts[model_id] = failures
+        if failures >= self._circuit_failures:
+            self._disable_model(
+                model_id,
+                f"{failures} consecutive request timeouts",
+            )
 
     def _call(self, prompt: str) -> tuple[str, str]:
         return self._call_with_system(
@@ -491,17 +589,25 @@ class MathTranscriptEnhancer:
         max_tokens: int,
         stage: str,
     ) -> tuple[str, str]:
+        self._ensure_runtime_state()
         errors = []
         pending = [
             (provider, client, model)
             for provider, client, models in self.providers
             for model in models
+            if f"{provider}/{model}" not in self._disabled_models
         ]
         for retry_round in range(_RATE_LIMIT_RETRIES + 1):
             rate_limited_candidates = []
             retry_delays = []
             for provider, client, model in pending:
                 model_id = f"{provider}/{model}"
+                if model_id in self._disabled_models:
+                    continue
+                remaining = self._remaining_budget()
+                request_timeout = _TIMEOUT
+                if remaining is not None:
+                    request_timeout = max(1.0, min(float(_TIMEOUT), remaining))
                 t0 = time.time()
                 try:
                     request = dict(
@@ -512,7 +618,7 @@ class MathTranscriptEnhancer:
                         ],
                         temperature=.03,
                         max_tokens=max_tokens,
-                        timeout=_TIMEOUT,
+                        timeout=request_timeout,
                     )
                     # Gemini 3 thinking defaults to medium.  Guide extraction
                     # and transcript editing need a long visible response more
@@ -526,6 +632,7 @@ class MathTranscriptEnhancer:
                         raise RuntimeError("empty response")
                     if str(getattr(choice, "finish_reason", "") or "").lower() == "length":
                         raise RuntimeError("truncated response")
+                    self._model_failure_counts[model_id] = 0
                     print(
                         f"[MathTranscript:{stage}] {model_id}: "
                         f"{len(prompt)} -> {len(text)} chars "
@@ -534,9 +641,14 @@ class MathTranscriptEnhancer:
                     return text, model_id
                 except Exception as exc:
                     detail = f"{type(exc).__name__}: {exc}"
+                    self._record_model_failure(model_id, exc)
                     delay_match = _RETRY_DELAY_RE.search(str(exc))
                     rate_limited = "429" in str(exc) or "ratelimit" in detail.lower()
-                    if rate_limited and delay_match:
+                    if (
+                        rate_limited
+                        and delay_match
+                        and model_id not in self._disabled_models
+                    ):
                         if retry_round < _RATE_LIMIT_RETRIES:
                             rate_limited_candidates.append((provider, client, model))
                             retry_delays.append(float(delay_match.group(1)))
@@ -556,7 +668,11 @@ class MathTranscriptEnhancer:
 
             if not rate_limited_candidates or retry_round >= _RATE_LIMIT_RETRIES:
                 break
+            self._remaining_budget()
             delay = min(60.0, max(1.0, min(retry_delays) + 1.0))
+            remaining = self._remaining_budget()
+            if remaining is not None:
+                delay = min(delay, remaining)
             print(
                 f"[MathTranscript:{stage}] all available candidates failed; "
                 f"waiting {delay:.0f}s before rate-limit retry "
@@ -565,7 +681,12 @@ class MathTranscriptEnhancer:
             )
             time.sleep(delay)
             pending = rate_limited_candidates
-        raise RuntimeError("All math transcript models failed: " + " | ".join(errors))
+        disabled = " | ".join(
+            f"{model_id}: circuit open ({reason})"
+            for model_id, reason in self._disabled_models.items()
+        )
+        details = " | ".join(errors) or disabled or "no enabled models"
+        raise RuntimeError("All math transcript models failed: " + details)
 
     def _global_review_guide(
         self,
@@ -1104,6 +1225,39 @@ class MathTranscriptEnhancer:
         checkpoint_db=None,
         checkpoint_sub_id: str = "",
     ):
+        self._ensure_runtime_state()
+        self._deadline_monotonic = time.monotonic() + _TOTAL_BUDGET
+        print(
+            f"[MathTranscript] total optional-enhancement budget: "
+            f"{_TOTAL_BUDGET}s",
+            flush=True,
+        )
+        try:
+            return self._enhance_impl(
+                proofread_segments,
+                ppt_pages,
+                course_title=course_title,
+                raw_blackboard=raw_blackboard,
+                summary_reference=summary_reference,
+                first_pass_segments=first_pass_segments,
+                checkpoint_db=checkpoint_db,
+                checkpoint_sub_id=checkpoint_sub_id,
+            )
+        finally:
+            self._deadline_monotonic = None
+
+    def _enhance_impl(
+        self,
+        proofread_segments,
+        ppt_pages,
+        *,
+        course_title: str = "",
+        raw_blackboard: str = "",
+        summary_reference: str = "",
+        first_pass_segments=None,
+        checkpoint_db=None,
+        checkpoint_sub_id: str = "",
+    ):
         source = [
             x for x in (self._normalise(s) for s in proofread_segments or []) if x is not None
         ]
@@ -1122,34 +1276,153 @@ class MathTranscriptEnhancer:
             a["start_ms"] == b["start_ms"] and a["end_ms"] == b["end_ms"]
             for a, b in zip(seeded, source)
         )
-        enhanced, models, fallbacks = [], [], 0
-        if seed_matches:
-            enhanced = seeded
+        checkpoint_enabled = checkpoint_db is not None and bool(checkpoint_sub_id)
+        first_pass_source = {
+            "course_title": str(course_title or ""),
+            "source": source,
+            "ppt": [
+                {
+                    "created_sec": page.get("created_sec"),
+                    "text": page.get("text"),
+                }
+                for page in pages
+            ],
+            "raw_blackboard": str(raw_blackboard or ""),
+            "batch_size": _BATCH,
+        }
+        first_pass_identity = {
+            "version": FIRST_PASS_CHECKPOINT_VERSION,
+            "source_sha256": hashlib.sha256(
+                json.dumps(
+                    first_pass_source,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "chunk_count": len(source),
+        }
+        completed: dict[int, dict] = {}
+        models: list[str] = []
+        payload = (
+            load_first_pass_checkpoint(checkpoint_db, checkpoint_sub_id)
+            if checkpoint_enabled else None
+        )
+        if payload and any(
+            payload.get(key) != value for key, value in first_pass_identity.items()
+        ):
+            print(
+                "[MathTranscript:first-pass] stored checkpoint does not match "
+                "the current evidence; discarding stale progress",
+                flush=True,
+            )
+            clear_first_pass_checkpoint(checkpoint_db, checkpoint_sub_id)
+            payload = None
+        if payload:
+            models = [str(model) for model in payload.get("models", []) if model]
+            raw_completed = payload.get("completed")
+            if isinstance(raw_completed, dict):
+                for raw_index, segment in raw_completed.items():
+                    try:
+                        index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if not 0 <= index < len(source) or not isinstance(segment, dict):
+                        continue
+                    if (
+                        int(segment.get("start_ms", -1)) != source[index]["start_ms"]
+                        or int(segment.get("end_ms", -1)) != source[index]["end_ms"]
+                        or not str(segment.get("text") or "").strip()
+                    ):
+                        continue
+                    completed[index] = dict(segment)
+            if completed:
+                print(
+                    f"[MathTranscript:first-pass] resumed checkpoint: "
+                    f"{len(completed)}/{len(source)} chunks",
+                    flush=True,
+                )
+
+        def save_first_pass_progress() -> None:
+            if not checkpoint_enabled:
+                return
+            saved = dict(first_pass_identity)
+            saved.update(
+                {
+                    "stage": "evidence-pass",
+                    "models": list(dict.fromkeys(models)),
+                    "completed": {
+                        str(index): completed[index] for index in sorted(completed)
+                    },
+                }
+            )
+            save_first_pass_checkpoint(checkpoint_db, checkpoint_sub_id, saved)
+
+        if not completed and seed_matches:
+            completed = {
+                index: {
+                    **segment,
+                    "math_enhance_status": "cached_evidence_pass_v7",
+                }
+                for index, segment in enumerate(seeded)
+            }
             models.append("cached-evidence-pass-v7")
+            save_first_pass_progress()
             print(
                 f"[MathTranscript] Reusing {len(seeded)} v7 evidence-aware chunks; "
                 "reserving model capacity for required editorial review.",
                 flush=True,
             )
-        else:
-            batches = (len(source) + _BATCH - 1) // _BATCH
-            for start in range(0, len(source), _BATCH):
-                batch = source[start:start + _BATCH]
+
+        batches = (len(source) + _BATCH - 1) // _BATCH
+        for start in range(0, len(source), _BATCH):
+            indices = list(range(start, min(start + _BATCH, len(source))))
+            missing = [index for index in indices if index not in completed]
+            if not missing:
                 print(
-                    f"[MathTranscript] batch {start//_BATCH+1}/{batches}: {len(batch)} chunk(s)",
+                    f"[MathTranscript:first-pass] batch {start//_BATCH+1}/{batches}: "
+                    f"resumed {len(indices)} completed chunk(s)",
                     flush=True,
                 )
-                out, used, failed = self._batch(
-                    batch,
+                continue
+            self._remaining_budget()
+            print(
+                f"[MathTranscript] batch {start//_BATCH+1}/{batches}: "
+                f"{len(missing)}/{len(indices)} chunk(s) remaining",
+                flush=True,
+            )
+            work_items = (
+                [(start, source[start:start + _BATCH])]
+                if len(missing) == len(indices)
+                else [(index, [source[index]]) for index in missing]
+            )
+            for work_start, work_batch in work_items:
+                self._remaining_budget()
+                out, used, _failed = self._batch(
+                    work_batch,
                     pages,
                     raw_blackboard,
                     course_title=course_title,
                     source=source,
-                    batch_start=start,
+                    batch_start=work_start,
                 )
-                enhanced.extend(out)
                 models.extend(used)
-                fallbacks += failed
+                for offset, segment in enumerate(out):
+                    completed[work_start + offset] = segment
+                save_first_pass_progress()
+                if checkpoint_enabled:
+                    print(
+                        f"[MathTranscript:first-pass] checkpoint saved: "
+                        f"{len(completed)}/{len(source)} chunks",
+                        flush=True,
+                    )
+
+        enhanced = [completed[index] for index in range(len(source))]
+        fallbacks = sum(
+            1
+            for segment in enhanced
+            if str(segment.get("math_enhance_status") or "").startswith("safe_base_")
+        )
 
         editorial_input = [dict(seg) for seg in enhanced]
         enhanced, final_models, final_fallbacks = self._final_review(

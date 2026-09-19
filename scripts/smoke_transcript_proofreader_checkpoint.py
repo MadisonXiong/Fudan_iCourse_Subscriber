@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +85,21 @@ class ScriptedProofreader(TranscriptProofreader):
 
 
 def main() -> None:
+    configured = [
+        {
+            "name": "modelscope",
+            "api_key": "test-key",
+            "base_url": "https://modelscope.invalid/v1",
+            "models": ["Qwen/test"],
+        }
+    ]
+    with patch(
+        "src.ai.transcript_proofreader.config.resolve_model_providers",
+        return_value=configured,
+    ), patch("src.ai.transcript_proofreader.OpenAI") as openai_factory:
+        TranscriptProofreader()
+    assert openai_factory.call_args.kwargs["max_retries"] == 0
+
     db = MemoryDB()
     segments = [
         {"start_ms": 0, "end_ms": 10_000, "text": "第一段课堂语音。"},

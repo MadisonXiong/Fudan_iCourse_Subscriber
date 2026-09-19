@@ -19,6 +19,10 @@ EDITORIAL_CHECKPOINT_VERSION = 1
 _EDITORIAL_CHECKPOINT_KEY_PREFIX = (
     "blackboard_cache_blob:math-transcript-editorial-checkpoint-v1:"
 )
+FIRST_PASS_CHECKPOINT_VERSION = 1
+_FIRST_PASS_CHECKPOINT_KEY_PREFIX = (
+    "blackboard_cache_blob:math-transcript-first-pass-checkpoint-v1:"
+)
 
 
 def source_fingerprint(
@@ -69,6 +73,42 @@ def _key(sub_id: str) -> str:
 
 def _editorial_checkpoint_key(sub_id: str) -> str:
     return f"{_EDITORIAL_CHECKPOINT_KEY_PREFIX}{sub_id}"
+
+
+def _first_pass_checkpoint_key(sub_id: str) -> str:
+    return f"{_FIRST_PASS_CHECKPOINT_KEY_PREFIX}{sub_id}"
+
+
+def load_first_pass_checkpoint(db, sub_id: str) -> dict | None:
+    """Load resumable evidence-pass progress for one lecture."""
+    raw = db.read_meta(_first_pass_checkpoint_key(str(sub_id)))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("version") or 0) != FIRST_PASS_CHECKPOINT_VERSION:
+        return None
+    return payload
+
+
+def save_first_pass_checkpoint(db, sub_id: str, payload: dict) -> None:
+    """Atomically persist completed evidence-pass chunks in SQLite meta."""
+    value = dict(payload)
+    value["version"] = FIRST_PASS_CHECKPOINT_VERSION
+    value["updated_at"] = datetime.now().isoformat()
+    db.write_meta(
+        _first_pass_checkpoint_key(str(sub_id)),
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def clear_first_pass_checkpoint(db, sub_id: str) -> None:
+    """Remove the evidence-pass checkpoint after the final cache succeeds."""
+    db.write_meta(_first_pass_checkpoint_key(str(sub_id)), "")
 
 
 def load_editorial_checkpoint(db, sub_id: str) -> dict | None:

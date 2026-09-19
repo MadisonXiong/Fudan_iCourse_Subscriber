@@ -29,6 +29,7 @@ from src.data.database import Database
 from src.data.math_transcript_store import (
     cache_matches,
     clear_editorial_checkpoint,
+    clear_first_pass_checkpoint,
     load_first_pass_seed,
     load_math_transcript,
     save_math_transcript,
@@ -123,9 +124,10 @@ class Emailer:
                 model=result.model_label,
                 source_sha256=fingerprint,
             )
-            # The final cache is now durable; only at this point is the
-            # incremental editorial checkpoint safe to discard.
+            # The final cache is now durable; only at this point are both
+            # incremental checkpoints safe to discard.
             clear_editorial_checkpoint(db, sub_id)
+            clear_first_pass_checkpoint(db, sub_id)
             print(
                 f"[Emailer] Math-enhanced transcript ready: "
                 f"{len(result.segments)} chunks, {len(result.markdown)} chars.",

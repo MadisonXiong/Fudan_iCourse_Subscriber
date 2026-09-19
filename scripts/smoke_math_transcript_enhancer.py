@@ -10,6 +10,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.ai.math_transcript_enhancer import (
+    MathTranscriptBudgetExceeded,
     MathTranscriptEnhancer,
     _clauses_preserved,
     _comparison_text,
@@ -30,7 +31,9 @@ from src.api.emailer import Emailer
 from src.runtime.config import MODEL_PROVIDERS
 from src.data.math_transcript_store import (
     MATH_TRANSCRIPT_VERSION,
+    clear_first_pass_checkpoint,
     clear_editorial_checkpoint,
+    load_first_pass_checkpoint,
     load_editorial_checkpoint,
     source_fingerprint,
 )
@@ -123,6 +126,35 @@ class _CheckpointFinalReviewEnhancer(MathTranscriptEnhancer):
         ], ["test/checkpoint-editor"], 0
 
 
+class _CheckpointFirstPassEnhancer(MathTranscriptEnhancer):
+    """Deterministic double covering interruption and first-pass resume."""
+
+    def __init__(self, *, fail_from: int | None = None):
+        self.fail_from = fail_from
+        self.batch_starts = []
+
+    def _remaining_budget(self):
+        return 100.0
+
+    def _batch(
+        self, batch, pages, raw_board, *, course_title, source, batch_start
+    ):
+        self.batch_starts.append(batch_start)
+        if self.fail_from is not None and batch_start >= self.fail_from:
+            raise MathTranscriptBudgetExceeded("simulated first-pass interruption")
+        return [
+            {
+                **seg,
+                "text": str(seg["text"]) + "（已增强）",
+                "math_enhance_status": "visual_evidence_enhanced",
+            }
+            for seg in batch
+        ], ["test/first-pass"], 0
+
+    def _final_review(self, *args, **kwargs):
+        raise RuntimeError("stop after first pass")
+
+
 class _FakeCompletions:
     def __init__(self, *, text="", error=None):
         self.text = text
@@ -163,9 +195,10 @@ def main() -> None:
     with patch(
         "src.ai.math_transcript_enhancer.config.resolve_model_providers",
         return_value=configured,
-    ), patch("src.ai.math_transcript_enhancer.OpenAI"):
+    ), patch("src.ai.math_transcript_enhancer.OpenAI") as openai_factory:
         pinned = MathTranscriptEnhancer()
     assert [name for name, _client, _models in pinned.providers] == ["modelscope"]
+    assert openai_factory.call_args.kwargs["max_retries"] == 0
 
     preferred = _fake_client(text="ModelScope result")
     unused_gemini = _fake_client(text="Gemini result")
@@ -179,6 +212,39 @@ def main() -> None:
     )
     assert (text, model) == ("ModelScope result", "modelscope/Qwen/test")
     assert unused_gemini.chat.completions.calls == 0
+
+    # Two real request timeouts open the model circuit.  A later call skips the
+    # slow model, while successful fallback calls remain usable.
+    slow_math = _fake_client(error=TimeoutError("Request timed out."))
+    healthy_math = _fake_client(text="healthy")
+    math_breaker = object.__new__(MathTranscriptEnhancer)
+    # Model-specific clients are represented as separate providers in this
+    # lightweight double so their call counts stay observable.
+    math_breaker.providers = [
+        ("slow", slow_math, ("slow-model",)),
+        ("healthy", healthy_math, ("healthy-model",)),
+    ]
+    for _ in range(3):
+        text, model = math_breaker._call_with_system(
+            "prompt", system="system", max_tokens=100, stage="circuit-test"
+        )
+        assert (text, model) == ("healthy", "healthy/healthy-model")
+    assert slow_math.chat.completions.calls == 2
+    assert healthy_math.chat.completions.calls == 3
+    assert "slow/slow-model" in math_breaker._disabled_models
+
+    budget_test = object.__new__(MathTranscriptEnhancer)
+    budget_test.providers = [("modelscope", healthy_math, ("healthy-model",))]
+    budget_test._deadline_monotonic = 10.0
+    with patch("src.ai.math_transcript_enhancer.time.monotonic", return_value=11.0):
+        try:
+            budget_test._call_with_system(
+                "prompt", system="system", max_tokens=100, stage="budget-test"
+            )
+        except MathTranscriptBudgetExceeded:
+            pass
+        else:
+            raise AssertionError("expired math transcript budget was ignored")
 
     limited_modelscope = _fake_client(
         error=RuntimeError("429 rate limit; please retry in 57s")
@@ -360,6 +426,56 @@ def main() -> None:
     assert all(seg["final_review_status"] == "ai_final_reviewed" for seg in completed)
     clear_editorial_checkpoint(checkpoint_db, "lecture-checkpoint")
     assert load_editorial_checkpoint(checkpoint_db, "lecture-checkpoint") is None
+
+    # The evidence pass is independently durable.  After an interruption only
+    # missing chunks are called again, and the original chunk is reused exactly.
+    first_pass_db = _FakeDb()
+    first_pass_source = [
+        {"start_ms": i * 1000, "end_ms": (i + 1) * 1000, "text": f"原稿{i + 1}"}
+        for i in range(3)
+    ]
+    interrupted_first_pass = _CheckpointFirstPassEnhancer(fail_from=1)
+    with patch("src.ai.math_transcript_enhancer._BATCH", 1):
+        try:
+            interrupted_first_pass.enhance(
+                first_pass_source,
+                [],
+                course_title="泛函分析",
+                summary_reference="课程总结",
+                checkpoint_db=first_pass_db,
+                checkpoint_sub_id="first-pass-checkpoint",
+            )
+        except MathTranscriptBudgetExceeded:
+            pass
+        else:
+            raise AssertionError("simulated first-pass interruption did not fire")
+    saved_first_pass = load_first_pass_checkpoint(
+        first_pass_db, "first-pass-checkpoint"
+    )
+    assert saved_first_pass and sorted(saved_first_pass["completed"]) == ["0"]
+
+    resumed_first_pass = _CheckpointFirstPassEnhancer()
+    with patch("src.ai.math_transcript_enhancer._BATCH", 1):
+        try:
+            resumed_first_pass.enhance(
+                first_pass_source,
+                [],
+                course_title="泛函分析",
+                summary_reference="课程总结",
+                checkpoint_db=first_pass_db,
+                checkpoint_sub_id="first-pass-checkpoint",
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "stop after first pass"
+        else:
+            raise AssertionError("first-pass test unexpectedly reached completion")
+    assert resumed_first_pass.batch_starts == [1, 2]
+    saved_first_pass = load_first_pass_checkpoint(
+        first_pass_db, "first-pass-checkpoint"
+    )
+    assert saved_first_pass and sorted(saved_first_pass["completed"]) == ["0", "1", "2"]
+    clear_first_pass_checkpoint(first_pass_db, "first-pass-checkpoint")
+    assert load_first_pass_checkpoint(first_pass_db, "first-pass-checkpoint") is None
 
     full_speech = (
         "首先欢迎大家选修泛函分析课程。作业每周一收发，平时成绩占百分之三十，"

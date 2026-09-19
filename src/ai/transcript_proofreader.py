@@ -205,6 +205,10 @@ class TranscriptProofreader:
                     OpenAI(
                         api_key=provider["api_key"],
                         base_url=provider["base_url"],
+                        # Keep the explicit 90-second timeout real.  The SDK's
+                        # default retries otherwise make one failure take
+                        # roughly three times as long before our circuit sees it.
+                        max_retries=0,
                     ),
                     tuple(models),
                 )
