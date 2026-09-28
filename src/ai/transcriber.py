@@ -382,6 +382,9 @@ class Transcriber:
         segments: list[dict] = []
         total_read = 0      # samples
         total_bytes = 0
+        sampled_peak = 0.0
+        sampled_square_sum = 0.0
+        sampled_count = 0
         last_report = t0
         last_segment_at = 0.0
         silence_marked = False
@@ -403,6 +406,13 @@ class Transcriber:
 
             total_bytes += len(raw)
             samples = np.frombuffer(raw, dtype=np.float32)
+            # Sample the signal to distinguish silent recordings from a VAD
+            # failure when no speech is recognized. Never persist raw audio.
+            sampled = samples[::16]
+            if len(sampled):
+                sampled_peak = max(sampled_peak, float(np.max(np.abs(sampled))))
+                sampled_square_sum += float(np.sum(sampled.astype(np.float64) ** 2))
+                sampled_count += len(sampled)
             total_read += len(samples)
             audio_pos = total_read / SAMPLE_RATE
 
@@ -540,6 +550,21 @@ class Transcriber:
         )
         self._last_transcript = transcript
         self._last_segments = segments
+        if self._media_duration and duration / self._media_duration < 0.9:
+            ratio = duration / self._media_duration
+            raise IncompleteAudioError(
+                f"Only received {duration:.0f}s of {self._media_duration:.0f}s "
+                f"audio ({ratio:.0%}); retry instead of summarizing partial audio.",
+                actual_duration=duration,
+                expected_duration=self._media_duration,
+            )
+        if not transcript.strip():
+            rms = (sampled_square_sum / sampled_count) ** 0.5 if sampled_count else 0.0
+            raise EmptyTranscriptError(
+                f"No speech recognized in {duration:.0f}s of decoded audio "
+                f"(sampled peak={sampled_peak:.5f}, RMS={rms:.5f}); "
+                "check the recording and VAD/ASR before marking it processed."
+            )
         return transcript, segments
 
     # ── Public mode 1 — disk tail-f (preferred) ─────────────────────────
@@ -724,3 +749,7 @@ class IncompleteAudioError(RuntimeError):
 
 class NoAudioStreamError(RuntimeError):
     """Raised when the media contains no audio stream (video-only file)."""
+
+
+class EmptyTranscriptError(RuntimeError):
+    """Decoded audio contained no recognized speech; keep lecture retryable."""
