@@ -22,6 +22,8 @@ from pathlib import Path
 from openai import OpenAI
 from PIL import Image
 
+from src.runtime import config
+
 
 BLACKBOARD_SUMMARY_MARKER = "### 黑板板书 LaTeX 转写"
 
