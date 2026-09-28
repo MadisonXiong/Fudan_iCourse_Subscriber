@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import unittest
 import os
+import datetime
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -20,6 +21,7 @@ from src.api.emailer import Emailer
 from src.pipeline.blackboard_lecture_runner import BlackboardLectureRunner
 from src.pdf.latex_renderer import _PANDOC_INPUT_FORMAT
 from src.runtime.scheduler import Scheduler
+from main import _current_week_functional_analysis
 
 
 class NoSpeechVAD:
@@ -150,6 +152,21 @@ class FailureRegressions(unittest.TestCase):
              patch("src.ai.blackboard_vision.OpenAI"):
             vision = BlackboardVision()
         self.assertEqual(vision.models, ["vision-test"])
+
+    def test_functional_analysis_only_this_week(self):
+        today = datetime.date(2026, 9, 28)
+        self.assertFalse(_current_week_functional_analysis(
+            {"date": "2026-09-21", "sub_title": "第3-5节"}, today=today
+        ))
+        self.assertTrue(_current_week_functional_analysis(
+            {"date": "", "sub_title": "2026-09-28第3-5节"}, today=today
+        ))
+        self.assertTrue(_current_week_functional_analysis(
+            {"date": "2026-10-04"}, today=today
+        ))
+        self.assertFalse(_current_week_functional_analysis(
+            {"date": "2026-10-05"}, today=today
+        ))
 
 
 if __name__ == "__main__":
