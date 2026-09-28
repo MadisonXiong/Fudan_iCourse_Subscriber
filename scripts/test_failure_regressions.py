@@ -3,6 +3,7 @@
 import shutil
 import subprocess
 import unittest
+import os
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -13,6 +14,7 @@ from src.ai.transcriber import (
     Transcriber,
 )
 from src.ai.transcript_proofreader import TranscriptProofreader
+from src.ai.blackboard_vision import BlackboardVision
 from src.api.webvpn import WebVPNLoginBounceError, WebVPNSession
 from src.api.emailer import Emailer
 from src.pipeline.blackboard_lecture_runner import BlackboardLectureRunner
@@ -140,6 +142,14 @@ class FailureRegressions(unittest.TestCase):
         scheduler.prefetch_lecture(object(), "course", "669978")
         scheduler.image_cache.schedule.assert_called_once()
         scheduler.audio_downloader.schedule.assert_not_called()
+
+    def test_blackboard_vision_initialization_uses_configured_models(self):
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-token"}), \
+             patch("src.ai.blackboard_vision.config.filter_modelscope_models",
+                   return_value=["vision-test"]), \
+             patch("src.ai.blackboard_vision.OpenAI"):
+            vision = BlackboardVision()
+        self.assertEqual(vision.models, ["vision-test"])
 
 
 if __name__ == "__main__":
