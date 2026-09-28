@@ -373,7 +373,8 @@ class Scheduler:
     def prefetch_lecture(self, client, course_id: str, sub_id: str) -> None:
         """Schedule image + audio prefetch for a future lecture."""
         self.image_cache.schedule(client, course_id, sub_id)
-        self.audio_downloader.schedule(client, course_id, sub_id)
+        if str(sub_id) not in config.SILENT_VISUAL_SUB_IDS:
+            self.audio_downloader.schedule(client, course_id, sub_id)
 
     def submit_ocr(self, fn: Callable, *args, **kwargs) -> Future:
         """Submit an OCR job.  Live concurrency is capped at

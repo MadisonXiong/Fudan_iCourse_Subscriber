@@ -58,6 +58,8 @@ class Emailer:
 
     def _complete_transcript(self, item: dict) -> str:
         """Return the mandatory complete transcript appendix for this PDF."""
+        if item.get("visual_only"):
+            return ""  # Source recording contains no speech to transcribe.
         course_title = str(item.get("course_title") or "")
         sub_id = str(item.get("sub_id") or "")
         stored_markdown = str(item.get("transcript_attachment") or "").strip()
@@ -173,20 +175,25 @@ class Emailer:
         if any_update:
             subject += "（含 PPT 识别·更新）"
 
+        visual_only = any(item.get("visual_only") for item in items)
         plain_lines = [
-            "完整课程内容见 LaTeX PDF 附件。",
-            "PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。",
-            "PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式。",
-            "忠实 AI 校订底稿保存在系统中，邮件仅发送最终 PDF。",
+            "课程笔记见 LaTeX PDF 附件。",
+            "PDF 由 Pandoc + Tectonic 原生排版，数学公式保留为矢量文字。",
+            (
+                "标注为无声录播的课程仅依据视频画面整理，不含语音逐字稿；"
+                "其他课程的 PDF 附有课堂语音转写。"
+                if visual_only else
+                "PDF 在原课程笔记之后附有完整课堂语音转写。"
+            ),
             "",
         ]
         html_parts = [
             '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;'
             'font-size:15px;line-height:1.7;color:#1f2937;max-width:720px;margin:auto;padding:20px;">',
-            '<p>完整课程内容见 <strong>LaTeX PDF 附件</strong>。</p>',
-            '<p>PDF 由 Pandoc + Tectonic 原生排版，数学公式不再转换为 CID/PNG 图片。'
-            'PDF 在原课程笔记之后附有完整课堂语音转写；泛函分析还会校正 ASR 并补全有证据的公式；'
-            '忠实 AI 校订底稿保存在系统中，邮件仅发送最终 PDF。</p>',
+            '<p>课程笔记见 <strong>LaTeX PDF 附件</strong>。</p>',
+            '<p>PDF 由 Pandoc + Tectonic 原生排版。'
+            + ('无声录播仅依据视频画面整理，不含语音逐字稿；其他课程附有语音转写。'
+               if visual_only else 'PDF 附有课堂语音转写。') + '</p>',
         ]
 
         for course_title, lectures in courses.items():
@@ -197,15 +204,19 @@ class Emailer:
             )
             for item in lectures:
                 tag = "[更新] " if item.get("is_update") else ""
+                description = (
+                    "无声录播：仅画面板书／课件笔记，见 PDF"
+                    if item.get("visual_only") else "完整笔记见 PDF"
+                )
                 plain_lines.append(
-                    f"- {tag}{item.get('sub_title','')} ({item.get('date','')})：完整笔记见 PDF"
+                    f"- {tag}{item.get('sub_title','')} ({item.get('date','')})：{description}"
                 )
                 html_parts.append(
                     '<div style="margin:8px 0 14px;padding:10px 12px;background:#f8fafc;'
                     'border:1px solid #e2e8f0;border-radius:6px;">'
                     f"<strong>{escape(tag + str(item.get('sub_title') or '课堂'))}</strong> "
                     f"<span style=\"color:#64748b\">({escape(str(item.get('date') or ''))})</span><br>"
-                    '<span style="color:#475569">完整笔记与文末增强语音转写见 PDF 附件。</span>'
+                    f'<span style="color:#475569">{escape(description)}</span>'
                     "</div>"
                 )
         html_parts.append("</div>")

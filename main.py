@@ -222,6 +222,12 @@ def _email_item_from_row_like(
         "date": date,
         "summary": summary,
     }
+    row = db.get_lecture(sub_id) or {}
+    item["visual_only"] = "visual-only/no-speech" in str(
+        row.get("summary_model") or ""
+    )
+    if item["visual_only"]:
+        return item
     proofread = load_proofread(db, sub_id)
     if proofread:
         transcript_md, timed_chunks, _ = proofread

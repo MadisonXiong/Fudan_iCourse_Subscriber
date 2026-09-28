@@ -50,6 +50,7 @@ def _rows(db: Database, course_ids: set[str]) -> list[dict]:
             l.sub_title,
             l.date,
             l.summary,
+            l.summary_model,
             l.transcript,
             c.title AS course_title
         FROM lectures AS l
@@ -240,7 +241,13 @@ def _email_item(
         "sub_title": sub_title,
         "date": str(row.get("date") or ""),
         "summary": str(row.get("summary") or ""),
+        "visual_only": "visual-only/no-speech" in str(
+            row.get("summary_model") or ""
+        ),
     }
+
+    if item["visual_only"]:
+        return item, proofreader
 
     transcript_md, timed_chunks, proofreader = _ensure_proofread(
         db, row, proofreader

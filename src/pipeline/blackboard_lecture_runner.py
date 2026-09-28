@@ -19,14 +19,17 @@ import time
 from typing import Optional
 
 from src.ai import bucketer
+from src.ai.ppt_dedup import clean_ppt_text
 from src.ai.blackboard_editor_annotated import BlackboardEditor
 from src.ai.blackboard_vision import course_requires_blackboard
 from src.data.blackboard_store import get_blackboard, save_blackboard
 from src.pipeline.blackboard_pipeline import BlackboardPipeline
 from src.pipeline.lecture_runner import LectureRunner as BaseLectureRunner
+from src.runtime import config
 
 
 _NOTES_MODEL_PREFIX = "blackboard-llm-editor-v9/"
+_VISUAL_ONLY_MODEL_PREFIX = _NOTES_MODEL_PREFIX + "visual-only/no-speech"
 _BOARD_NOTES_MARKER = "### 黑板板书整理稿"
 _AI_SUMMARY_HEADING_RE = re.compile(
     r"\n\s*---\s*\n\s*###\s+AI\s*课程总结(?:（带视频定位）)?\s*\n",
@@ -52,7 +55,82 @@ class BlackboardLectureRunner(BaseLectureRunner):
             next_info: Optional[tuple[str, str]] = None) -> Optional[str]:
         self._active_course_id = str(course_id)
         self._active_course_title = course_title or ""
+        if (str(lecture["sub_id"]) in config.SILENT_VISUAL_SUB_IDS
+                and course_requires_blackboard(course_title)):
+            return self._run_visual_only(course_id, course_title, lecture, next_info)
         return super().run(course_id, course_title, lecture, next_info=next_info)
+
+    def _run_visual_only(self, course_id: str, course_title: str,
+                         lecture: dict,
+                         next_info: Optional[tuple[str, str]]) -> str:
+        """Produce sourced visual notes for a subscriber-confirmed silent video."""
+        sub_id = str(lecture["sub_id"])
+        sub_title = str(lecture.get("sub_title") or sub_id)
+        started = time.time()
+        self._reporter.lecture_start(course_title, sub_title, lecture.get("date", ""))
+        self._schedule_next(next_info)
+
+        existing = self._db.get_lecture(sub_id)
+        if (existing and existing.get("summary") and
+                str(existing.get("summary_model") or "").startswith(
+                    _VISUAL_ONLY_MODEL_PREFIX)):
+            self._db.mark_processed(sub_id)
+            self._db.clear_error(sub_id)
+            return existing["summary"]
+
+        try:
+            self._reporter.info(
+                "    [Visual only] Subscriber confirmed this recording has no "
+                "human speech; skipping ASR and the audio-based summary."
+            )
+            self._ppt.submit(self._client, course_id, sub_id).drain()
+            pages = self._db.get_done_ppt_pages(sub_id)
+            raw_board, vision_model = self._ensure_raw_blackboard(
+                sub_id, course_title
+            )
+            board_notes = ""
+            editor_model = "none"
+            if raw_board.strip():
+                board_notes, editor_model = self._edit_blackboard_or_fallback(
+                    sub_id, raw_board
+                )
+
+            ppt_parts = []
+            for page in pages:
+                text = clean_ppt_text(page.get("text") or "").strip()
+                if text:
+                    minute, second = divmod(int(page.get("created_sec") or 0), 60)
+                    ppt_parts.append(
+                        f"#### 第 {page['page_num']} 页（视频 {minute:02d}:{second:02d}）\n\n{text}"
+                    )
+            if not board_notes.strip() and not ppt_parts:
+                raise RuntimeError(
+                    "Confirmed silent recording has no usable visual "
+                    "transcription or PPT OCR; cannot produce notes"
+                )
+
+            sections = [
+                "### 录播说明\n\n"
+                "> 这节录播没有人声。以下笔记仅依据可见的板书和课件画面；"
+                "没有语音逐字稿，也不提供基于语音的课程总结。"
+            ]
+            if board_notes.strip():
+                sections.append(board_notes.strip())
+            if ppt_parts:
+                sections.append("### 课件画面文字（OCR）\n\n" + "\n\n".join(ppt_parts))
+            summary = "\n\n".join(sections)
+            model = (
+                f"{_VISUAL_ONLY_MODEL_PREFIX}|vision={vision_model or 'none'}"
+                f"|editor={editor_model}|ppt={len(ppt_parts)}"
+            )
+            self._db.update_summary(sub_id, summary, model)
+            self._db.mark_processed(sub_id)
+            self._db.clear_error(sub_id)
+            self._reporter.lecture_done(course_title, sub_title, time.time() - started)
+            return summary
+        except Exception as exc:
+            self._db.update_error(sub_id, "visual-only", str(exc))
+            raise
 
     def _prior_board_notes(self, sub_id: str) -> str:
         """Recover a previously-produced final board section, if present.
