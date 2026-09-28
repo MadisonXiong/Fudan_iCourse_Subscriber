@@ -112,6 +112,10 @@ def get_ordinary_url(vpn_url: str) -> str:
     return original
 
 
+class WebVPNLoginBounceError(RuntimeError):
+    """The CAS request returned to WebVPN login instead of reaching IDP."""
+
+
 class WebVPNSession:
     """Manages a WebVPN session with full IDP authentication."""
 
@@ -239,6 +243,14 @@ class WebVPNSession:
                     break
             if lck:
                 break
+            # Repeating with this same expired VPN session only repeats the
+            # bounce; the caller should establish a fresh WebVPN session.
+            final_url = urlparse(resp.url)
+            if (final_url.hostname == urlparse(config.WEBVPN_BASE).hostname
+                    and final_url.path.rstrip("/") == "/login"):
+                raise WebVPNLoginBounceError(
+                    "iCourse CAS redirected to WebVPN /login; renew VPN session"
+                )
         if not lck:
             # Log the redirect trail so future failures are diagnosable
             # without re-running with extra prints.

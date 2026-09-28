@@ -39,6 +39,11 @@ _TIMEOUT = int(os.environ.get("TRANSCRIPT_PROOFREAD_TIMEOUT", "90"))
 _CIRCUIT_FAILURES = max(
     1, int(os.environ.get("TRANSCRIPT_PROOFREAD_CIRCUIT_FAILURES", "2"))
 )
+# The free Gemini tier reported five requests per minute in production.
+# Space calls per model, including calls made after another provider fails.
+_GEMINI_MIN_INTERVAL = max(
+    0.0, float(os.environ.get("GEMINI_PROOFREAD_MIN_INTERVAL_SEC", "13"))
+)
 _MIN_RATIO = 0.55
 _MAX_RATIO = 1.55
 
@@ -217,6 +222,7 @@ class TranscriptProofreader:
             raise ValueError("No model provider available for transcript proofreading")
         self._model_failure_counts: dict[str, int] = {}
         self._disabled_models: dict[str, str] = {}
+        self._next_request_at: dict[str, float] = {}
         self._circuit_failures = _CIRCUIT_FAILURES
 
     def _disable_model(self, model_id: str, reason: str) -> None:
@@ -232,6 +238,21 @@ class TranscriptProofreader:
     def _record_model_failure(self, model_id: str, exc: Exception) -> None:
         kind = _provider_failure_kind(exc)
         if kind == "rate-limit":
+            # A minute quota supplies a short retry delay. Keep that model
+            # available after the delay; unknown/hard quotas still open the
+            # circuit so one run cannot wait indefinitely.
+            match = re.search(r"(?:retry in|retryDelay['\"]?:\s*['\"]?)\s*(\d+(?:\.\d+)?)s", str(exc), re.I)
+            if match and float(match.group(1)) <= 120:
+                self._next_request_at[model_id] = max(
+                    self._next_request_at.get(model_id, 0.0),
+                    time.monotonic() + float(match.group(1)) + 1,
+                )
+                print(
+                    f"[TranscriptProofreader] {model_id} cooling down for "
+                    f"{float(match.group(1)) + 1:.0f}s after minute quota.",
+                    flush=True,
+                )
+                return
             self._disable_model(model_id, "rate limit/quota exhausted")
             return
         if kind == "permanent":
@@ -255,6 +276,13 @@ class TranscriptProofreader:
                 model_id = f"{provider_name}/{model}"
                 if model_id in self._disabled_models:
                     continue
+                wait = self._next_request_at.get(model_id, 0.0) - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                if provider_name == "gemini":
+                    self._next_request_at[model_id] = (
+                        time.monotonic() + _GEMINI_MIN_INTERVAL
+                    )
                 t0 = time.time()
                 try:
                     response = client.chat.completions.create(

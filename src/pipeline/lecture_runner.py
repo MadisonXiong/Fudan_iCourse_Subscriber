@@ -97,11 +97,9 @@ class LectureRunner:
                 )
 
         if not transcript.strip():
-            self._reporter.info("    Empty transcript, skipping summary.")
+            self._db.update_error(sub_id, "transcribe", "Empty ASR transcript")
             self._release_audio(sub_id)
-            self._db.mark_processed(sub_id)
-            self._db.clear_error(sub_id)
-            return None
+            raise RuntimeError(f"Empty transcript for lecture {sub_id}")
 
         summary = self._summarize(
             sub_id, course_title, transcript, transcript_segments,
@@ -182,8 +180,9 @@ class LectureRunner:
             return None, None
         except IncompleteAudioError as e:
             self._reporter.info(f"    [WARN] Incomplete audio: {e}")
-            transcript = self._transcriber._last_transcript
-            segments = self._transcriber._last_segments
+            self._db.update_error(sub_id, "transcribe", str(e))
+            self._release_audio(sub_id)
+            raise
         except Exception as e:
             self._reporter.info(
                 f"    [FAIL] Transcription error: {type(e).__name__}: {e}"

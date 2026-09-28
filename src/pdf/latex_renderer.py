@@ -30,6 +30,12 @@ from src.pdf.latex_repairer import LatexRepairError, repair_latex
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TEMPLATE = _REPO_ROOT / "templates" / "course_notes.tex"
 _FILTER = _REPO_ROOT / "templates" / "fics_filter.lua"
+# Notes are generated Markdown, never YAML metadata. A leading `---` in
+# lecture 666947 made Pandoc interpret subsequent notes as malformed YAML.
+_PANDOC_INPUT_FORMAT = (
+    "markdown-yaml_metadata_block+fenced_divs+bracketed_spans"
+    "+raw_tex+tex_math_dollars"
+)
 _DEBUG_ROOT = Path(
     os.environ.get(
         "FICS_LATEX_DEBUG_DIR",
@@ -323,7 +329,7 @@ def render_markdown_pdf(
         pandoc_cmd = [
             pandoc,
             str(md_path),
-            "--from=markdown+fenced_divs+bracketed_spans+raw_tex+tex_math_dollars",
+            f"--from={_PANDOC_INPUT_FORMAT}",
             "--to=latex",
             "--standalone",
             "--no-highlight",

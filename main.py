@@ -16,7 +16,7 @@ from src.runtime.reporter import Reporter
 from src.runtime.scheduler import Scheduler
 from src.ai.summarizer import Summarizer
 from src.ai.transcriber import Transcriber
-from src.api.webvpn import WebVPNSession
+from src.api.webvpn import WebVPNSession, WebVPNLoginBounceError
 
 
 BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v9/"
@@ -63,6 +63,9 @@ def login_with_retry(
                 return vpn
             except Exception as exc:
                 last_error = exc
+                if isinstance(exc, WebVPNLoginBounceError):
+                    print(f"  {exc}; rebuilding WebVPN session.")
+                    break
                 if not _has_webvpn_ticket(vpn):
                     print(
                         "  iCourse CAS failed and the WebVPN ticket cookie "
