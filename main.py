@@ -1,8 +1,10 @@
 """iCourse Subscriber — top-level orchestration."""
 
 import datetime
+import re
 import time
 import traceback
+from zoneinfo import ZoneInfo
 
 from src.runtime import config
 from src.data.database import Database
@@ -20,6 +22,26 @@ from src.api.webvpn import WebVPNSession, WebVPNLoginBounceError
 
 
 BLACKBOARD_NOTES_MODEL_PREFIX = "blackboard-llm-editor-v9/"
+
+
+def _current_week_functional_analysis(row: dict,
+                                      *, today: datetime.date | None = None) -> bool:
+    """Keep only this Shanghai calendar week's Functional Analysis lectures.
+
+    The lecture date can be absent in historical rows, so read the date prefix
+    from the subtitle as a fallback. Unknown dates are not treated as new.
+    """
+    today = today or datetime.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    date_text = str(row.get("sub_title") or "") + " " + str(row.get("date") or "")
+    match = re.search(r"\d{4}-\d{2}-\d{2}", date_text)
+    if not match:
+        return False
+    try:
+        lecture_date = datetime.date.fromisoformat(match.group(0))
+    except ValueError:
+        return False
+    monday = today - datetime.timedelta(days=today.weekday())
+    return monday <= lecture_date < monday + datetime.timedelta(days=7)
 
 
 def _has_webvpn_ticket(vpn: WebVPNSession) -> bool:
@@ -188,6 +210,19 @@ def _enumerate_lectures(
             ]
             new_lectures.extend(retry_only)
 
+            if "泛函分析" in course_title:
+                pending = len(new_lectures)
+                new_lectures = [
+                    lec for lec in new_lectures
+                    if _current_week_functional_analysis(lec)
+                ]
+                if pending != len(new_lectures):
+                    reporter.info(
+                        f"  Skipping {pending - len(new_lectures)} earlier "
+                        "Functional Analysis lecture(s); only this week's "
+                        "new board/audio is requested."
+                    )
+
             reporter.course_new_count(len(new_lectures))
             for lecture in new_lectures:
                 sub_id = str(lecture["sub_id"])
@@ -305,6 +340,11 @@ def _send_email(
 ) -> bool:
     """Append unsent processed lectures, including durable transcript attachments."""
     unsent = db.get_unsent_lectures()
+    unsent = [
+        row for row in unsent
+        if "泛函分析" not in str(row.get("course_title") or "")
+        or _current_week_functional_analysis(row)
+    ]
     if unsent:
         seen_sub_ids = {item["sub_id"] for item in email_items}
         for row in unsent:
