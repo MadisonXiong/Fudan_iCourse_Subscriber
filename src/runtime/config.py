@@ -9,6 +9,15 @@ WEBVPN_BASE = "https://webvpn.fudan.edu.cn"
 IDP_BASE = "https://id.fudan.edu.cn"
 ICOURSE_BASE = "https://icourse.fudan.edu.cn"
 
+# Confirmed by the subscriber: these recordings have no human speech but
+# contain visual course material. Keep the exception explicit so an unexpected
+# empty ASR result in any other lecture remains a visible failure.
+SILENT_VISUAL_SUB_IDS = frozenset(
+    sub_id.strip()
+    for sub_id in os.environ.get("SILENT_VISUAL_SUB_IDS", "669978").split(",")
+    if sub_id.strip()
+)
+
 WEBVPN_AES_KEY = b"wrdvpnisthebest!"
 WEBVPN_AES_IV = b"wrdvpnisthebest!"
 

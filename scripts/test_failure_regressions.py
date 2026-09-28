@@ -3,7 +3,7 @@
 import shutil
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -14,7 +14,10 @@ from src.ai.transcriber import (
 )
 from src.ai.transcript_proofreader import TranscriptProofreader
 from src.api.webvpn import WebVPNLoginBounceError, WebVPNSession
+from src.api.emailer import Emailer
+from src.pipeline.blackboard_lecture_runner import BlackboardLectureRunner
 from src.pdf.latex_renderer import _PANDOC_INPUT_FORMAT
+from src.runtime.scheduler import Scheduler
 
 
 class NoSpeechVAD:
@@ -96,6 +99,47 @@ class FailureRegressions(unittest.TestCase):
         )
         self.assertNotIn("gemini/gemini-3.6-flash", proofreader._disabled_models)
         self.assertIn("gemini/gemini-3.6-flash", proofreader._next_request_at)
+
+    def test_confirmed_silent_lecture_produces_visual_notes_without_asr(self):
+        runner = BlackboardLectureRunner.__new__(BlackboardLectureRunner)
+        runner._active_course_title = ""
+        runner._active_course_id = ""
+        runner._client = object()
+        runner._reporter = MagicMock()
+        runner._db = MagicMock()
+        runner._db.get_lecture.return_value = None
+        runner._db.get_done_ppt_pages.return_value = [
+            {"page_num": 1, "created_sec": 90, "text": "函数空间与投影"}
+        ]
+        runner._ppt = MagicMock()
+        runner._scheduler = MagicMock()
+        with patch.object(runner, "_ensure_raw_blackboard", return_value=(
+            "板书中的证明", "vision-test"
+        )), patch.object(runner, "_edit_blackboard_or_fallback", return_value=(
+            "### 黑板板书整理稿\n\n证明内容", "editor-test"
+        )):
+            notes = runner.run("course", "泛函分析", {
+                "sub_id": "669978", "sub_title": "第3-5节", "date": "2026-09-28"
+            })
+        self.assertIn("没有人声", notes)
+        self.assertIn("证明内容", notes)
+        self.assertIn("函数空间与投影", notes)
+        self.assertNotIn("AI 课程总结（带视频定位）", notes)
+        self.assertTrue(runner._db.update_summary.call_args.args[2].startswith(
+            "blackboard-llm-editor-v9/visual-only/no-speech"
+        ))
+        runner._db.mark_processed.assert_called_once_with("669978")
+        runner._scheduler.audio_downloader.schedule.assert_not_called()
+        mailer = Emailer.__new__(Emailer)
+        self.assertEqual(mailer._complete_transcript({"visual_only": True}), "")
+
+    def test_silent_prefetch_does_not_download_audio(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.image_cache = MagicMock()
+        scheduler.audio_downloader = MagicMock()
+        scheduler.prefetch_lecture(object(), "course", "669978")
+        scheduler.image_cache.schedule.assert_called_once()
+        scheduler.audio_downloader.schedule.assert_not_called()
 
 
 if __name__ == "__main__":
