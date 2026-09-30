@@ -155,41 +155,42 @@ class LectureRunner:
             )
 
         downloader = self._scheduler.audio_downloader
-        downloader.schedule(self._client, course_id, sub_id)
-        try:
-            handle = downloader.get(sub_id, timeout=120)
-        except TimeoutError as e:
-            self._reporter.info(f"    [SKIP] {e}")
-            self._db.update_error(sub_id, "transcribe", str(e))
-            return None, None
-        if handle is None:
-            self._reporter.lecture_skip_no_video(
-                existing.get("sub_title", sub_id) if existing else sub_id
-            )
-            return None, None
-
-        try:
-            transcript, segments = self._transcriber.transcribe_tail(
-                handle.path, handle.process, handle.stderr_chunks,
-            )
-        except NoAudioStreamError as e:
-            self._reporter.info(f"    [SKIP] Video-only (no audio stream): {e}")
-            self._db.update_error(sub_id, "transcribe", str(e))
-            self._db.mark_processed(sub_id)
-            self._release_audio(sub_id)
-            return None, None
-        except IncompleteAudioError as e:
-            self._reporter.info(f"    [WARN] Incomplete audio: {e}")
-            self._db.update_error(sub_id, "transcribe", str(e))
-            self._release_audio(sub_id)
-            raise
-        except Exception as e:
-            self._reporter.info(
-                f"    [FAIL] Transcription error: {type(e).__name__}: {e}"
-            )
-            self._db.update_error(sub_id, "transcribe", str(e))
-            self._release_audio(sub_id)
-            raise
+        # A clean ffmpeg exit can still contain a truncated HTTP response.
+        # Retry with a fresh signed URL and scratch file; never persist partial ASR.
+        for attempt in range(1, 4):
+            downloader.schedule(self._client, course_id, sub_id)
+            try:
+                handle = downloader.get(sub_id, timeout=120)
+                if handle is None:
+                    raise RuntimeError(f"Audio download unavailable for {sub_id}")
+                transcript, segments = self._transcriber.transcribe_tail(
+                    handle.path, handle.process, handle.stderr_chunks,
+                )
+                break
+            except NoAudioStreamError as e:
+                self._reporter.info(f"    [SKIP] Video-only (no audio stream): {e}")
+                self._db.update_error(sub_id, "transcribe", str(e))
+                self._db.mark_processed(sub_id)
+                self._release_audio(sub_id)
+                return None, None
+            except (IncompleteAudioError, TimeoutError) as e:
+                self._db.update_error(sub_id, "transcribe", str(e))
+                self._release_audio(sub_id)
+                if attempt == 3:
+                    self._reporter.info(f"    [FAIL] Audio retries exhausted: {e}")
+                    raise
+                self._reporter.info(
+                    f"    [RETRY] Audio attempt {attempt}/3 failed: {e}; "
+                    "fetching a fresh video URL and restarting audio."
+                )
+                time.sleep(5 * attempt)
+            except Exception as e:
+                self._reporter.info(
+                    f"    [FAIL] Transcription error: {type(e).__name__}: {e}"
+                )
+                self._db.update_error(sub_id, "transcribe", str(e))
+                self._release_audio(sub_id)
+                raise
 
         self._db.update_transcript(sub_id, transcript)
         save_transcript_segments(self._db, sub_id, segments)
